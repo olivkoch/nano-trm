@@ -1,0 +1,53 @@
+# @package _global_
+
+# Specify default configuration here.
+# Order of defaults determines the order in which configs override each other.
+defaults:
+  - _self_
+  - data: null
+  - model: null
+  - callbacks: default
+  - logger: many_loggers
+  - trainer: default
+  - paths: default
+  - extras: default
+  - hydra: default
+
+  # Experiment configs allow for version control of specific hyperparameters, e.g., 
+  # specific hyperparameters for given model and datamodule.
+  - experiment: null
+
+  # Optional local config for machine/user specific settings. It's optional since it 
+  # doesn't need to exist and is excluded from version control.
+  - optional local: default
+
+  # Debugging config (enable through command line, e.g. `python train.py debug=default).
+  - debug: null
+
+# Task name, determines output directory path.
+task_name: "train"
+
+# Tags to help identify experiment, etc.
+tags: []
+
+# Simply provide checkpoint path to resume training.
+ckpt_path: null
+
+# Location where to upload results at the end of training
+save_dir: null
+
+# Seed for random number generators in pytorch, numpy and python.random
+seed: 12345
+
+# Sweep mode flag - Set to true when running as part of a W&B sweep. This will ask
+# the training script to update the config with information from the W&B run.
+sweep_mode: false
+
+# Only append wandb name to save_dir when running sweeps (or explicitly overridden).
+append_wandb_name_to_save_dir: ${sweep_mode}
+
+# Information about epoch lengths, etc.
+timekeeping:
+  max_epochs: ???
+  batch_size: ???
+  nb_steps_per_epoch: ${eval:'${timekeeping.nb_samples_per_epoch} // ${timekeeping.batch_size}'}

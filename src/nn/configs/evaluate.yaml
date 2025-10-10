@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: arc
+  - paths: default
+  - hydra: default
+
+task_name: "evaluate"
+
+# Required: LakeFS checkpoint path
+checkpoint_path: ???
+
+# Required: Dataset to evaluate
+eval_dataset_path: ???
+
+# Optional overrides
+eval_dataset_name: eval
+save_dir: null  # Defaults to checkpoint_dir/extracted_logits
+batch_size: 128
+seed: 12345

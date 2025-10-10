@@ -1,0 +1,14 @@
+_target_: lightning.pytorch.trainer.Trainer
+
+min_epochs: 1 # Prevents early stopping
+max_epochs: ${timekeeping.max_epochs}
+
+accelerator: cpu
+devices: 1
+
+# Perform a validation loop every N training epochs
+check_val_every_n_epoch: 1
+
+# Set to True to to ensure deterministic results. Makes training slower, but gives
+# more reproducability than just setting seeds.
+deterministic: False

@@ -31,6 +31,8 @@ dependencies = [
     "tqdm>=4.65.0",
     "colorama>=0.4.6",
     "Pillow>=10.0.0",
+    "omegaconf>=2.3.0",
+    "lightning>=2.5.4",
 ]
 
 [project.optional-dependencies]

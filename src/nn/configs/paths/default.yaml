@@ -1,0 +1,8 @@
+# Path to logging directory
+log_dir: /tmp/logs/
+
+# Path to output directory, created dynamically by hydra. This will be a subdirectory
+# of `log_dir`. See `configs/hydra/default.yaml` for the path generation pattern. Use
+# this directory to store all files generated during the run, such as configs,
+# checkpoints and metrics.
+output_dir: ${hydra:runtime.output_dir}

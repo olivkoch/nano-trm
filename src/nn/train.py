@@ -6,11 +6,9 @@ import shutil
 import wandb
 from pathlib import Path
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
-from src.arc_evaluator import ARCEvaluator
 from src.viewer.arc_notebook_viewer import create_viewer
 from lightning.pytorch.loggers import Logger
 from typing import Optional
-from neural_arc_solver import NeuralARCSolver
 from src.nn.utils import (
     RankedLogger,
     extras,

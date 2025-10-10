@@ -32,7 +32,9 @@ class TRMModule(LightningModule):
                  warmup_steps: int = 2000,
                  max_steps: int = 100000,
                  ema_decay: float = 0.999,
-                 use_ema: bool = True):
+                 use_ema: bool = True,
+                 output_dir: str = None
+                 ):
         """
         Initialize TRM Lightning Module.
         

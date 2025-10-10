@@ -319,7 +319,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
 
 
 # Example usage with custom collate
-class TRMDataModuleWithCollate(TRMDataModule):
+class TRMDataModuleWithCollate(ARCDataModule):
     """Extended DataModule with custom collate function."""
     
     def train_dataloader(self):

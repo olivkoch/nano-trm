@@ -7,7 +7,7 @@ defaults:
   - data: null
   - model: null
   - callbacks: default
-  - logger: many_loggers
+  - logger: wandb
   - trainer: default
   - paths: default
   - extras: default
@@ -50,4 +50,4 @@ append_wandb_name_to_save_dir: ${sweep_mode}
 timekeeping:
   max_epochs: ???
   batch_size: ???
-  nb_steps_per_epoch: ${eval:'${timekeeping.nb_samples_per_epoch} // ${timekeeping.batch_size}'}
+  # nb_steps_per_epoch: ${eval:'${timekeeping.nb_samples_per_epoch} // ${timekeeping.batch_size}'}

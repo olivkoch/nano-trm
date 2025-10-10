@@ -14,3 +14,4 @@ warmup_steps: 2000
 max_steps: 100000
 ema_decay: 0.999
 use_ema: True
+output_dir: null

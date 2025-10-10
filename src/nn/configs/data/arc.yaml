@@ -1,4 +1,4 @@
-_target_: src.nn.data.detection_datamodule.ARCDataModule
+_target_: src.nn.data.ARCDataModule
 _recursive_: false
 data_dir: "data"
 batch_size: 32

@@ -1,174 +1,147 @@
-import numpy as np
 import torch
 import os
-import torch.nn as nn
-from typing import Dict, Any, Optional
-
-from src.arc_solver_base import MLSolver
+import lightning
+import wandb
+from pathlib import Path
+from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from src.arc_evaluator import ARCEvaluator
 from src.viewer.arc_notebook_viewer import create_viewer
+from neural_arc_solver import NeuralARCSolver
+from src.nn.utils import (
+    RankedLogger,
+    extras,
+    instantiate_callbacks,
+    instantiate_loggers,
+    log_hyperparameters,
+    task_wrapper,
+)
+log = RankedLogger(__name__, rank_zero_only=True)
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
-class NeuralARCSolver(MLSolver):
-    """Example neural network solver using PyTorch."""
-    
-    def __init__(self, name: str = "NeuralNet", input_size: int = 30, hidden_size: int = 128):
-        super().__init__(name, model_type="pytorch")
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.max_output_size = 30
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Create a simple model
-        self.model = self._build_model()
-        
-    def _build_model(self):
-        """Build a simple neural network model."""
-        class SimpleARCNet(nn.Module):
-            def __init__(self, input_size, hidden_size, output_size):
-                super().__init__()
-                flat_size = input_size * input_size * 10  # 10 colors
-                self.encoder = nn.Sequential(
-                    nn.Linear(flat_size, hidden_size),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(hidden_size, hidden_size),
-                    nn.ReLU(),
-                )
-                self.decoder = nn.Sequential(
-                    nn.Linear(hidden_size, hidden_size),
-                    nn.ReLU(),
-                    nn.Linear(hidden_size, output_size * output_size * 10),
-                )
-                self.output_size = output_size
-                
-            def forward(self, x):
-                # x shape: (batch, height, width, colors)
-                batch_size = x.shape[0]
-                x = x.view(batch_size, -1)
-                encoded = self.encoder(x)
-                decoded = self.decoder(encoded)
-                # Reshape to (batch, height, width, colors)
-                decoded = decoded.view(batch_size, self.output_size, self.output_size, 10)
-                return decoded
-        
-        model = SimpleARCNet(self.input_size, self.hidden_size, self.max_output_size)
-        return model.to(self.device)
-    
-    def preprocess_task(self, task_data: Dict) -> Any:
-        """Convert task to tensors for the model."""
-        test_examples = task_data.get('test', [])
-        
-        # For simplicity, just process test inputs
-        test_tensors = []
-        for test_case in test_examples:
-            grid = np.array(test_case['input'])
-            # Pad to fixed size
-            padded = np.zeros((self.input_size, self.input_size), dtype=int)
-            h, w = min(grid.shape[0], self.input_size), min(grid.shape[1], self.input_size)
-            padded[:h, :w] = grid[:h, :w]
-            
-            # One-hot encode colors (0-9)
-            one_hot = np.zeros((self.input_size, self.input_size, 10))
-            for i in range(self.input_size):
-                for j in range(self.input_size):
-                    one_hot[i, j, padded[i, j]] = 1
-            
-            test_tensors.append(torch.FloatTensor(one_hot))
-        
-        return {'test_inputs': test_tensors}
-    
-    def predict(self, preprocessed_data: Any) -> Any:
-        """Make predictions using the model."""
-        test_inputs = preprocessed_data['test_inputs']
-        predictions = []
-        
-        self.model.eval()
-        with torch.no_grad():
-            for test_input in test_inputs:
-                # Add batch dimension
-                x = test_input.unsqueeze(0).to(self.device)
-                
-                # Forward pass
-                output = self.model(x)
-                
-                # Convert to color indices
-                output = output.squeeze(0).cpu().numpy()
-                output = np.argmax(output, axis=-1)
-                
-                # Find actual size (remove padding)
-                non_zero_mask = output != 0
-                if non_zero_mask.any():
-                    rows = np.any(non_zero_mask, axis=1)
-                    cols = np.any(non_zero_mask, axis=0)
-                    rmin, rmax = np.where(rows)[0][[0, -1]]
-                    cmin, cmax = np.where(cols)[0][[0, -1]]
-                    output = output[rmin:rmax+1, cmin:cmax+1]
+def flatten_config(cfg, parent_key="", sep="."):
+    """Flatten a nested config to avoid W&B duplication."""
+    items = []
+    config_dict = OmegaConf.to_container(cfg, resolve=True)
+
+    def _flatten(obj, parent_key=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if isinstance(v, (dict, list)) and not isinstance(v, str):
+                    _flatten(v, new_key)
                 else:
-                    output = output[:3, :3]  # Default small output
-                
-                predictions.append(output)
-        
-        return predictions
-    
-    def train(self, training_data: Dict[str, Dict], 
-              validation_data: Optional[Dict[str, Dict]] = None,
-              epochs: int = 10, batch_size: int = 16, lr: float = 0.001) -> Dict[str, Any]:
-        """Train the neural network."""
-        print(f"Training {self.name}...")
-        
-        # For demo purposes, we'll just show the structure
-        # In practice, you would:
-        # 1. Convert all training tasks to input/output pairs
-        # 2. Create a DataLoader
-        # 3. Train with backpropagation
-        
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
-        
-        history = {'loss': [], 'val_loss': []}
-        
-        # Placeholder training loop
-        for epoch in range(epochs):
-            # This would contain actual training logic
-            fake_loss = 0.5 - epoch * 0.02
-            history['loss'].append(fake_loss)
-            
-            if validation_data:
-                fake_val_loss = 0.6 - epoch * 0.015
-                history['val_loss'].append(fake_val_loss)
-            
-            if (epoch + 1) % 5 == 0:
-                print(f"  Epoch {epoch+1}/{epochs}: loss={fake_loss:.3f}")
-        
-        self.is_trained = True
-        return history
+                    items.append((new_key, v))
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                new_key = f"{parent_key}{sep}{i}" if parent_key else str(i)
+                if isinstance(v, (dict, list)) and not isinstance(v, str):
+                    _flatten(v, new_key)
+                else:
+                    items.append((new_key, v))
 
-def main():
+    _flatten(config_dict)
+    return dict(items)
+
+@task_wrapper
+def train():
     print("\n" + "=" * 60)
     print("Example 3: Neural Network Solver (PyTorch)")
     print("=" * 60)
 
+    # In sweep mode, get sweep config from W&B run and update cfg
+    if cfg.sweep_mode:
+        if not wandb.run:
+            raise RuntimeError("Using sweep mode requires a `wandb.init() context.")
+        from src.nn.train_sweep import update_config_with_sweep
+
+        cfg = update_config_with_sweep(cfg, wandb.run.config)
+
+    # Set seed for random number generators in pytorch, numpy and python.random.
+    if cfg.get("seed"):
+        lightning.seed_everything(cfg.seed, workers=True)
+
+    output_dir = Path(cfg["paths"]["output_dir"])
+
+    log.info(f"Instantiating model <{cfg.model._target_}>")
+    model: LightningModule = hydra.utils.instantiate(cfg.model, output_dir=output_dir)
+
+    log.info(f"Instantiating datamodule <{cfg.data._target_}>")
+    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
+
+    log.info("Instantiating callbacks...")
+    callbacks: list[Callback] = instantiate_callbacks(cfg.get("callbacks"))
+
+    log.info("Instantiating loggers...")
+    loggers: list[Logger] = instantiate_loggers(cfg.get("logger"))
+
+    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
+    trainer: Trainer = hydra.utils.instantiate(
+        cfg.trainer, callbacks=callbacks, logger=loggers, enable_progress_bar=False
+    )
+
+    object_dict = {
+        "cfg": cfg,
+        "datamodule": datamodule,
+        "model": model,
+        "callbacks": callbacks,
+        "logger": loggers,
+        "trainer": trainer,
+    }
+
+    if loggers:
+        log.info("Logging hyperparameters!")
+        log_hyperparameters(object_dict)
+        if not cfg.sweep_mode:
+            wandb.config.update(flatten_config(cfg), allow_val_change=True)
+
+    log.info("Starting training!")
+    trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+
+    log.info("Training finished!")
+
+    OmegaConf.save(cfg, output_dir / "config.yaml", resolve=True)
+
+    if cfg.save_dir is not None:
+        save_dir = cfg.save_dir
+        # Append wandb run name to save_dir if enabled
+        if cfg.append_wandb_name_to_save_dir and wandb.run and wandb.run.name:
+            save_dir = save_dir.rstrip("/") + "/" + wandb.run.name
+
+        log.info(f"Uploading training output to: {save_dir}")
+        upload_directory(output_dir, save_dir, commit=True, message="Training output.")
     # Create and train neural solver
-    neural_solver = NeuralARCSolver(name="SimpleNeuralNet")
+    if False:
+        neural_solver = NeuralARCSolver(name="SimpleNeuralNet")
 
-    evaluator = ARCEvaluator(data_dir="data")
+        evaluator = ARCEvaluator(data_dir="data")
 
-    # Train on some data (placeholder training)
-    training_data = evaluator.datasets['training']['challenges']
-    history = neural_solver.train(training_data, epochs=10)
-    print(f"Training complete. Final loss: {history['loss'][-1]:.3f}")
+        # Train on some data (placeholder training)
+        training_data = evaluator.datasets['training']['challenges']
+        history = neural_solver.train(training_data, epochs=10)
+        print(f"Training complete. Final loss: {history['loss'][-1]:.3f}")
 
-    # Evaluate
-    result = evaluator.evaluate_solver(neural_solver, dataset='training', max_tasks=20)
+        # Evaluate
+        result = evaluator.evaluate_solver(neural_solver, dataset='training', max_tasks=20)
 
-    # store model weights
-    os.makedirs("checkpoints", exist_ok=True)
-    torch.save(neural_solver.model.state_dict(), "checkpoints/neural_arc_solver.pth")
+        # store model weights
+        os.makedirs("checkpoints", exist_ok=True)
+        torch.save(neural_solver.model.state_dict(), "checkpoints/neural_arc_solver.pth")
 
-    # Visualize predictions
-    # viewer = create_viewer(data_dir="data")
-    # viewer.visualize_predictions(neural_solver, n_tasks=2)
+@hydra.main(version_base="1.3", config_path="./configs", config_name="train.yaml")
+def main(cfg: DictConfig):
+    """
+    Main entry point for training.
 
+    Args:
+        cfg: DictConfig configuration composed by Hydra.
+    """
+    # Apply extra utilities
+    # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
+    extras(cfg)
+
+    # Train the model
+    return train(cfg)
 
 if __name__ == "__main__":
     main()

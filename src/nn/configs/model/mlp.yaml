@@ -1,2 +1,9 @@
 _target_: src.nn.models.mlp_module.MLPModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
+input_dim: 32
+hidden_dim: 128
+output_dim: 10
+num_layers: 3
+num_colors: 10
+lr: 1e-3
+output_dir: null

@@ -18,8 +18,7 @@ timekeeping:
 trainer:
   accumulate_grad_batches: 1
   gradient_clip_val: 1.0
-  limit_train_batches: ${timekeeping.nb_steps_per_epoch}
+  # limit_train_batches: ${timekeeping.nb_steps_per_epoch}
 
 save_dir: /tmp/ml-experiments # lakefs://arc/ml-experiments/trm-arc-experiments/
 append_wandb_name_to_save_dir: true
-auto_tune_trainer: false

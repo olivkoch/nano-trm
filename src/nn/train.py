@@ -1,11 +1,15 @@
+import shutil
 import torch
 import os
 import lightning
+import shutil
 import wandb
 from pathlib import Path
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from src.arc_evaluator import ARCEvaluator
 from src.viewer.arc_notebook_viewer import create_viewer
+from lightning.pytorch.loggers import Logger
+from typing import Optional
 from neural_arc_solver import NeuralARCSolver
 from src.nn.utils import (
     RankedLogger,
@@ -44,18 +48,7 @@ def flatten_config(cfg, parent_key="", sep="."):
     return dict(items)
 
 @task_wrapper
-def train():
-    print("\n" + "=" * 60)
-    print("Example 3: Neural Network Solver (PyTorch)")
-    print("=" * 60)
-
-    # In sweep mode, get sweep config from W&B run and update cfg
-    if cfg.sweep_mode:
-        if not wandb.run:
-            raise RuntimeError("Using sweep mode requires a `wandb.init() context.")
-        from src.nn.train_sweep import update_config_with_sweep
-
-        cfg = update_config_with_sweep(cfg, wandb.run.config)
+def train(cfg: DictConfig) -> Optional[float]:
 
     # Set seed for random number generators in pytorch, numpy and python.random.
     if cfg.get("seed"):
@@ -109,7 +102,8 @@ def train():
             save_dir = save_dir.rstrip("/") + "/" + wandb.run.name
 
         log.info(f"Uploading training output to: {save_dir}")
-        upload_directory(output_dir, save_dir, commit=True, message="Training output.")
+        shutil.copytree(output_dir, save_dir)
+
     # Create and train neural solver
     if False:
         neural_solver = NeuralARCSolver(name="SimpleNeuralNet")

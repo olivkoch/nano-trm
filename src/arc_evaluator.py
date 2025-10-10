@@ -6,15 +6,12 @@ Framework for evaluating and comparing different solving methods
 import json
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
-import time
 from collections import defaultdict
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-from arc_solver_base import ARCSolver, SolverResult
-
+from src.arc_solver_base import ARCSolver
 
 @dataclass
 class EvaluationResult:

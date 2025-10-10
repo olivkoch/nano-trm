@@ -1,11 +1,12 @@
 import numpy as np
 import torch
+import os
 import torch.nn as nn
 from typing import Dict, Any, Optional
 
-from arc_solver_base import MLSolver
-from arc_evaluator import ARCEvaluator
-from viewer.arc_notebook_viewer import create_viewer
+from src.arc_solver_base import MLSolver
+from src.arc_evaluator import ARCEvaluator
+from src.viewer.arc_notebook_viewer import create_viewer
 
 class NeuralARCSolver(MLSolver):
     """Example neural network solver using PyTorch."""
@@ -142,24 +143,32 @@ class NeuralARCSolver(MLSolver):
         self.is_trained = True
         return history
 
+def main():
+    print("\n" + "=" * 60)
+    print("Example 3: Neural Network Solver (PyTorch)")
+    print("=" * 60)
 
-print("\n" + "=" * 60)
-print("Example 3: Neural Network Solver (PyTorch)")
-print("=" * 60)
+    # Create and train neural solver
+    neural_solver = NeuralARCSolver(name="SimpleNeuralNet")
 
-# Create and train neural solver
-neural_solver = NeuralARCSolver(name="SimpleNeuralNet")
+    evaluator = ARCEvaluator(data_dir="data")
 
-evaluator = ARCEvaluator(data_dir="data")
+    # Train on some data (placeholder training)
+    training_data = evaluator.datasets['training']['challenges']
+    history = neural_solver.train(training_data, epochs=10)
+    print(f"Training complete. Final loss: {history['loss'][-1]:.3f}")
 
-# Train on some data (placeholder training)
-training_data = evaluator.datasets['training']['challenges']
-history = neural_solver.train(training_data, epochs=10)
-print(f"Training complete. Final loss: {history['loss'][-1]:.3f}")
+    # Evaluate
+    result = evaluator.evaluate_solver(neural_solver, dataset='training', max_tasks=20)
 
-# Evaluate
-result = evaluator.evaluate_solver(neural_solver, dataset='training', max_tasks=20)
+    # store model weights
+    os.makedirs("checkpoints", exist_ok=True)
+    torch.save(neural_solver.model.state_dict(), "checkpoints/neural_arc_solver.pth")
 
-# Visualize predictions
-# viewer = create_viewer(data_dir="data")
-# viewer.visualize_predictions(neural_solver, n_tasks=2)
+    # Visualize predictions
+    # viewer = create_viewer(data_dir="data")
+    # viewer.visualize_predictions(neural_solver, n_tasks=2)
+
+
+if __name__ == "__main__":
+    main()

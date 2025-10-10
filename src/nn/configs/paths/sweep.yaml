@@ -1,0 +1,9 @@
+# Path configuration for W&B sweep runs
+# Uses static paths since Hydra runtime context is not fully available in sweep mode
+
+# Path to logging directory - use temp for sweep runs
+log_dir: ${oc.env:TMPDIR,/tmp}/sweep_logs/
+
+# Path to output directory - use static path for sweep runs
+# Each sweep run will get a unique subdirectory via W&B run ID
+output_dir: ${oc.env:TMPDIR,/tmp}/sweep_outputs/${oc.env:WANDB_RUN_ID,unknown_run}

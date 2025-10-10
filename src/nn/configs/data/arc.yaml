@@ -1,0 +1,9 @@
+_target_: src.nn.data.detection_datamodule.ARCDataModule
+_recursive_: false
+data_dir: "data"
+batch_size: 32
+num_workers: 4
+max_grid_size: 30
+augment_train: false
+samples_per_task: 100  # For augmentation
+train_split: 0.8

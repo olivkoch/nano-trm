@@ -1,9 +1,11 @@
-_target_: src.nn.models.mlp_module.MLPModule
+_target_: src.nn.models.mlp_module.ConvMLPModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
-input_dim: 32
-hidden_dim: 128
-output_dim: 10
-num_layers: 3
 num_colors: 10
-lr: 1e-3
+hidden_channels: 128
+num_conv_layers: 4
+num_mlp_layers: 2
+kernel_size: 3
+dropout: 0.1
+learning_rate: 1e-4
+weight_decay: 0.01
 output_dir: null

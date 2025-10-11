@@ -21,6 +21,9 @@ log = RankedLogger(__name__, rank_zero_only=True)
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+import warnings
+warnings.filterwarnings("ignore", module="pydantic")
+
 def flatten_config(cfg, parent_key="", sep="."):
     """Flatten a nested config to avoid W&B duplication."""
     items = []
@@ -83,7 +86,7 @@ def train(cfg: DictConfig) -> Optional[float]:
     if loggers:
         log.info("Logging hyperparameters!")
         log_hyperparameters(object_dict)
-        if not cfg.sweep_mode:
+        if not cfg.sweep_mode and wandb.run is not None:
             wandb.config.update(flatten_config(cfg), allow_val_change=True)
 
     log.info("Starting training!")

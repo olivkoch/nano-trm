@@ -7,7 +7,7 @@ defaults:
   - data: null
   - model: null
   - callbacks: default
-  - logger: wandb
+  - logger: csv
   - trainer: default
   - paths: default
   - extras: default

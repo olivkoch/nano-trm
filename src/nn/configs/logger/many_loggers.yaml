@@ -1,0 +1,5 @@
+# Train with multiple loggers at once
+
+defaults:
+  - csv
+  - wandb

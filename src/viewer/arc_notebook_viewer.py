@@ -1,6 +1,6 @@
 """
-ARC-AGI Notebook Viewer
-Interactive visualization for Jupyter notebooks with widget support
+ARC-AGI Notebook Viewer for Neural Network Models
+Interactive visualization for Jupyter notebooks with PyTorch model support
 """
 
 import json
@@ -14,6 +14,7 @@ import random
 from IPython.display import display, HTML, clear_output
 import ipywidgets as widgets
 from ipywidgets import interact, interactive, fixed
+import torch
 
 
 # ARC-AGI color palette (0-9)
@@ -126,7 +127,7 @@ class ARCNotebookViewer:
     
     def plot_task(self, task_id: str, task_data: Dict, 
                   solution: Optional[Union[List, Dict]] = None,
-                  predictions: Optional[List[List[List[int]]]] = None,
+                  predictions: Optional[List[Union[List[List[int]], np.ndarray]]] = None,
                   figsize: Optional[Tuple[float, float]] = None) -> plt.Figure:
         """Create a comprehensive visualization of a task.
         
@@ -134,7 +135,7 @@ class ARCNotebookViewer:
             task_id: Task identifier
             task_data: Task dictionary with 'train' and 'test' keys
             solution: Ground truth solution (if available)
-            predictions: Model predictions (if available)
+            predictions: Model predictions as list of 2D arrays (if available)
             figsize: Figure size (width, height)
             
         Returns:
@@ -198,7 +199,8 @@ class ARCNotebookViewer:
                 # Prediction
                 ax_pred = plt.subplot(total_rows, n_cols, row_idx * n_cols + 2)
                 if i < len(predictions):
-                    self._plot_grid_on_axes(predictions[i], ax_pred,
+                    pred = np.array(predictions[i])
+                    self._plot_grid_on_axes(pred.tolist(), ax_pred,
                                           f'Test {i+1} - Prediction')
                 else:
                     self._plot_placeholder(ax_pred, f'Test {i+1} - No Prediction')
@@ -227,7 +229,9 @@ class ARCNotebookViewer:
                         else:
                             truth = solution[i]
                         
-                        is_correct = np.array_equal(predictions[i], truth)
+                        pred = np.array(predictions[i])
+                        truth_arr = np.array(truth)
+                        is_correct = np.array_equal(pred, truth_arr)
                         color = '#2ECC40' if is_correct else '#FF4136'
                         symbol = '✓' if is_correct else '✗'
                         
@@ -247,7 +251,8 @@ class ARCNotebookViewer:
                 # Show only predictions
                 ax_pred = plt.subplot(total_rows, n_cols, row_idx * n_cols + 2)
                 if i < len(predictions):
-                    self._plot_grid_on_axes(predictions[i], ax_pred,
+                    pred = np.array(predictions[i])
+                    self._plot_grid_on_axes(pred.tolist(), ax_pred,
                                           f'Test {i+1} - Prediction')
                 else:
                     self._plot_placeholder(ax_pred, f'Test {i+1} - No Prediction')
@@ -368,6 +373,266 @@ class ARCNotebookViewer:
             print(f"  • Colors used in inputs: {sorted(all_colors_in)}")
             print(f"  • Colors used in outputs: {sorted(all_colors_out)}")
     
+    def predict_with_model(self, model: torch.nn.Module, task_data: Dict, 
+                          device: str = 'cpu') -> List[np.ndarray]:
+        """Generate predictions for a task using a PyTorch model.
+        
+        Args:
+            model: PyTorch model (e.g., ConvMLPModule)
+            task_data: Task dictionary with 'test' key
+            device: Device to run on
+            
+        Returns:
+            List of predicted grids as numpy arrays
+        """
+        model.eval()
+        model.to(device)
+        
+        predictions = []
+        
+        with torch.no_grad():
+            for test_example in task_data.get('test', []):
+                # Get input grid
+                input_grid = torch.tensor(test_example['input'], dtype=torch.long).unsqueeze(0).to(device)
+                
+                # Get logits from model
+                logits = model(input_grid)  # [1, H, W, num_colors]
+                
+                # Get predicted classes
+                pred = logits.argmax(dim=-1).squeeze(0).cpu().numpy()  # [H, W]
+                
+                predictions.append(pred)
+        
+        return predictions
+    
+    def visualize_model_predictions(self, model: torch.nn.Module, 
+                                    task_ids: Optional[List[str]] = None, 
+                                    dataset: str = 'training', 
+                                    n_tasks: int = 3,
+                                    device: str = 'cpu') -> None:
+        """Visualize model predictions compared to ground truth.
+        
+        Args:
+            model: PyTorch model (e.g., ConvMLPModule)
+            task_ids: Specific task IDs to visualize (None for random)
+            dataset: Which dataset to use ('training' or 'evaluation')
+            n_tasks: Number of tasks to visualize if task_ids is None
+            device: Device to run model on
+        """
+        # Get data
+        if dataset == 'training':
+            challenges = self.training_challenges
+            solutions = self.training_solutions
+        else:
+            challenges = self.evaluation_challenges
+            solutions = self.evaluation_solutions
+        
+        if not challenges:
+            print(f"No {dataset} data loaded!")
+            return
+        
+        # Select tasks
+        if task_ids is None:
+            available_ids = list(challenges.keys())
+            task_ids = random.sample(available_ids, min(n_tasks, len(available_ids)))
+        
+        # Visualize each task
+        for task_id in task_ids:
+            if task_id not in challenges:
+                print(f"Task {task_id} not found in {dataset} set!")
+                continue
+            
+            task_data = challenges[task_id]
+            solution = solutions.get(task_id) if solutions else None
+            
+            # Get predictions from model
+            try:
+                predictions = self.predict_with_model(model, task_data, device)
+            except Exception as e:
+                print(f"Error predicting task {task_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+            
+            # Create visualization
+            fig = self.plot_task(task_id, task_data, solution, predictions)
+            plt.show()
+            
+            # Print accuracy for this task
+            if solution:
+                correct = 0
+                total = len(predictions)
+                
+                for i, pred in enumerate(predictions):
+                    if i < len(solution):
+                        if isinstance(solution[i], dict) and 'output' in solution[i]:
+                            truth = solution[i]['output']
+                        else:
+                            truth = solution[i]
+                        
+                        truth_arr = np.array(truth)
+                        if np.array_equal(pred, truth_arr):
+                            correct += 1
+                
+                accuracy = correct / total if total > 0 else 0
+                model_name = model.__class__.__name__
+                print(f"\n📊 Task {task_id} - {model_name}: {correct}/{total} correct ({accuracy:.0%})")
+            print("-" * 60)
+    
+    def compare_predictions(self, model: torch.nn.Module, task_id: str, 
+                           dataset: str = 'training', device: str = 'cpu') -> None:
+        """Show detailed comparison of predictions vs ground truth for a single task.
+        
+        Args:
+            model: PyTorch model
+            task_id: Task ID to analyze
+            dataset: Which dataset to use
+            device: Device to run model on
+        """
+        # Get data
+        if dataset == 'training':
+            challenges = self.training_challenges
+            solutions = self.training_solutions
+        else:
+            challenges = self.evaluation_challenges
+            solutions = self.evaluation_solutions
+        
+        if not challenges or task_id not in challenges:
+            print(f"Task {task_id} not found in {dataset} set!")
+            return
+        
+        task_data = challenges[task_id]
+        solution = solutions.get(task_id) if solutions else None
+        
+        # Get predictions
+        predictions = self.predict_with_model(model, task_data, device)
+        
+        print(f"🔍 Analysis for Task {task_id}")
+        print(f"   Model: {model.__class__.__name__}")
+        
+        # Create detailed visualization
+        fig = self.plot_task(task_id, task_data, solution, predictions)
+        plt.show()
+        
+        # Detailed comparison
+        if solution:
+            print(f"\n📊 Detailed Comparison:")
+            for i, pred in enumerate(predictions):
+                if i < len(solution):
+                    if isinstance(solution[i], dict) and 'output' in solution[i]:
+                        truth = solution[i]['output']
+                    else:
+                        truth = solution[i]
+                    
+                    pred_arr = np.array(pred)
+                    truth_arr = np.array(truth)
+                    
+                    is_correct = np.array_equal(pred_arr, truth_arr)
+                    
+                    print(f"\n   Test {i+1}:")
+                    print(f"     Prediction shape: {pred_arr.shape}")
+                    print(f"     Ground truth shape: {truth_arr.shape}")
+                    print(f"     Correct: {'✓' if is_correct else '✗'}")
+                    
+                    if not is_correct:
+                        # Show what's different
+                        if pred_arr.shape == truth_arr.shape:
+                            diff_count = np.sum(pred_arr != truth_arr)
+                            total_pixels = pred_arr.size
+                            print(f"     Pixels different: {diff_count}/{total_pixels} ({diff_count/total_pixels*100:.1f}%)")
+                        else:
+                            print(f"     Shape mismatch!")
+    
+    def evaluate_and_visualize(self, model: torch.nn.Module, 
+                               dataset: str = 'training', 
+                               n_samples: int = 5, 
+                               show_only_errors: bool = False,
+                               device: str = 'cpu') -> Dict:
+        """Evaluate model and visualize results.
+        
+        Args:
+            model: PyTorch model
+            dataset: Which dataset to use
+            n_samples: Number of examples to visualize
+            show_only_errors: If True, only show incorrect predictions
+            device: Device to run model on
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        if dataset == 'training':
+            challenges = self.training_challenges
+            solutions = self.training_solutions
+        else:
+            challenges = self.evaluation_challenges
+            solutions = self.evaluation_solutions
+        
+        if not challenges or not solutions:
+            print(f"No {dataset} data with solutions loaded!")
+            return {}
+        
+        print(f"🔍 Evaluating on {dataset} set...")
+        
+        # Collect results
+        results = []
+        for task_id in list(challenges.keys())[:n_samples * 3]:  # Check more to find errors
+            task_data = challenges[task_id]
+            predictions = self.predict_with_model(model, task_data, device)
+            solution = solutions[task_id]
+            
+            # Check correctness
+            all_correct = True
+            for i, pred in enumerate(predictions):
+                if i < len(solution):
+                    if isinstance(solution[i], dict) and 'output' in solution[i]:
+                        truth = solution[i]['output']
+                    else:
+                        truth = solution[i]
+                    
+                    if not np.array_equal(pred, np.array(truth)):
+                        all_correct = False
+                        break
+            
+            results.append({
+                'task_id': task_id,
+                'correct': all_correct,
+                'predictions': predictions,
+                'solution': solution
+            })
+        
+        # Filter based on show_only_errors
+        if show_only_errors:
+            results_to_show = [r for r in results if not r['correct']][:n_samples]
+            if not results_to_show:
+                print("No errors found in the sample!")
+                results_to_show = results[:n_samples]
+        else:
+            results_to_show = results[:n_samples]
+        
+        # Summary statistics
+        total_tasks = len(results)
+        correct_tasks = sum(1 for r in results if r['correct'])
+        print(f"\n📊 Overall: {correct_tasks}/{total_tasks} tasks fully correct ({correct_tasks/total_tasks*100:.1f}%)")
+        
+        # Visualize selected results
+        print(f"\n📈 Showing {len(results_to_show)} examples:")
+        for result in results_to_show:
+            task_id = result['task_id']
+            task_data = challenges[task_id]
+            
+            status = "✓ Correct" if result['correct'] else "✗ Wrong"
+            print(f"\nTask {task_id}: {status}")
+            
+            fig = self.plot_task(task_id, task_data, 
+                               result['solution'], result['predictions'])
+            plt.show()
+        
+        return {
+            'total_tasks': total_tasks,
+            'correct_tasks': correct_tasks,
+            'accuracy': correct_tasks / total_tasks if total_tasks > 0 else 0
+        }
+    
     def create_interactive_widget(self):
         """Create an interactive widget for exploring tasks.
         
@@ -485,283 +750,3 @@ class ARCNotebookViewer:
             
             task_data = challenges[task_id]
             solution = solutions.get(task_id) if solutions else None
-            
-            # Create and display plot
-            fig = self.plot_task(task_id, task_data, solution)
-            plt.show()
-            
-            # Print statistics
-            self._print_task_stats(task_id, task_data, solution)
-    
-    def explore(self):
-        """Launch the interactive explorer widget."""
-        widget = self.create_interactive_widget()
-        display(widget)
-    
-    def batch_analyze(self, n_samples: int = 5, dataset: str = 'training'):
-        """Analyze multiple random tasks at once.
-        
-        Args:
-            n_samples: Number of tasks to analyze
-            dataset: Which dataset to use
-        """
-        if dataset == 'training':
-            challenges = self.training_challenges
-        else:
-            challenges = self.evaluation_challenges
-        
-        if not challenges:
-            print(f"No {dataset} data loaded!")
-            return
-        
-        task_ids = random.sample(list(challenges.keys()), 
-                                min(n_samples, len(challenges)))
-        
-        for task_id in task_ids:
-            print(f"\n{'='*60}")
-            print(f"Task: {task_id}")
-            print('='*60)
-            self.show_task(task_id, dataset)
-
-
-    def visualize_predictions(self, solver, task_ids: Optional[List[str]] = None, 
-                             dataset: str = 'training', n_tasks: int = 3) -> None:
-        """Visualize solver predictions compared to ground truth.
-        
-        Args:
-            solver: Any solver with solve_task method (ARCSolver instance)
-            task_ids: Specific task IDs to visualize (None for random)
-            dataset: Which dataset to use ('training' or 'evaluation')
-            n_tasks: Number of tasks to visualize if task_ids is None
-        """
-        # Get data
-        if dataset == 'training':
-            challenges = self.training_challenges
-            solutions = self.training_solutions
-        else:
-            challenges = self.evaluation_challenges
-            solutions = self.evaluation_solutions
-        
-        if not challenges:
-            print(f"No {dataset} data loaded!")
-            return
-        
-        # Select tasks
-        if task_ids is None:
-            available_ids = list(challenges.keys())
-            task_ids = random.sample(available_ids, min(n_tasks, len(available_ids)))
-        
-        # Visualize each task
-        for task_id in task_ids:
-            if task_id not in challenges:
-                print(f"Task {task_id} not found in {dataset} set!")
-                continue
-            
-            task_data = challenges[task_id]
-            solution = solutions.get(task_id) if solutions else None
-            
-            # Get predictions from solver
-            try:
-                # Check if solver returns SolverResult or raw predictions
-                result = solver.solve_task(task_data)
-                if hasattr(result, 'predictions'):
-                    predictions = result.predictions
-                    metadata = result.metadata if hasattr(result, 'metadata') else {}
-                else:
-                    predictions = result
-                    metadata = {}
-            except Exception as e:
-                print(f"Error solving task {task_id}: {e}")
-                continue
-            
-            # Create visualization
-            fig = self.plot_task(task_id, task_data, solution, predictions)
-            plt.show()
-            
-            # Print accuracy for this task
-            if solution:
-                correct = 0
-                total = len(predictions)
-                
-                for i, pred in enumerate(predictions):
-                    if i < len(solution):
-                        if isinstance(solution[i], dict) and 'output' in solution[i]:
-                            truth = solution[i]['output']
-                        else:
-                            truth = solution[i]
-                        
-                        if np.array_equal(pred, truth):
-                            correct += 1
-                
-                accuracy = correct / total if total > 0 else 0
-                solver_name = solver.name if hasattr(solver, 'name') else solver.__class__.__name__
-                print(f"\n📊 Task {task_id} - {solver_name}: {correct}/{total} correct ({accuracy:.0%})")
-                
-                # Print metadata if available
-                if metadata:
-                    print(f"   Metadata: {metadata}")
-            print("-" * 60)
-    
-    def compare_predictions(self, baseline, task_id: str, dataset: str = 'training') -> None:
-        """Show detailed comparison of predictions vs ground truth for a single task.
-        
-        Args:
-            baseline: ARCBaseline instance
-            task_id: Task ID to analyze
-            dataset: Which dataset to use
-        """
-        # Get data
-        if dataset == 'training':
-            challenges = self.training_challenges
-            solutions = self.training_solutions
-        else:
-            challenges = self.evaluation_challenges
-            solutions = self.evaluation_solutions
-        
-        if not challenges or task_id not in challenges:
-            print(f"Task {task_id} not found in {dataset} set!")
-            return
-        
-        task_data = challenges[task_id]
-        solution = solutions.get(task_id) if solutions else None
-        
-        # Get predictions
-        predictions = baseline.solve_task(task_data)
-        
-        # Analyze transformation
-        train_examples = task_data.get('train', [])
-        if hasattr(baseline, 'analyze_transformation'):
-            pattern = baseline.analyze_transformation(train_examples)
-            
-            print(f"🔍 Analysis for Task {task_id}")
-            print(f"   Pattern type: {pattern.pattern_type}")
-            print(f"   Confidence: {pattern.confidence:.2f}")
-            if pattern.params:
-                print(f"   Parameters: {pattern.params}")
-        
-        # Create detailed visualization
-        fig = self.plot_task(task_id, task_data, solution, predictions)
-        plt.show()
-        
-        # Detailed comparison
-        if solution:
-            print(f"\n📊 Detailed Comparison:")
-            for i, pred in enumerate(predictions):
-                if i < len(solution):
-                    if isinstance(solution[i], dict) and 'output' in solution[i]:
-                        truth = solution[i]['output']
-                    else:
-                        truth = solution[i]
-                    
-                    pred_arr = np.array(pred)
-                    truth_arr = np.array(truth)
-                    
-                    is_correct = np.array_equal(pred_arr, truth_arr)
-                    
-                    print(f"\n   Test {i+1}:")
-                    print(f"     Prediction shape: {pred_arr.shape}")
-                    print(f"     Ground truth shape: {truth_arr.shape}")
-                    print(f"     Correct: {'✓' if is_correct else '✗'}")
-                    
-                    if not is_correct:
-                        # Show what's different
-                        if pred_arr.shape == truth_arr.shape:
-                            diff_count = np.sum(pred_arr != truth_arr)
-                            total_pixels = pred_arr.size
-                            print(f"     Pixels different: {diff_count}/{total_pixels} ({diff_count/total_pixels*100:.1f}%)")
-                        else:
-                            print(f"     Shape mismatch!")
-    
-    def evaluate_and_visualize(self, baseline, dataset: str = 'training', 
-                               n_samples: int = 5, show_only_errors: bool = False) -> None:
-        """Evaluate baseline and visualize results.
-        
-        Args:
-            baseline: ARCBaseline instance
-            dataset: Which dataset to use
-            n_samples: Number of examples to visualize
-            show_only_errors: If True, only show incorrect predictions
-        """
-        if dataset == 'training':
-            challenges = self.training_challenges
-            solutions = self.training_solutions
-        else:
-            challenges = self.evaluation_challenges
-            solutions = self.evaluation_solutions
-        
-        if not challenges or not solutions:
-            print(f"No {dataset} data with solutions loaded!")
-            return
-        
-        print(f"🔍 Evaluating on {dataset} set...")
-        
-        # Collect results
-        results = []
-        for task_id in list(challenges.keys())[:n_samples * 3]:  # Check more to find errors
-            task_data = challenges[task_id]
-            predictions = baseline.solve_task(task_data)
-            solution = solutions[task_id]
-            
-            # Check correctness
-            all_correct = True
-            for i, pred in enumerate(predictions):
-                if i < len(solution):
-                    if isinstance(solution[i], dict) and 'output' in solution[i]:
-                        truth = solution[i]['output']
-                    else:
-                        truth = solution[i]
-                    
-                    if not np.array_equal(pred, truth):
-                        all_correct = False
-                        break
-            
-            results.append({
-                'task_id': task_id,
-                'correct': all_correct,
-                'predictions': predictions,
-                'solution': solution
-            })
-        
-        # Filter based on show_only_errors
-        if show_only_errors:
-            results_to_show = [r for r in results if not r['correct']][:n_samples]
-            if not results_to_show:
-                print("No errors found in the sample!")
-                results_to_show = results[:n_samples]
-        else:
-            results_to_show = results[:n_samples]
-        
-        # Summary statistics
-        total_tasks = len(results)
-        correct_tasks = sum(1 for r in results if r['correct'])
-        print(f"\n📊 Overall: {correct_tasks}/{total_tasks} tasks fully correct ({correct_tasks/total_tasks*100:.1f}%)")
-        
-        # Visualize selected results
-        print(f"\n📈 Showing {len(results_to_show)} examples:")
-        for result in results_to_show:
-            task_id = result['task_id']
-            task_data = challenges[task_id]
-            
-            status = "✓ Correct" if result['correct'] else "✗ Wrong"
-            print(f"\nTask {task_id}: {status}")
-            
-            fig = self.plot_task(task_id, task_data, 
-                               result['solution'], result['predictions'])
-            plt.show()
-
-
-# Enhanced convenience function
-def create_viewer(data_dir: str = "data", auto_load: bool = True) -> ARCNotebookViewer:
-    """Create and optionally load an ARC viewer.
-    
-    Args:
-        data_dir: Directory containing the data files
-        auto_load: Whether to automatically load data
-        
-    Returns:
-        ARCNotebookViewer instance
-    """
-    viewer = ARCNotebookViewer(data_dir=data_dir)
-    if auto_load:
-        viewer.load_data()
-    return viewer

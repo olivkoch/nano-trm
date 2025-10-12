@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings('ignore')
+
 import shutil
 import torch
 import os
@@ -6,7 +9,6 @@ import shutil
 import wandb
 from pathlib import Path
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
-from src.viewer.arc_notebook_viewer import create_viewer
 from lightning.pytorch.loggers import Logger
 from typing import Optional
 from src.nn.utils import (
@@ -20,9 +22,6 @@ from src.nn.utils import (
 log = RankedLogger(__name__, rank_zero_only=True)
 import hydra
 from omegaconf import DictConfig, OmegaConf
-
-import warnings
-warnings.filterwarnings("ignore", module="pydantic")
 
 def flatten_config(cfg, parent_key="", sep="."):
     """Flatten a nested config to avoid W&B duplication."""

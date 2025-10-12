@@ -1,4 +1,4 @@
-_target_: src.nn.models.fairness_detection_module.TRMModule
+_target_: src.nn.models.trm_module.TRMModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
 
 hidden_size: 512

@@ -7,7 +7,7 @@ defaults:
   - data: null
   - model: null
   - callbacks: default
-  - logger: csv
+  - logger: many_loggers
   - trainer: default
   - paths: default
   - extras: default

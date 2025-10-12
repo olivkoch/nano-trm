@@ -89,6 +89,14 @@ def train(cfg: DictConfig) -> Optional[float]:
             wandb.config.update(flatten_config(cfg), allow_val_change=True)
 
     log.info("Starting training!")
+
+    datamodule.setup(stage="fit")
+    log.info(f"Val check interval: {cfg.trainer.get('val_check_interval', 'default (1.0)')}")
+    log.info(f"Check val every n epoch: {cfg.trainer.get('check_val_every_n_epoch', 'default (1.0)')}")
+    log.info(f"Steps per epoch: {len(datamodule.train_dataset) // cfg.data.batch_size}")
+    log.info(f"Max epochs: {cfg.trainer.max_epochs}")
+    log.info(f"Batch size: {cfg.data.batch_size}")
+    
     trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
 
     log.info("Training finished!")
@@ -103,24 +111,6 @@ def train(cfg: DictConfig) -> Optional[float]:
 
         log.info(f"Uploading training output to: {save_dir}")
         shutil.copytree(output_dir, save_dir)
-
-    # Create and train neural solver
-    if False:
-        neural_solver = NeuralARCSolver(name="SimpleNeuralNet")
-
-        evaluator = ARCEvaluator(data_dir="data")
-
-        # Train on some data (placeholder training)
-        training_data = evaluator.datasets['training']['challenges']
-        history = neural_solver.train(training_data, epochs=10)
-        print(f"Training complete. Final loss: {history['loss'][-1]:.3f}")
-
-        # Evaluate
-        result = evaluator.evaluate_solver(neural_solver, dataset='training', max_tasks=20)
-
-        # store model weights
-        os.makedirs("checkpoints", exist_ok=True)
-        torch.save(neural_solver.model.state_dict(), "checkpoints/neural_arc_solver.pth")
 
 @hydra.main(version_base="1.3", config_path="./configs", config_name="train.yaml")
 def main(cfg: DictConfig):

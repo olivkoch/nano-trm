@@ -11,9 +11,9 @@ tags: ["arc", "mlp"]
 
 timekeeping:
   max_epochs: 1  # Longer training for combined losses
-  batch_size: 512
-  num_workers: 24
-  nb_samples_per_epoch: 100
+  batch_size: 32
+  num_workers: 4
+  # nb_samples_per_epoch: 100
 
 trainer:
   accumulate_grad_batches: 1

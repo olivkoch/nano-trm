@@ -9,34 +9,15 @@ defaults:
 
 tags: ["arc", "trm"]
 
-data:
-  _target_: src.nn.data.detection_datamodule.DetectionDataModule
-  pin_memory: true
-  persistent_workers: true
-  train_dataset:
-    path: /home/ubuntu/training_256_bboxes
-  val_dataset:
-    path: /home/ubuntu/validation_256_bboxes # /home/ubuntu/wild_deepfake/validation.lance # /home/ubuntu/validation_256_bboxes
-  download_data:
-    - src: lakefs://ai-face-detection-challenge/main/serialized_dataset/lance/
-      dst: /opt/dlami/nvme/dataset/
-  sampler:
-    _target_: src.nn.data.attribute_sampler.AttributeSampler
-    attribute: Intersection
-  skip_data_download: true
-
 timekeeping:
   max_epochs: 1  # Longer training for combined losses
   batch_size: 512
   num_workers: 24
-  nb_samples_per_epoch: 1317236
+  nb_samples_per_epoch: 100
 
 trainer:
   accumulate_grad_batches: 1
   gradient_clip_val: 1.0
-  limit_train_batches: 500 # ${timekeeping.nb_steps_per_epoch}
-  limit_val_batches: 500
 
-save_dir: lakefs://arc/ml-experiments/trm-arc-experiments/
+save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true
-auto_tune_trainer: false

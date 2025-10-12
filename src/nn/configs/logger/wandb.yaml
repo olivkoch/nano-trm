@@ -7,8 +7,8 @@ wandb:
   offline: false
   id: null  # Same as version, can be used to resume runs.
   anonymous: null  # Set to enable anonymous logging
-  entity: "chimp-adv-challenge"
-  project: "ai-face-fairness-bench"
+  entity: "olivier-koch"
+  project: "arc-agi"
   log_model: false  # If true, upload lightning ckpts
   prefix: ""  # String to put at the beginning of metric keys
   tags: ${tags}

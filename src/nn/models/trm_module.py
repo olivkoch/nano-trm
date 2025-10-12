@@ -3,7 +3,6 @@ TRM PyTorch Lightning Module
 Complete training implementation with DataModule integration
 """
 
-import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +11,6 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 from lightning import LightningModule
-
 
 class TRMModule(LightningModule):
     """
@@ -323,11 +321,16 @@ class TRMModule(LightningModule):
     
     def setup_ema(self):
         """Setup exponential moving average model."""
-        self.ema_model = torch.nn.ModuleDict()
+        # Use nn.ParameterDict instead of nn.ModuleDict for storing tensors
+        self.ema_model = nn.ParameterDict()
         for name, param in self.named_parameters():
             if param.requires_grad:
-                self.ema_model[name.replace('.', '_')] = param.data.clone()
-    
+                # Store as Parameter (not just tensor)
+                self.ema_model[name.replace('.', '_')] = nn.Parameter(
+                    param.data.clone(), 
+                    requires_grad=False
+                )
+            
     def update_ema(self):
         """Update EMA parameters."""
         if self.ema_model is None:
@@ -344,17 +347,25 @@ class TRMModule(LightningModule):
     
     def ema_scope(self):
         """Context manager for using EMA parameters."""
-        # Save current parameters
-        backup = {}
-        for name, param in self.named_parameters():
-            backup[name] = param.data.clone()
-            ema_name = name.replace('.', '_')
-            if ema_name in self.ema_model:
-                param.data.copy_(self.ema_model[ema_name])
+        from contextlib import contextmanager
         
-        try:
-            yield
-        finally:
-            # Restore original parameters
+        @contextmanager
+        def _ema_scope():
+            # Save current parameters
+            backup = {}
             for name, param in self.named_parameters():
-                param.data.copy_(backup[name])
+                if param.requires_grad:
+                    backup[name] = param.data.clone()
+                    ema_name = name.replace('.', '_')
+                    if ema_name in self.ema_model:
+                        param.data.copy_(self.ema_model[ema_name].data)
+            
+            try:
+                yield
+            finally:
+                # Restore original parameters
+                for name, param in self.named_parameters():
+                    if name in backup:
+                        param.data.copy_(backup[name])
+        
+        return _ema_scope()

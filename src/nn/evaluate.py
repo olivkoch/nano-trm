@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Optional
+import warnings
 
 import hydra
 import torch
@@ -18,6 +19,8 @@ log = RankedLogger(__name__, rank_zero_only=True)
 # eval resolver already registered in train.py which we import from
 torch.set_float32_matmul_precision("medium")
 
+warnings.filterwarnings("ignore", module="pydantic")
+
 
 @task_wrapper
 def evaluate(cfg: DictConfig) -> Optional[float]:
@@ -32,7 +35,7 @@ def evaluate(cfg: DictConfig) -> Optional[float]:
         None (evaluation outputs are saved to LakeFS)
     """
 
-      # Initialize evaluator
+    # Initialize evaluator
     evaluator = ARCEvaluator(
         checkpoint_path=cfg.checkpoint,
         data_dir=cfg.data_dir,
@@ -67,7 +70,9 @@ def evaluate(cfg: DictConfig) -> Optional[float]:
         print(f"\nPer-task results saved to {per_task_file}")
     
     # Save results
-    evaluator.save_results(results, cfg.output_dir)
+    output_dir = cfg.output_dir if cfg.output_dir is not None else str(Path(cfg.checkpoint).parent / "evaluation_results")
+    print(f"Saving evaluation results to {output_dir}")
+    evaluator.save_results(results, output_dir)
 
 
 @hydra.main(version_base="1.3", config_path="./configs", config_name="evaluate.yaml")

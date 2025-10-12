@@ -405,11 +405,212 @@ class ARCNotebookViewer:
         
         return predictions
     
+    def _evaluate_task_correctness(self, task_data: Dict, predictions: List[np.ndarray], 
+                               solution: Optional[Union[List, Dict]]) -> Dict:
+        """Evaluate if predictions for a task are correct.
+        
+        Args:
+            task_data: Task dictionary
+            predictions: Model predictions
+            solution: Ground truth solution
+            
+        Returns:
+            Dictionary with correctness info
+        """
+        if not solution:
+            return {
+                'all_correct': False,
+                'num_correct': 0,
+                'num_total': len(predictions),
+                'has_solution': False
+            }
+        
+        num_correct = 0
+        num_total = len(predictions)
+        
+        for i, pred in enumerate(predictions):
+            if i < len(solution):
+                if isinstance(solution[i], dict) and 'output' in solution[i]:
+                    truth = solution[i]['output']
+                else:
+                    truth = solution[i]
+                
+                truth_arr = np.array(truth)
+                if np.array_equal(pred, truth_arr):
+                    num_correct += 1
+        
+        return {
+            'all_correct': num_correct == num_total,
+            'num_correct': num_correct,
+            'num_total': num_total,
+            'has_solution': True
+        }
+
+
+    def _filter_tasks_by_correctness(self, task_ids: List[str], challenges: Dict, 
+                                    solutions: Dict, model: torch.nn.Module,
+                                    device: str, show_only_correct: bool,
+                                    show_only_errors: bool, n_tasks: int) -> List[str]:
+        """Filter tasks based on model correctness.
+        
+        Args:
+            task_ids: List of task IDs to check
+            challenges: Challenge dictionary
+            solutions: Solutions dictionary
+            model: PyTorch model
+            device: Device to run on
+            show_only_correct: Filter for correct predictions only
+            show_only_errors: Filter for incorrect predictions only
+            n_tasks: Target number of tasks to return
+            
+        Returns:
+            Filtered list of task IDs
+        """
+        filtered_ids = []
+        
+        for task_id in task_ids:
+            if task_id not in challenges:
+                continue
+                
+            task_data = challenges[task_id]
+            solution = solutions.get(task_id)
+            
+            if not solution:
+                continue
+            
+            try:
+                # Get predictions
+                predictions = self.predict_with_model(model, task_data, device)
+                
+                # Evaluate correctness
+                eval_result = self._evaluate_task_correctness(task_data, predictions, solution)
+                
+                # Add to filtered list based on criteria
+                if show_only_correct and eval_result['all_correct']:
+                    filtered_ids.append(task_id)
+                elif show_only_errors and not eval_result['all_correct']:
+                    filtered_ids.append(task_id)
+                
+                # Stop if we have enough
+                if len(filtered_ids) >= n_tasks:
+                    break
+                    
+            except Exception as e:
+                # Skip tasks that cause errors
+                continue
+        
+        return filtered_ids
+
+
+    def _select_tasks_to_visualize(self, task_ids: Optional[List[str]], challenges: Dict,
+                                solutions: Dict, model: Optional[torch.nn.Module],
+                                device: str, dataset: str, n_tasks: int,
+                                show_only_correct: bool, show_only_errors: bool) -> List[str]:
+        """Select which tasks to visualize based on criteria.
+        
+        Args:
+            task_ids: Specific task IDs or None for random selection
+            challenges: Challenge dictionary
+            solutions: Solutions dictionary
+            model: PyTorch model (required if filtering by correctness)
+            device: Device to run on
+            dataset: Dataset name for messages
+            n_tasks: Number of tasks to select
+            show_only_correct: Only select tasks with perfect predictions
+            show_only_errors: Only select tasks with errors
+            
+        Returns:
+            List of task IDs to visualize
+        """
+        # If specific task IDs provided, return them
+        if task_ids is not None:
+            return task_ids
+        
+        available_ids = list(challenges.keys())
+        
+        # If no filtering, just sample randomly
+        if not (show_only_correct or show_only_errors):
+            return random.sample(available_ids, min(n_tasks, len(available_ids)))
+        
+        # Filtering requires solutions and model
+        if not solutions:
+            print(f"⚠️  No {dataset} solutions loaded! Cannot filter by correctness.")
+            return random.sample(available_ids, min(n_tasks, len(available_ids)))
+        
+        if model is None:
+            print(f"⚠️  Model required for filtering! Showing random tasks instead.")
+            return random.sample(available_ids, min(n_tasks, len(available_ids)))
+        
+        # Sample more tasks to check for filtering
+        check_size = min(len(available_ids), n_tasks * 10)
+        task_ids_to_check = random.sample(available_ids, check_size)
+        
+        # Filter tasks
+        filtered_ids = self._filter_tasks_by_correctness(
+            task_ids_to_check, challenges, solutions, model, device,
+            show_only_correct, show_only_errors, n_tasks
+        )
+        
+        # Handle case where no matching tasks found
+        if not filtered_ids:
+            filter_type = "correct" if show_only_correct else "with errors"
+            print(f"⚠️  No tasks found {filter_type} in sample of {check_size} tasks!")
+            print("Showing random tasks instead...")
+            return random.sample(available_ids, min(n_tasks, len(available_ids)))
+        
+        # Report what we found
+        if show_only_correct:
+            print(f"✓ Found {len(filtered_ids)} tasks where model got all test examples correct")
+        else:
+            print(f"✗ Found {len(filtered_ids)} tasks where model made errors")
+        
+        return filtered_ids[:n_tasks]
+
+
+    def _visualize_single_task(self, task_id: str, task_data: Dict, 
+                            solution: Optional[Union[List, Dict]],
+                            predictions: List[np.ndarray],
+                            model_name: str) -> Dict:
+        """Visualize a single task and return its metrics.
+        
+        Args:
+            task_id: Task identifier
+            task_data: Task data dictionary
+            solution: Ground truth solution
+            predictions: Model predictions
+            model_name: Name of the model for display
+            
+        Returns:
+            Dictionary with task metrics
+        """
+        # Create visualization
+        fig = self.plot_task(task_id, task_data, solution, predictions)
+        plt.show()
+        
+        # Evaluate and print accuracy
+        eval_result = self._evaluate_task_correctness(task_data, predictions, solution)
+        
+        if eval_result['has_solution']:
+            num_correct = eval_result['num_correct']
+            num_total = eval_result['num_total']
+            accuracy = num_correct / num_total if num_total > 0 else 0
+            
+            status = "✓ PERFECT" if eval_result['all_correct'] else f"✗ {num_correct}/{num_total}"
+            print(f"\n📊 Task {task_id} - {model_name}: {status} ({accuracy:.0%})")
+        else:
+            print(f"\n📊 Task {task_id} - {model_name}: No solution available")
+        
+        print("-" * 60)
+        
+        return eval_result
+
     def visualize_model_predictions(self, model: torch.nn.Module, 
                                     task_ids: Optional[List[str]] = None, 
                                     dataset: str = 'training', 
                                     n_tasks: int = 3,
-                                    device: str = 'cpu') -> None:
+                                    device: str = 'cpu',
+                                    show_only_correct: bool = False,
+                                    show_only_errors: bool = False) -> Dict:
         """Visualize model predictions compared to ground truth.
         
         Args:
@@ -418,6 +619,11 @@ class ARCNotebookViewer:
             dataset: Which dataset to use ('training' or 'evaluation')
             n_tasks: Number of tasks to visualize if task_ids is None
             device: Device to run model on
+            show_only_correct: If True, only show tasks where model got ALL test examples correct
+            show_only_errors: If True, only show tasks where model got at least one test example wrong
+            
+        Returns:
+            Dictionary with summary statistics
         """
         # Get data
         if dataset == 'training':
@@ -429,17 +635,23 @@ class ARCNotebookViewer:
         
         if not challenges:
             print(f"No {dataset} data loaded!")
-            return
+            return {}
         
-        # Select tasks
-        if task_ids is None:
-            available_ids = list(challenges.keys())
-            task_ids = random.sample(available_ids, min(n_tasks, len(available_ids)))
+        # Select tasks to visualize
+        selected_task_ids = self._select_tasks_to_visualize(
+            task_ids, challenges, solutions, model, device, dataset,
+            n_tasks, show_only_correct, show_only_errors
+        )
         
-        # Visualize each task
-        for task_id in task_ids:
+        # Visualize each task and collect metrics
+        model_name = model.__class__.__name__
+        total_shown = 0
+        total_correct = 0
+        task_results = []
+        
+        for task_id in selected_task_ids:
             if task_id not in challenges:
-                print(f"Task {task_id} not found in {dataset} set!")
+                print(f"⚠️  Task {task_id} not found in {dataset} set!")
                 continue
             
             task_data = challenges[task_id]
@@ -449,35 +661,42 @@ class ARCNotebookViewer:
             try:
                 predictions = self.predict_with_model(model, task_data, device)
             except Exception as e:
-                print(f"Error predicting task {task_id}: {e}")
+                print(f"❌ Error predicting task {task_id}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
             
-            # Create visualization
-            fig = self.plot_task(task_id, task_data, solution, predictions)
-            plt.show()
+            # Visualize and get metrics
+            eval_result = self._visualize_single_task(
+                task_id, task_data, solution, predictions, model_name
+            )
             
-            # Print accuracy for this task
-            if solution:
-                correct = 0
-                total = len(predictions)
+            # Track statistics
+            if eval_result['has_solution']:
+                total_shown += 1
+                if eval_result['all_correct']:
+                    total_correct += 1
                 
-                for i, pred in enumerate(predictions):
-                    if i < len(solution):
-                        if isinstance(solution[i], dict) and 'output' in solution[i]:
-                            truth = solution[i]['output']
-                        else:
-                            truth = solution[i]
-                        
-                        truth_arr = np.array(truth)
-                        if np.array_equal(pred, truth_arr):
-                            correct += 1
-                
-                accuracy = correct / total if total > 0 else 0
-                model_name = model.__class__.__name__
-                print(f"\n📊 Task {task_id} - {model_name}: {correct}/{total} correct ({accuracy:.0%})")
-            print("-" * 60)
+                task_results.append({
+                    'task_id': task_id,
+                    'correct': eval_result['all_correct'],
+                    'num_correct': eval_result['num_correct'],
+                    'num_total': eval_result['num_total']
+                })
+        
+        # Print summary
+        if total_shown > 0:
+            print(f"\n{'='*60}")
+            print(f"📊 Summary: {total_correct}/{total_shown} tasks completely correct "
+                f"({total_correct/total_shown*100:.1f}%)")
+            print(f"{'='*60}")
+        
+        return {
+            'total_shown': total_shown,
+            'total_correct': total_correct,
+            'accuracy': total_correct / total_shown if total_shown > 0 else 0,
+            'task_results': task_results
+        }
     
     def compare_predictions(self, model: torch.nn.Module, task_id: str, 
                            dataset: str = 'training', device: str = 'cpu') -> None:

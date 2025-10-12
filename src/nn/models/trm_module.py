@@ -12,6 +12,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 from lightning import LightningModule
 
+from src.nn.utils import RankedLogger
+log = RankedLogger(__name__, rank_zero_only=True)
+
 class TRMModule(LightningModule):
     """
     PyTorch Lightning implementation of TRM (Tiny Recursive Model).
@@ -115,7 +118,7 @@ class TRMModule(LightningModule):
         return y, z
     
     def deep_recursion(self, x: torch.Tensor, y: torch.Tensor,
-                      z: torch.Tensor, training: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                  z: torch.Tensor, training: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Deep recursion with T steps.
         T-1 without gradients, 1 with gradients (during training).
@@ -133,13 +136,13 @@ class TRMModule(LightningModule):
             with torch.no_grad():
                 y, z = self.latent_recursion(x, y, z)
         
-        # Compute halting probability
-        q = torch.sigmoid(self.q_head(y.mean(dim=1, keepdim=True)))
+        # Compute halting logits (NOT probabilities)
+        q_logits = self.q_head(y.mean(dim=1, keepdim=True))  # Raw logits
         
-        return y, z, q
+        return y, z, q_logits
     
     def forward(self, x: torch.Tensor, 
-                supervision_steps: Optional[int] = None) -> torch.Tensor:
+            supervision_steps: Optional[int] = None) -> torch.Tensor:
         """
         Forward pass with deep supervision.
         
@@ -165,11 +168,14 @@ class TRMModule(LightningModule):
         n_steps = supervision_steps or self.hparams.N_supervision
         
         for step in range(n_steps):
-            y, z, q = self.deep_recursion(x_emb, y, z, training=self.training)
+            y, z, q_logits = self.deep_recursion(x_emb, y, z, training=self.training)
             
             # Early stopping based on confidence (inference only)
-            if not self.training and q.mean() > 0.8:
-                break
+            # Apply sigmoid to convert logits to probability
+            if not self.training:
+                q_prob = torch.sigmoid(q_logits)
+                if q_prob.mean() > 0.8:
+                    break
             
             # Detach for next iteration (as in paper)
             y = y.detach()
@@ -182,11 +188,13 @@ class TRMModule(LightningModule):
         return y_out
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Training step with deep supervision."""
-        x = batch['input']  # [batch, H, W]
-        y_true = batch['output']  # [batch, H, W]
+        """Training step with deep supervision - memory efficient."""
+        x = batch['input']
+        y_true = batch['output']
         
         batch_size, height, width = x.shape
+        
+        log.info(f"\tTraining step {self.global_step} with batch size {x.size(0)}")
         
         # Embed input
         x_emb = self.input_embedding(x)
@@ -203,7 +211,7 @@ class TRMModule(LightningModule):
         # Deep supervision training loop
         for step in range(self.hparams.N_supervision):
             # Deep recursion
-            y, z, q = self.deep_recursion(x_emb, y, z, training=True)
+            y, z, q_logits = self.deep_recursion(x_emb, y, z, training=True)
             
             # Predict output
             y_hat = self.output_head(y)
@@ -211,61 +219,164 @@ class TRMModule(LightningModule):
             
             # Classification loss
             loss = F.cross_entropy(
-                y_hat.permute(0, 3, 1, 2),  # [batch, colors, H, W]
+                y_hat.permute(0, 3, 1, 2),
                 y_true,
-                ignore_index=0  # Ignore padding
+                ignore_index=0
             )
             
-            # Halting loss (learns when to stop)
-            correct = (y_hat.argmax(dim=-1) == y_true).float()
-            # Mask out padding
-            mask = (y_true != 0).float()
-            if mask.sum() > 0:
-                correct = (correct * mask).sum() / mask.sum()
-            else:
-                correct = correct.mean()
+            # Halting loss
+            with torch.no_grad():  # Don't need gradients for accuracy computation
+                correct = (y_hat.argmax(dim=-1) == y_true).float()
+                mask = (y_true != 0).float()
+                if mask.sum() > 0:
+                    correct = (correct * mask).sum() / mask.sum()
+                else:
+                    correct = correct.mean()
             
-            halt_target = (correct > 0.95).float()  # Stop if >95% accurate
-            halt_loss = F.binary_cross_entropy(q.squeeze(), halt_target.unsqueeze(0).expand(batch_size))
+            halt_target = (correct > 0.95).float()
+            halt_loss = F.binary_cross_entropy_with_logits(
+                q_logits.squeeze(),
+                halt_target.expand(batch_size)
+            )
             
             # Combined loss
             step_loss = loss + 0.5 * halt_loss
-            total_loss = total_loss + step_loss
             
-            # Log metrics
-            self.log(f'train/loss_step_{step}', step_loss, on_step=True, on_epoch=False)
-            self.log(f'train/accuracy_step_{step}', correct, on_step=True, on_epoch=False)
+            # CRITICAL FIX: Accumulate loss values, not tensors
+            # This prevents keeping the entire computation graph
+            total_loss = total_loss + step_loss.item()  # .item() extracts the scalar
+            
+            # Keep the last step_loss tensor for backprop
+            last_step_loss = step_loss
+            
+            # Log metrics (use .item() to avoid keeping tensors)
+            self.log(f'train/loss_step_{step}', step_loss.item(), on_step=False, on_epoch=True)
+            self.log(f'train/accuracy_step_{step}', correct.item(), on_step=False, on_epoch=True)
             
             n_steps += 1
             
-            # Early stopping based on Q-head
-            if q.mean() > 0.8:
-                break
+            # Early stopping
+            with torch.no_grad():
+                q_prob = torch.sigmoid(q_logits)
+                if q_prob.mean() > 0.8:
+                    break
             
             # Detach for next iteration
             y = y.detach()
             z = z.detach()
         
-        # Average loss over steps
-        avg_loss = total_loss / n_steps
+        # Return the last step's loss (which has gradients)
+        # This is what gets backpropagated
+        final_loss = last_step_loss
         
-        # Log overall metrics
-        self.log('train/loss', avg_loss, prog_bar=True)
+        # Log average loss for monitoring (scalar only)
+        avg_loss_value = total_loss / n_steps
+        self.log('train/loss', avg_loss_value, prog_bar=True)
         self.log('train/n_steps', float(n_steps))
         
-        # Update EMA if enabled
-        if self.hparams.use_ema and self.ema_model is not None:
+        # Update EMA
+        if self.hparams.use_ema and hasattr(self, 'ema_params') and self.ema_params is not None:
             self.update_ema()
         
-        return avg_loss
+        return final_loss
+
+    # def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    #     """Training step with deep supervision."""
+        
+    #     x = batch['input']  # [batch, H, W]
+    #     y_true = batch['output']  # [batch, H, W]
+        
+    #     batch_size, height, width = x.shape
+        
+    #     log.info(f"\tTraining step {self.global_step} with batch size {x.size(0)}")
+
+    #     # Embed input
+    #     x_emb = self.input_embedding(x)
+    #     x_emb = x_emb.view(batch_size, -1, self.hparams.hidden_size)
+        
+    #     # Initialize y and z
+    #     seq_len = height * width
+    #     y = self.y_init.expand(batch_size, seq_len, -1).clone()
+    #     z = self.z_init.expand(batch_size, seq_len, -1).clone()
+        
+    #     total_loss = 0
+    #     n_steps = 0
+        
+    #     # Deep supervision training loop
+    #     for step in range(self.hparams.N_supervision):
+    #         # Deep recursion
+    #         y, z, q_logits = self.deep_recursion(x_emb, y, z, training=True)
+            
+    #         # Predict output
+    #         y_hat = self.output_head(y)
+    #         y_hat = y_hat.view(batch_size, height, width, self.hparams.num_colors)
+            
+    #         # Classification loss
+    #         loss = F.cross_entropy(
+    #             y_hat.permute(0, 3, 1, 2),  # [batch, colors, H, W]
+    #             y_true,
+    #             ignore_index=0  # Ignore padding
+    #         )
+            
+    #         # Halting loss (learns when to stop)
+    #         correct = (y_hat.argmax(dim=-1) == y_true).float()
+    #         # Mask out padding
+    #         mask = (y_true != 0).float()
+    #         if mask.sum() > 0:
+    #             correct = (correct * mask).sum() / mask.sum()
+    #         else:
+    #             correct = correct.mean()
+            
+    #         halt_target = (correct > 0.95).float()  # Stop if >95% accurate
+            
+    #         # USE binary_cross_entropy_with_logits instead of binary_cross_entropy
+    #         # q_logits is now raw logits, not probabilities
+    #         halt_loss = F.binary_cross_entropy_with_logits(
+    #             q_logits.squeeze(),  # Raw logits from q_head
+    #             halt_target.expand(batch_size)  # Target should match batch size
+    #         )
+            
+    #         # Combined loss
+    #         step_loss = loss + 0.5 * halt_loss
+    #         total_loss = total_loss + step_loss
+            
+    #         # Log metrics
+    #         self.log(f'train/loss_step_{step}', step_loss, on_step=True, on_epoch=False)
+    #         self.log(f'train/accuracy_step_{step}', correct, on_step=True, on_epoch=False)
+            
+    #         n_steps += 1
+            
+    #         # Early stopping based on Q-head (apply sigmoid for threshold check)
+    #         q_prob = torch.sigmoid(q_logits)
+    #         if q_prob.mean() > 0.8:
+    #             break
+            
+    #         # Detach for next iteration
+    #         y = y.detach()
+    #         z = z.detach()
+        
+    #     # Average loss over steps
+    #     avg_loss = total_loss / n_steps
+        
+    #     # Log overall metrics
+    #     self.log('train/loss', avg_loss, prog_bar=True)
+    #     self.log('train/n_steps', float(n_steps))
+        
+    #     # Update EMA if enabled
+    #     if self.hparams.use_ema and hasattr(self, 'ema_params') and self.ema_params is not None:
+    #         self.update_ema()
+        
+    #     return avg_loss
     
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
         """Validation step."""
         x = batch['input']
         y_true = batch['output']
         
+        log.info(f"\tValidation step {self.global_step}")
+        
         # Use EMA model for validation if available
-        if self.hparams.use_ema and self.ema_model is not None:
+        if self.hparams.use_ema and hasattr(self, 'ema_params') and self.ema_params is not None:
             with self.ema_scope():
                 y_pred = self(x, supervision_steps=self.hparams.N_supervision)
         else:

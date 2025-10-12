@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 # Import your modules (adjust paths as needed)
 from src.nn.data.arc_datamodule import ARCTaskDataset, TRMTransform, collate_fn
-from src.nn.models.mlp_module import ConvMLPModule, SimpleMLPLightningModule, MLPLightningModule
+from src.nn.models.mlp_module import ConvMLPModule
 
 
 class ARCEvaluator:
@@ -63,10 +63,10 @@ class ARCEvaluator:
         
     def load_model(self):
         """Load model from checkpoint."""
-        print(f"Loading model from {self.checkpoint_path}")
+        print(f"Loading model from {self.checkpoint_path} and device={self.device}")
         
         # Try to infer model type from checkpoint
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
         
         # Check hyperparameters to determine model type
         if 'hyper_parameters' in checkpoint:
@@ -83,18 +83,6 @@ class ARCEvaluator:
             elif 'hidden_channels' in hparams:
                 # ConvMLP model
                 model = ConvMLPModule.load_from_checkpoint(
-                    self.checkpoint_path,
-                    map_location=self.device
-                )
-            elif 'encoder_layers' in hparams:
-                # Full MLP model
-                model = MLPLightningModule.load_from_checkpoint(
-                    self.checkpoint_path,
-                    map_location=self.device
-                )
-            else:
-                # Simple MLP model
-                model = SimpleMLPLightningModule.load_from_checkpoint(
                     self.checkpoint_path,
                     map_location=self.device
                 )

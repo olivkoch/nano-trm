@@ -63,11 +63,12 @@ class TRMTransform:
             output_grid = np.flipud(output_grid)
         
         # Color permutation (keeping 0 as background)
-        perm = np.random.permutation(self.num_colors - 1) + 1
-        perm = np.concatenate([[0], perm])  # Keep 0 as 0
-        
-        input_grid = perm[input_grid]
-        output_grid = perm[output_grid]
+        if np.random.random() > 0.5:  # Only apply 50% of the time
+            perm = np.random.permutation(self.num_colors - 1) + 1
+            perm = np.concatenate([[0], perm])  # Keep 0 as 0
+            
+            input_grid = perm[input_grid]
+            output_grid = perm[output_grid]
         
         return input_grid, output_grid
     
@@ -179,6 +180,7 @@ class ARCTaskDataset(Dataset):
 class ARCDataModule(LightningDataModule):
     """
     PyTorch Lightning DataModule for training on ARC tasks.
+    Uses full training set for training and evaluation set for validation.
     """
     
     def __init__(self,
@@ -187,8 +189,7 @@ class ARCDataModule(LightningDataModule):
                  num_workers: int = 4,
                  max_grid_size: int = 30,
                  augment_train: bool = True,
-                 samples_per_task: int = 100,  # For augmentation
-                 train_split: float = 0.8):
+                 samples_per_task: int = 100):  # For augmentation
         """
         Initialize DataModule.
         
@@ -199,7 +200,6 @@ class ARCDataModule(LightningDataModule):
             max_grid_size: Maximum grid size for padding
             augment_train: Whether to augment training data
             samples_per_task: Number of augmented samples per task
-            train_split: Fraction of data for training
         """
         super().__init__()
         self.data_dir = data_dir
@@ -208,7 +208,6 @@ class ARCDataModule(LightningDataModule):
         self.max_grid_size = max_grid_size
         self.augment_train = augment_train
         self.samples_per_task = samples_per_task
-        self.train_split = train_split
         
         # Create transforms
         self.train_transform = TRMTransform(
@@ -228,46 +227,57 @@ class ARCDataModule(LightningDataModule):
         
         data_path = Path(self.data_dir)
         
-        # Load training data
+        # Load TRAINING data (for training)
         train_challenges_path = data_path / "arc-agi_training_challenges.json"
         train_solutions_path = data_path / "arc-agi_training_solutions.json"
         
+        # Load EVALUATION data (for validation)
+        eval_challenges_path = data_path / "arc-agi_evaluation_challenges.json"
+        eval_solutions_path = data_path / "arc-agi_evaluation_solutions.json"
+        
+        # Check if files exist
+        if not train_challenges_path.exists():
+            raise FileNotFoundError(f"Training challenges not found: {train_challenges_path}")
+        if not train_solutions_path.exists():
+            raise FileNotFoundError(f"Training solutions not found: {train_solutions_path}")
+        if not eval_challenges_path.exists():
+            raise FileNotFoundError(f"Evaluation challenges not found: {eval_challenges_path}")
+        if not eval_solutions_path.exists():
+            raise FileNotFoundError(f"Evaluation solutions not found: {eval_solutions_path}")
+        
+        # Load training data
         with open(train_challenges_path, 'r') as f:
-            all_challenges = json.load(f)
+            train_challenges = json.load(f)
         
         with open(train_solutions_path, 'r') as f:
-            all_solutions = json.load(f)
+            train_solutions = json.load(f)
         
-        # Split into train/val
-        task_ids = list(all_challenges.keys())
-        n_train = int(len(task_ids) * self.train_split)
+        # Load evaluation data
+        with open(eval_challenges_path, 'r') as f:
+            eval_challenges = json.load(f)
         
-        train_ids = task_ids[:n_train]
-        val_ids = task_ids[n_train:]
-        
-        train_tasks = {tid: all_challenges[tid] for tid in train_ids}
-        train_sols = {tid: all_solutions[tid] for tid in train_ids}
-        
-        val_tasks = {tid: all_challenges[tid] for tid in val_ids}
-        val_sols = {tid: all_solutions[tid] for tid in val_ids}
+        with open(eval_solutions_path, 'r') as f:
+            eval_solutions = json.load(f)
         
         # Create datasets
         self.train_dataset = ARCTaskDataset(
-            train_tasks,
-            train_sols,
+            train_challenges,
+            train_solutions,
             transform=self.train_transform,
             samples_per_task=self.samples_per_task if self.augment_train else 1
         )
         
         self.val_dataset = ARCTaskDataset(
-            val_tasks,
-            val_sols,
+            eval_challenges,
+            eval_solutions,
             transform=self.val_transform,
             samples_per_task=1  # No augmentation for validation
         )
         
-        print(f"Train samples: {len(self.train_dataset)}")
-        print(f"Val samples: {len(self.val_dataset)}")
+        print(f"✓ Loaded training set: {len(train_challenges)} tasks")
+        print(f"  → {len(self.train_dataset)} samples (with augmentation)")
+        print(f"✓ Loaded evaluation set: {len(eval_challenges)} tasks")
+        print(f"  → {len(self.val_dataset)} samples")
     
     def train_dataloader(self):
         return DataLoader(
@@ -275,7 +285,8 @@ class ARCDataModule(LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True if self.num_workers > 0 else False
         )
     
     def val_dataloader(self):
@@ -284,11 +295,12 @@ class ARCDataModule(LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True if self.num_workers > 0 else False
         )
     
     def test_dataloader(self):
-        # For testing, use validation dataset
+        # For testing, use evaluation dataset
         return self.val_dataloader()
 
 
@@ -329,7 +341,8 @@ class TRMDataModuleWithCollate(ARCDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            collate_fn=collate_fn
+            collate_fn=collate_fn,
+            persistent_workers=True if self.num_workers > 0 else False
         )
     
     def val_dataloader(self):
@@ -339,5 +352,6 @@ class TRMDataModuleWithCollate(ARCDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
-            collate_fn=collate_fn
+            collate_fn=collate_fn,
+            persistent_workers=True if self.num_workers > 0 else False
         )

@@ -1,9 +1,8 @@
 _target_: src.nn.data.ARCDataModule
 _recursive_: false
 data_dir: "data"
-batch_size: 32
-num_workers: 4
+batch_size: ${timekeeping.batch_size}
+num_workers: ${timekeeping.num_workers}
 max_grid_size: 30
 augment_train: false
 samples_per_task: 100  # For augmentation
-train_split: 0.8

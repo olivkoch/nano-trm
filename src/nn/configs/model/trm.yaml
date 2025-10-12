@@ -13,5 +13,5 @@ weight_decay: 0.01
 warmup_steps: 2000
 max_steps: 100000
 ema_decay: 0.999
-use_ema: True
+use_ema: false
 output_dir: null

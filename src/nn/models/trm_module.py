@@ -1,6 +1,5 @@
 """
-TRM PyTorch Lightning Module
-Complete training implementation with DataModule integration
+TRM PyTorch Lightning Module - Corrected to match paper pseudocode
 """
 
 import torch
@@ -8,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, Optional, Tuple
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
 from lightning import LightningModule
 
@@ -18,6 +16,7 @@ log = RankedLogger(__name__, rank_zero_only=True)
 class TRMModule(LightningModule):
     """
     PyTorch Lightning implementation of TRM (Tiny Recursive Model).
+    Following the paper pseudocode exactly.
     """
     
     def __init__(self,
@@ -25,37 +24,21 @@ class TRMModule(LightningModule):
                  num_layers: int = 2,
                  max_grid_size: int = 30,
                  num_colors: int = 10,
-                 n_latent_recursions: int = 6,
-                 T_deep_recursions: int = 3,
+                 n_latent_recursions: int = 2,  # n in paper
+                 T_deep_recursions: int = 2,    # T in paper
                  N_supervision: int = 16,
                  learning_rate: float = 1e-4,
                  weight_decay: float = 0.01,
                  warmup_steps: int = 2000,
                  max_steps: int = 100000,
-                 ema_decay: float = 0.999,
-                 use_ema: bool = True,
                  output_dir: str = None
                  ):
-        """
-        Initialize TRM Lightning Module.
-        
-        Args:
-            hidden_size: Hidden dimension (D=512 in paper)
-            num_layers: Number of layers in tiny network (2 is optimal)
-            max_grid_size: Maximum grid size
-            num_colors: Number of colors
-            n_latent_recursions: Number of latent reasoning steps (n)
-            T_deep_recursions: Number of deep recursions (T)
-            N_supervision: Maximum supervision steps
-            learning_rate: Base learning rate
-            weight_decay: Weight decay for AdamW
-            warmup_steps: Number of warmup steps
-            max_steps: Maximum training steps
-            ema_decay: Exponential moving average decay
-            use_ema: Whether to use EMA
-        """
+        """Initialize TRM Lightning Module."""
         super().__init__()
         self.save_hyperparameters()
+        
+        # CRITICAL: Use manual optimization
+        self.automatic_optimization = False
         
         # Model components
         self.input_embedding = nn.Embedding(
@@ -63,24 +46,23 @@ class TRMModule(LightningModule):
             hidden_size
         )
         
-        # The tiny network
-        self.net = self._build_tiny_network(hidden_size, num_layers)
+        # Build L_net and H_net (hierarchical networks)
+        self.L_net = self._build_network(hidden_size, num_layers)
+        self.H_net = self._build_network(hidden_size, num_layers)
         
         # Output heads
         self.output_head = nn.Linear(hidden_size, num_colors)
-        self.q_head = nn.Linear(hidden_size, 1)  # For early stopping
         
-        # Initialize latent buffers
-        self.register_buffer('y_init', torch.zeros(1, 1, hidden_size))
-        self.register_buffer('z_init', torch.zeros(1, 1, hidden_size))
+        # Q-head returns 2 values: q[0] for halt, q[1] for continue
+        self.Q_head = nn.Linear(hidden_size, 2)
         
-        # EMA model for stability (as mentioned in paper)
-        self.ema_model = None
-        if use_ema:
-            self.setup_ema()
+        # Initialize z (split into zH and zL)
+        # Each is half of hidden_size
+        self.register_buffer('z_init_H', torch.zeros(1, 1, hidden_size // 2))
+        self.register_buffer('z_init_L', torch.zeros(1, 1, hidden_size // 2))
     
-    def _build_tiny_network(self, hidden_size: int, num_layers: int) -> nn.Module:
-        """Build the tiny network architecture."""
+    def _build_network(self, hidden_size: int, num_layers: int) -> nn.Module:
+        """Build a network (L_net or H_net)."""
         layers = []
         for _ in range(num_layers):
             layers.append(nn.ModuleDict({
@@ -89,298 +71,232 @@ class TRMModule(LightningModule):
                     nn.Linear(hidden_size, hidden_size * 4),
                     nn.GELU(),
                     nn.Linear(hidden_size * 4, hidden_size),
-                    nn.Dropout(0.1)  # Small dropout for regularization
+                    nn.Dropout(0.1)
                 )
             }))
         return nn.ModuleList(layers)
     
-    def net_forward(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the tiny network."""
-        combined = x + y + z
+    def _net_forward(self, net: nn.ModuleList, *inputs: torch.Tensor) -> torch.Tensor:
+        """Forward pass through a network with multiple inputs."""
+        # Concatenate or sum inputs
+        combined = sum(inputs)  # Could also concatenate
         
-        for layer in self.net:
+        for layer in net:
             normalized = layer['norm'](combined)
             output = layer['mlp'](normalized)
             combined = combined + output  # Residual
         
         return combined
     
-    def latent_recursion(self, x: torch.Tensor, y: torch.Tensor,
-                        z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Perform latent recursion (Figure 3 from paper)."""
-        # Recursively update z for n steps
-        for _ in range(self.hparams.n_latent_recursions):
-            z = self.net_forward(x, y, z)
+    def hrm(self, z: Tuple[torch.Tensor, torch.Tensor], 
+            x: torch.Tensor) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """
+        Hierarchical Reasoning Module - exactly as in paper pseudocode.
         
-        # Update y given refined z (no x input when updating y)
-        y = self.net_forward(torch.zeros_like(x), y, z)
+        Args:
+            z: Tuple of (zH, zL)
+            x: Input embeddings [batch, seq_len, hidden]
+            
+        Returns:
+            z: Updated (zH, zL)
+            y_pred: Output predictions
+            q: Q-values [batch, 2] where q[0]=halt, q[1]=continue
+        """
+        zH, zL = z
+        n = self.hparams.n_latent_recursions
+        T = self.hparams.T_deep_recursions
         
-        return y, z
+        # n*T - 2 iterations without gradients
+        with torch.no_grad():
+            for i in range(n * T - 2):
+                zL = self._net_forward(self.L_net, zL, zH, x)
+                if (i + 1) % T == 0:
+                    zH = self._net_forward(self.H_net, zH, zL)
+        
+        # 1-step grad (final 2 steps with gradients)
+        zL = self._net_forward(self.L_net, zL, zH, x)
+        zH = self._net_forward(self.H_net, zH, zL)
+        
+        # Output heads
+        y_pred = self.output_head(zH)  # [batch, seq_len, num_colors]
+        q = self.Q_head(zH.mean(dim=1))  # [batch, 2]
+        
+        return (zH, zL), y_pred, q
     
-    def deep_recursion(self, x: torch.Tensor, y: torch.Tensor,
-                  z: torch.Tensor, training: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def ACT_halt(self, q: torch.Tensor, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """
-        Deep recursion with T steps.
-        T-1 without gradients, 1 with gradients (during training).
-        """
-        # T-1 recursions without gradients
-        if self.hparams.T_deep_recursions > 1:
-            with torch.no_grad():
-                for _ in range(self.hparams.T_deep_recursions - 1):
-                    y, z = self.latent_recursion(x, y, z)
+        ACT halt loss - learns when to stop.
         
-        # Final recursion
-        if training:
-            y, z = self.latent_recursion(x, y, z)
+        Args:
+            q: Q-values [batch, 2]
+            y_pred: Predictions [batch, seq_len, num_colors]
+            y_true: Ground truth [batch, height, width]
+        """
+        # Reshape y_pred to match y_true
+        batch_size = y_true.shape[0]
+        height, width = y_true.shape[1], y_true.shape[2]
+        y_pred_classes = y_pred.view(batch_size, height, width, -1).argmax(dim=-1)
+        
+        # Target: halt if prediction matches ground truth
+        target_halt = (y_pred_classes == y_true).float().mean(dim=[1, 2])  # [batch]
+        
+        # Binary cross entropy with q[0] (halt signal)
+        loss = 0.5 * F.binary_cross_entropy_with_logits(q[:, 0], target_halt)
+        
+        return loss
+    
+    def ACT_continue(self, q: torch.Tensor, last_step: bool) -> torch.Tensor:
+        """
+        ACT continue loss - learns to continue if not done.
+        
+        Args:
+            q: Q-values [batch, 2]
+            last_step: Whether this is the last supervision step
+        """
+        if last_step:
+            # At last step, target = sigmoid(q[0])
+            target_continue = torch.sigmoid(q[:, 0])
         else:
-            with torch.no_grad():
-                y, z = self.latent_recursion(x, y, z)
+            # Not last step, target = sigmoid(max(q[0], q[1]))
+            target_continue = torch.sigmoid(torch.max(q[:, 0], q[:, 1]))
         
-        # Compute halting logits (NOT probabilities)
-        q_logits = self.q_head(y.mean(dim=1, keepdim=True))  # Raw logits
+        # Binary cross entropy with q[1] (continue signal)
+        loss = 0.5 * F.binary_cross_entropy_with_logits(q[:, 1], target_continue)
         
-        return y, z, q_logits
+        return loss
     
-    def forward(self, x: torch.Tensor, 
-            supervision_steps: Optional[int] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, supervision_steps: Optional[int] = None) -> torch.Tensor:
         """
-        Forward pass with deep supervision.
+        Forward pass for inference.
         
         Args:
             x: Input tensor [batch, height, width]
-            supervision_steps: Number of supervision steps (None = use default)
+            supervision_steps: Number of supervision steps
             
         Returns:
-            Predicted output [batch, height, width, num_colors]
+            Output predictions [batch, height, width, num_colors]
         """
         batch_size, height, width = x.shape
-        
-        # Embed input
-        x_emb = self.input_embedding(x)  # [batch, H, W, hidden]
-        x_emb = x_emb.view(batch_size, -1, self.hparams.hidden_size)  # [batch, H*W, hidden]
-        
-        # Initialize y and z
-        seq_len = height * width
-        y = self.y_init.expand(batch_size, seq_len, -1).clone()
-        z = self.z_init.expand(batch_size, seq_len, -1).clone()
-        
-        # Deep supervision loop
-        n_steps = supervision_steps or self.hparams.N_supervision
-        
-        for step in range(n_steps):
-            y, z, q_logits = self.deep_recursion(x_emb, y, z, training=self.training)
-            
-            # Early stopping based on confidence (inference only)
-            # Apply sigmoid to convert logits to probability
-            if not self.training:
-                q_prob = torch.sigmoid(q_logits)
-                if q_prob.mean() > 0.8:
-                    break
-            
-            # Detach for next iteration (as in paper)
-            y = y.detach()
-            z = z.detach()
-        
-        # Final output
-        y_out = self.output_head(y)  # [batch, H*W, num_colors]
-        y_out = y_out.view(batch_size, height, width, self.hparams.num_colors)
-        
-        return y_out
-    
-    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """Training step with deep supervision - memory efficient."""
-        x = batch['input']
-        y_true = batch['output']
-        
-        batch_size, height, width = x.shape
-        
-        log.info(f"\tTraining step {self.global_step} with batch size {x.size(0)}")
         
         # Embed input
         x_emb = self.input_embedding(x)
         x_emb = x_emb.view(batch_size, -1, self.hparams.hidden_size)
         
-        # Initialize y and z
+        # Initialize z
         seq_len = height * width
-        y = self.y_init.expand(batch_size, seq_len, -1).clone()
-        z = self.z_init.expand(batch_size, seq_len, -1).clone()
+        zH = self.z_init_H.expand(batch_size, seq_len, -1).clone()
+        zL = self.z_init_L.expand(batch_size, seq_len, -1).clone()
+        z = (zH, zL)
         
-        total_loss = 0
+        n_steps = supervision_steps or self.hparams.N_supervision
+        
+        for step in range(n_steps):
+            z, y_pred, q = self.hrm(z, x_emb)
+            
+            # Early stopping: if q[0] > q[1], halt
+            if not self.training:
+                with torch.no_grad():
+                    if (q[:, 0] > q[:, 1]).all():
+                        break
+            
+            # Detach for next iteration
+            zH, zL = z
+            z = (zH.detach(), zL.detach())
+        
+        # Final output
+        y_out = y_pred.view(batch_size, height, width, self.hparams.num_colors)
+        return y_out
+    
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """
+        Training step following paper pseudocode exactly.
+        Uses manual optimization with backward inside the supervision loop.
+        """
+        # Get optimizer and scheduler
+        opt = self.optimizers()
+        sch = self.lr_schedulers()
+        
+        x_input = batch['input']
+        y_true = batch['output']
+        
+        batch_size, height, width = x_input.shape
+        
+        # Initialize z
+        seq_len = height * width
+        zH = self.z_init_H.expand(batch_size, seq_len, -1).clone()
+        zL = self.z_init_L.expand(batch_size, seq_len, -1).clone()
+        z = (zH, zL)
+        
+        total_loss_value = 0
         n_steps = 0
         
-        # Deep supervision training loop
+        # Deep Supervision loop
         for step in range(self.hparams.N_supervision):
-            # Deep recursion
-            y, z, q_logits = self.deep_recursion(x_emb, y, z, training=True)
+            # Input embedding
+            x = self.input_embedding(x_input)
+            x = x.view(batch_size, -1, self.hparams.hidden_size)
             
-            # Predict output
-            y_hat = self.output_head(y)
-            y_hat = y_hat.view(batch_size, height, width, self.hparams.num_colors)
+            # Hierarchical reasoning
+            z, y_pred, q = self.hrm(z, x)
             
-            # Classification loss
+            # Reshape y_pred for cross entropy
+            y_pred_reshaped = y_pred.view(batch_size, height, width, self.hparams.num_colors)
+            
+            # Main classification loss
             loss = F.cross_entropy(
-                y_hat.permute(0, 3, 1, 2),
+                y_pred_reshaped.permute(0, 3, 1, 2),  # [batch, colors, H, W]
                 y_true,
                 ignore_index=0
             )
             
-            # Halting loss
-            with torch.no_grad():  # Don't need gradients for accuracy computation
-                correct = (y_hat.argmax(dim=-1) == y_true).float()
-                mask = (y_true != 0).float()
-                if mask.sum() > 0:
-                    correct = (correct * mask).sum() / mask.sum()
-                else:
-                    correct = correct.mean()
+            # ACT halt loss
+            loss += self.ACT_halt(q, y_pred, y_true)
             
-            halt_target = (correct > 0.95).float()
-            halt_loss = F.binary_cross_entropy_with_logits(
-                q_logits.squeeze(),
-                halt_target.expand(batch_size)
-            )
+            # ACT continue loss with extra forward pass
+            with torch.no_grad():
+                z_detached = (z[0].detach(), z[1].detach())
+            _, _, q_next = self.hrm(z_detached, x)
+            loss += self.ACT_continue(q_next, last_step=(step == self.hparams.N_supervision - 1))
             
-            # Combined loss
-            step_loss = loss + 0.5 * halt_loss
+            # Detach z for next iteration (before backward)
+            zH, zL = z
+            z = (zH.detach(), zL.detach())
             
-            # CRITICAL FIX: Accumulate loss values, not tensors
-            # This prevents keeping the entire computation graph
-            total_loss = total_loss + step_loss.item()  # .item() extracts the scalar
+            # CRITICAL: Backward and optimize INSIDE the loop
+            opt.zero_grad()
+            self.manual_backward(loss)
+            opt.step()
+            if sch is not None:
+                sch.step()
             
-            # Keep the last step_loss tensor for backprop
-            last_step_loss = step_loss
-            
-            # Log metrics (use .item() to avoid keeping tensors)
-            self.log(f'train/loss_step_{step}', step_loss.item(), on_step=False, on_epoch=True)
-            self.log(f'train/accuracy_step_{step}', correct.item(), on_step=False, on_epoch=True)
-            
+            # Track loss for logging
+            total_loss_value += loss.item()
             n_steps += 1
             
-            # Early stopping
-            with torch.no_grad():
-                q_prob = torch.sigmoid(q_logits)
-                if q_prob.mean() > 0.8:
-                    break
+            # Log per-step metrics
+            self.log(f'train/loss_step_{step}', loss.item(), on_step=False, on_epoch=True)
             
-            # Detach for next iteration
-            y = y.detach()
-            z = z.detach()
+            # Early stopping: if q[0] > q[1]
+            with torch.no_grad():
+                q_halt = q[:, 0].mean().item()
+                q_continue = q[:, 1].mean().item()
+                if q_halt > q_continue:
+                    self.log('train/early_stopped_at', float(step))
+                    break
         
-        # Return the last step's loss (which has gradients)
-        # This is what gets backpropagated
-        final_loss = last_step_loss
-        
-        # Log average loss for monitoring (scalar only)
-        avg_loss_value = total_loss / n_steps
-        self.log('train/loss', avg_loss_value, prog_bar=True)
+        # Log aggregate metrics
+        avg_loss = total_loss_value / n_steps if n_steps > 0 else 0
+        self.log('train/loss', avg_loss, prog_bar=True)
         self.log('train/n_steps', float(n_steps))
         
-        # Update EMA
-        if self.hparams.use_ema and hasattr(self, 'ema_params') and self.ema_params is not None:
-            self.update_ema()
-        
-        return final_loss
-
-    # def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-    #     """Training step with deep supervision."""
-        
-    #     x = batch['input']  # [batch, H, W]
-    #     y_true = batch['output']  # [batch, H, W]
-        
-    #     batch_size, height, width = x.shape
-        
-    #     log.info(f"\tTraining step {self.global_step} with batch size {x.size(0)}")
-
-    #     # Embed input
-    #     x_emb = self.input_embedding(x)
-    #     x_emb = x_emb.view(batch_size, -1, self.hparams.hidden_size)
-        
-    #     # Initialize y and z
-    #     seq_len = height * width
-    #     y = self.y_init.expand(batch_size, seq_len, -1).clone()
-    #     z = self.z_init.expand(batch_size, seq_len, -1).clone()
-        
-    #     total_loss = 0
-    #     n_steps = 0
-        
-    #     # Deep supervision training loop
-    #     for step in range(self.hparams.N_supervision):
-    #         # Deep recursion
-    #         y, z, q_logits = self.deep_recursion(x_emb, y, z, training=True)
-            
-    #         # Predict output
-    #         y_hat = self.output_head(y)
-    #         y_hat = y_hat.view(batch_size, height, width, self.hparams.num_colors)
-            
-    #         # Classification loss
-    #         loss = F.cross_entropy(
-    #             y_hat.permute(0, 3, 1, 2),  # [batch, colors, H, W]
-    #             y_true,
-    #             ignore_index=0  # Ignore padding
-    #         )
-            
-    #         # Halting loss (learns when to stop)
-    #         correct = (y_hat.argmax(dim=-1) == y_true).float()
-    #         # Mask out padding
-    #         mask = (y_true != 0).float()
-    #         if mask.sum() > 0:
-    #             correct = (correct * mask).sum() / mask.sum()
-    #         else:
-    #             correct = correct.mean()
-            
-    #         halt_target = (correct > 0.95).float()  # Stop if >95% accurate
-            
-    #         # USE binary_cross_entropy_with_logits instead of binary_cross_entropy
-    #         # q_logits is now raw logits, not probabilities
-    #         halt_loss = F.binary_cross_entropy_with_logits(
-    #             q_logits.squeeze(),  # Raw logits from q_head
-    #             halt_target.expand(batch_size)  # Target should match batch size
-    #         )
-            
-    #         # Combined loss
-    #         step_loss = loss + 0.5 * halt_loss
-    #         total_loss = total_loss + step_loss
-            
-    #         # Log metrics
-    #         self.log(f'train/loss_step_{step}', step_loss, on_step=True, on_epoch=False)
-    #         self.log(f'train/accuracy_step_{step}', correct, on_step=True, on_epoch=False)
-            
-    #         n_steps += 1
-            
-    #         # Early stopping based on Q-head (apply sigmoid for threshold check)
-    #         q_prob = torch.sigmoid(q_logits)
-    #         if q_prob.mean() > 0.8:
-    #             break
-            
-    #         # Detach for next iteration
-    #         y = y.detach()
-    #         z = z.detach()
-        
-    #     # Average loss over steps
-    #     avg_loss = total_loss / n_steps
-        
-    #     # Log overall metrics
-    #     self.log('train/loss', avg_loss, prog_bar=True)
-    #     self.log('train/n_steps', float(n_steps))
-        
-    #     # Update EMA if enabled
-    #     if self.hparams.use_ema and hasattr(self, 'ema_params') and self.ema_params is not None:
-    #         self.update_ema()
-        
-    #     return avg_loss
+        return torch.tensor(avg_loss)
     
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
         """Validation step."""
         x = batch['input']
         y_true = batch['output']
         
-        log.info(f"\tValidation step {self.global_step}")
-        
-        # Use EMA model for validation if available
-        if self.hparams.use_ema and hasattr(self, 'ema_params') and self.ema_params is not None:
-            with self.ema_scope():
-                y_pred = self(x, supervision_steps=self.hparams.N_supervision)
-        else:
-            y_pred = self(x, supervision_steps=self.hparams.N_supervision)
+        y_pred = self(x, supervision_steps=self.hparams.N_supervision)
         
         # Compute loss
         loss = F.cross_entropy(
@@ -406,12 +322,11 @@ class TRMModule(LightningModule):
     
     def configure_optimizers(self):
         """Configure optimizer and scheduler."""
-        # AdamW optimizer as in paper
         optimizer = AdamW(
             self.parameters(),
             lr=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.95)  # As specified in paper
+            betas=(0.9, 0.95)
         )
         
         # Learning rate schedule with warmup
@@ -422,61 +337,6 @@ class TRMModule(LightningModule):
                 progress = (step - self.hparams.warmup_steps) / (self.hparams.max_steps - self.hparams.warmup_steps)
                 return 0.5 * (1 + np.cos(np.pi * progress))
         
-        scheduler = {
-            'scheduler': torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda),
-            'interval': 'step',
-            'frequency': 1
-        }
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
         return [optimizer], [scheduler]
-    
-    def setup_ema(self):
-        """Setup exponential moving average model."""
-        # Use nn.ParameterDict instead of nn.ModuleDict for storing tensors
-        self.ema_model = nn.ParameterDict()
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                # Store as Parameter (not just tensor)
-                self.ema_model[name.replace('.', '_')] = nn.Parameter(
-                    param.data.clone(), 
-                    requires_grad=False
-                )
-            
-    def update_ema(self):
-        """Update EMA parameters."""
-        if self.ema_model is None:
-            return
-        
-        with torch.no_grad():
-            for name, param in self.named_parameters():
-                if param.requires_grad:
-                    ema_name = name.replace('.', '_')
-                    if ema_name in self.ema_model:
-                        self.ema_model[ema_name].mul_(self.hparams.ema_decay).add_(
-                            param.data, alpha=1 - self.hparams.ema_decay
-                        )
-    
-    def ema_scope(self):
-        """Context manager for using EMA parameters."""
-        from contextlib import contextmanager
-        
-        @contextmanager
-        def _ema_scope():
-            # Save current parameters
-            backup = {}
-            for name, param in self.named_parameters():
-                if param.requires_grad:
-                    backup[name] = param.data.clone()
-                    ema_name = name.replace('.', '_')
-                    if ema_name in self.ema_model:
-                        param.data.copy_(self.ema_model[ema_name].data)
-            
-            try:
-                yield
-            finally:
-                # Restore original parameters
-                for name, param in self.named_parameters():
-                    if name in backup:
-                        param.data.copy_(backup[name])
-        
-        return _ema_scope()

@@ -2,4 +2,4 @@
 
 defaults:
   - csv
-  # - wandb
+  - wandb

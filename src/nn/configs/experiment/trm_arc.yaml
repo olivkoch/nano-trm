@@ -10,14 +10,14 @@ defaults:
 tags: ["arc", "trm"]
 
 timekeeping:
-  max_epochs: 10  # Longer training for combined losses
-  batch_size: 64
+  max_epochs: 1  # Longer training for combined losses
+  batch_size: 6
   num_workers: 4
   # nb_samples_per_epoch: 100
 
 trainer:
   accumulate_grad_batches: 1
-  gradient_clip_val: 1.0
+  # gradient_clip_val: 1.0
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

@@ -46,10 +46,14 @@ class TRMModule(LightningModule):
 
         # Output heads
         self.output_head = nn.Linear(hidden_size, num_colors)
-        self.Q_head = nn.Linear(hidden_size, 2)  # Q_head returns 2 values: q[0] and q[1]
+
+        # Halting head for adaptive computation
+        # Only learn a halting probability through a Binary-Cross-Entropy loss of having
+        # reached the correct solution
+        self.Q_head = nn.Linear(hidden_size, 1)  # Q_head returns 1 value: q[0]
         
-        self.y_init = None
-        self.z_init = None
+        self.y_init = torch.rand((1, 1, self.hparams.hidden_size))
+        self.z_init = torch.rand((1, 1, self.hparams.hidden_size))
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -83,31 +87,6 @@ class TRMModule(LightningModule):
             for _ in range(num_layers)
         ])
     
-    def _build_network(self, hidden_size: int, num_layers: int) -> nn.Module:
-        """Build network (L_net or H_net)."""
-        layers = []
-        for _ in range(num_layers):
-            mlp = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size * 4),
-                nn.GELU(),
-                nn.Linear(hidden_size * 4, hidden_size),
-                nn.Dropout(0.1)
-            )
-            
-            # Small initialization
-            for layer in mlp:
-                if isinstance(layer, nn.Linear):
-                    nn.init.normal_(layer.weight, mean=0.0, std=0.02)
-                    if layer.bias is not None:
-                        nn.init.zeros_(layer.bias)
-            
-            layers.append(nn.ModuleDict({
-                'norm': nn.LayerNorm(hidden_size),
-                'mlp': mlp
-            }))
-        
-        return nn.ModuleList(layers)
-
     def net_L(self, x, y, z):
         return self._net_forward(self.L_net, x, y, z)
 
@@ -117,7 +96,7 @@ class TRMModule(LightningModule):
     def latent_recursion(self, x, y, z, n=6):
         for _ in range(n):  # latent reasoning
             z = self.net_L(x, y, z)
-            y = self.net_H(y, z)  # refine output answer
+        y = self.net_H(y, z)  # refine output answer
         return y, z
 
     def deep_recursion(self, x, y, z, n=6, T=3):
@@ -129,10 +108,7 @@ class TRMModule(LightningModule):
         y, z = self.latent_recursion(x, y, z, n)
         return (y.detach(), z.detach()), self.output_head(y), self.Q_head(y)
 
-    def init_state (self, batch_size: int, seq_len: int):
-        self.y_init = self.z_init.expand(batch_size, seq_len, -1).clone()
-        self.z_init = self.z_init.expand(batch_size, seq_len, -1).clone()
-        
+
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         opt = self.optimizers()
         
@@ -145,18 +121,22 @@ class TRMModule(LightningModule):
         if not self.y_init:
             self.init_state(batch_size, seq_len)
         
-        total_loss_value = 0
         n_steps = 0
+
         y, z = self.y_init, self.z_init
+
         for step in range(self.hparams.N_supervision):
-            x = self.input_embedding(x_input)
-            (y, z), y_hat, q_hat = self.deep_recursion(x, y, z)
+            x_emb = self.input_embedding(x_input)
+            x_emb = x_emb.view(batch_size, -1, self.hparams.hidden_size) # B, L, D
+            print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
+            (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z)
+            print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}, y_true shape: {y_true.shape}')
             loss = F.cross_entropy(y_hat, y_true)
-            loss += F.binary_cross_entropy(q_hat, (y_hat == y_true).float())
+            # loss += F.binary_cross_entropy(q_hat, (y_hat == y_true).float())
             loss.backward()
             opt.step()
             opt.zero_grad()
-            if q_hat > 0:  # early-stopping
+            if q_hat.mean() > 0:  # early-stopping
                 break
 
         log.info(f"Training step {batch_idx}, supervision steps: {step+1} loss = {loss.item():.4f}")
@@ -167,11 +147,12 @@ class TRMModule(LightningModule):
     
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Validation step."""
-        x = batch['input']
+
+        x_input = batch['input']
         y_true = batch['output']
-        
-        y_pred = self(x)
-        
+                
+        y_pred = self(x_input)
+
         loss = F.cross_entropy(
             y_pred.permute(0, 3, 1, 2),
             y_true,
@@ -192,29 +173,27 @@ class TRMModule(LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass for inference."""
         batch_size, height, width = x.shape
-        seq_len = height * width
         
-        # Initialize z
-        z_init_expanded = self.z_init.expand(batch_size, seq_len, -1).clone()
-        z = (z_init_expanded, z_init_expanded.clone())
-        
-        x_emb = self.input_embedding(x).view(batch_size, -1, self.hparams.hidden_size)
-        
+        y = self.y_init
+        z = self.z_init
+
         # Run supervision steps
-        for _ in range(self.hparams.N_supervision):
-            z, y_pred, q = self.hrm(z, x_emb, n=self.hparams.n_latent_recursions, T=self.hparams.T_deep_recursions)
+        for i in range(self.hparams.N_supervision):
+            print(f'Forward pass supervision step {i+1}/{self.hparams.N_supervision}')
+            x_emb = self.input_embedding(x).view(batch_size, -1, self.hparams.hidden_size)
+            print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
+            (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z)
+            print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}')
+            if self.training:
+                if q_hat.mean() > 0:
+                    break
             
-            if not self.training and q[:, 0].mean() > q[:, 1].mean():
-                break
-            
-            z = (z[0].detach(), z[1].detach())
-        
-        return y_pred.view(batch_size, height, width, self.hparams.num_colors)
+        return y_hat.view(batch_size, height, width, self.hparams.num_colors)
     
     def configure_optimizers(self):
         """Configure optimizer."""
         # Scale learning rate since we do N_supervision updates per batch
-        effective_lr = self.hparams.learning_rate / self.hparams.N_supervision
+        effective_lr = self.hparams.learning_rate #/ self.hparams.N_supervision
         
         optimizer = AdamW(
             self.parameters(),
@@ -224,3 +203,10 @@ class TRMModule(LightningModule):
         )
         
         return optimizer
+    
+if __name__ == "__main__":
+    # Simple test
+    model = TRMModule()
+    x = torch.randint(0, 10, (2, 10, 10))  # Batch of 2, 10x10 grid with values in [0, 9]
+    y = model(x)
+    print(y.shape)  # Should be (2, 10, 10, num_colors)

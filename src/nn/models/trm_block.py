@@ -29,12 +29,19 @@ class RotaryEmbedding(nn.Module):
         self.max_seq_len = max_seq_len
 
     def forward(self, x, seq_len: int):
-        # x: [batch, seq_len, dim]
+        """
+        Args:
+            x: input tensor (used only for device/dtype)
+            seq_len: sequence length
+        Returns:
+            cos: [1, seq_len, head_dim]
+            sin: [1, seq_len, head_dim]
+        """
         t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-        freqs = torch.outer(t, self.inv_freq)  # [seq_len, dim/2]
-        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, dim]
-        cos = emb.cos()[None, :, :]  # [1, seq_len, dim]
-        sin = emb.sin()[None, :, :]  # [1, seq_len, dim]
+        freqs = torch.outer(t, self.inv_freq)  # [seq_len, head_dim/2]
+        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, head_dim]
+        cos = emb.cos()[None, :, :]  # [1, seq_len, head_dim]
+        sin = emb.sin()[None, :, :]  # [1, seq_len, head_dim]
         return cos, sin
 
 
@@ -45,7 +52,19 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(x, cos, sin):
-    """Apply rotary position embedding."""
+    """
+    Apply rotary position embedding.
+    
+    Args:
+        x: [batch, seq_len, num_heads, head_dim] or [batch, num_heads, seq_len, head_dim]
+        cos: [1, seq_len, head_dim]
+        sin: [1, seq_len, head_dim]
+    """
+    # x is [batch, seq_len, num_heads, head_dim]
+    # We need to unsqueeze cos/sin to [1, seq_len, 1, head_dim] to broadcast over num_heads
+    cos = cos.unsqueeze(2)  # [1, seq_len, 1, head_dim]
+    sin = sin.unsqueeze(2)  # [1, seq_len, 1, head_dim]
+    
     return (x * cos) + (rotate_half(x) * sin)
 
 
@@ -66,7 +85,7 @@ class SwiGLU(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Single Transformer block with specifications from paper."""
+    """Single Transformer block with RMSNorm, Multi-head Self-Attention with RoPE, and SwiGLU FFN."""
     def __init__(self, hidden_size: int, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
         self.hidden_size = hidden_size
@@ -114,6 +133,7 @@ class TransformerBlock(nn.Module):
         v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
         
         # Apply rotary embeddings to q and k
+        # q and k are [batch, seq_len, num_heads, head_dim]
         cos, sin = self.rotary_emb(x, seq_len)
         q = apply_rotary_pos_emb(q, cos, sin)
         k = apply_rotary_pos_emb(k, cos, sin)

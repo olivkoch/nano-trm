@@ -108,9 +108,8 @@ def train(cfg: DictConfig) -> Optional[float]:
         # Append wandb run name to save_dir if enabled
         if cfg.append_wandb_name_to_save_dir and wandb.run and wandb.run.name:
             save_dir = save_dir.rstrip("/") + "/" + wandb.run.name
-
-        log.info(f"Uploading training output to: {save_dir}")
-        shutil.copytree(output_dir, save_dir)
+            log.info(f"Uploading training output to: {save_dir}")
+            shutil.copytree(output_dir, save_dir)
 
 @hydra.main(version_base="1.3", config_path="./configs", config_name="train.yaml")
 def main(cfg: DictConfig):

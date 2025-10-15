@@ -26,6 +26,7 @@ class TRMModule(LightningModule):
                  n_latent_recursions: int = 2,  # n in HRM
                  T_deep_recursions: int = 2,    # T in HRM
                  N_supervision: int = 16,
+                 ffn_expansion: int = 2,
                  learning_rate: float = 1e-4,
                  weight_decay: float = 0.01,
                  warmup_steps: int = 2000,
@@ -41,8 +42,8 @@ class TRMModule(LightningModule):
         self.input_embedding = nn.Embedding(num_colors + 1, hidden_size)
         
         # L_net and H_net (two separate networks)
-        self.L_net = self._build_transformer(hidden_size, num_layers, num_heads=8, dropout=0.1)
-        self.H_net = self._build_transformer(hidden_size, num_layers, num_heads=8, dropout=0.1)
+        self.L_net = self._build_transformer(hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1)
+        self.H_net = self._build_transformer(hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1)
 
         # Output heads
         self.output_head = nn.Linear(hidden_size, num_colors)
@@ -80,10 +81,10 @@ class TRMModule(LightningModule):
         return x
 
     def _build_transformer(self, hidden_size: int, num_layers: int, 
-                          num_heads: int, dropout: float) -> nn.ModuleList:
+                          num_heads: int, ffn_expansion: int, dropout: float) -> nn.ModuleList:
         """Build Transformer as specified in paper."""
         return nn.ModuleList([
-            TransformerBlock(hidden_size, num_heads, dropout)
+            TransformerBlock(hidden_size, num_heads, ffn_expansion, dropout)
             for _ in range(num_layers)
         ])
     
@@ -137,9 +138,9 @@ class TRMModule(LightningModule):
         for step in range(self.hparams.N_supervision):
             x_emb = self.input_embedding(x_input)
             x_emb = x_emb.view(batch_size, seq_len, self.hparams.hidden_size) # B, L, D
-            print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
+            # print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
             (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
-            print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}, y_true shape: {y_true.shape}')
+            # print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}, y_true shape: {y_true.shape}')
             loss = F.cross_entropy(
                 y_hat.view(-1, self.hparams.num_colors), 
                 y_true.view(-1),
@@ -152,7 +153,8 @@ class TRMModule(LightningModule):
             if q_hat.mean() > 0:  # early-stopping
                 break
 
-        log.info(f"Training step {batch_idx}, supervision steps: {step+1} loss = {loss.item():.4f}")
+        if batch_idx % 10 == 0:
+            log.info(f"Training step {batch_idx}, supervision steps: {step+1} loss = {loss.item():.4f}")
 
         self.log('train/loss', loss.item(), prog_bar=True)
         self.log('train/n_steps', float(n_steps))
@@ -182,6 +184,8 @@ class TRMModule(LightningModule):
         self.log('val/loss', loss, prog_bar=True)
         self.log('val/accuracy', accuracy, prog_bar=True)
         
+        log.info(f"Validation step {batch_idx}, loss = {loss.item():.4f}, accuracy = {accuracy.item():.4f}")
+
         return {'loss': loss, 'accuracy': accuracy}
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -198,11 +202,11 @@ class TRMModule(LightningModule):
 
         # Run supervision steps
         for i in range(self.hparams.N_supervision):
-            print(f'Forward pass supervision step {i+1}/{self.hparams.N_supervision}')
+            # print(f'Forward pass supervision step {i+1}/{self.hparams.N_supervision}')
             x_emb = self.input_embedding(x).view(batch_size, seq_len, self.hparams.hidden_size)
-            print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
+            # print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
             (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
-            print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}')
+            # print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}')
             if self.training:
                 if q_hat.mean() > 0:
                     break

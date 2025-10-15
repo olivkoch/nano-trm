@@ -86,7 +86,7 @@ class SwiGLU(nn.Module):
 
 class TransformerBlock(nn.Module):
     """Single Transformer block with RMSNorm, Multi-head Self-Attention with RoPE, and SwiGLU FFN."""
-    def __init__(self, hidden_size: int, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, hidden_size: int, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -110,7 +110,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(hidden_size)
         
         # SwiGLU FFN (hidden_dim = 4 * hidden_size as standard)
-        self.ffn = SwiGLU(hidden_size, hidden_size * 4, bias=False)
+        self.ffn = SwiGLU(hidden_size, hidden_size * ffn_expansion, bias=False)
         
         self.dropout = nn.Dropout(dropout)
     

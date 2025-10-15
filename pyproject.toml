@@ -5,7 +5,7 @@ description = "Baseline solution for ARC-AGI-2 Challenge / ARC Prize 2025"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
-    { name = "Your Name", email = "your.email@example.com" }
+    { name = "Olivier Koch", email = "olivier.koch@gmail.com" }
 ]
 license = { text = "MIT" }
 keywords = ["arc-agi", "artificial-intelligence", "reasoning", "kaggle"]
@@ -168,3 +168,7 @@ exclude_lines = [
     "class .*\\bProtocol\\):",
     "@(abc\\.)?abstractmethod",
 ]
+
+[tool.taskipy.tasks]
+check-style = { "cmd" = "ruff format --diff . && ruff check .", help = "Check style."}
+format = { "cmd" = "ruff format . && ruff check --fix", help = "Format code."}

@@ -9,6 +9,7 @@ from typing import Dict
 from torch.optim import AdamW
 from lightning import LightningModule
 from src.nn.models.trm_block import TransformerBlock
+from src.nn.utils.stable_max_loss import StableMaxCrossEntropyLoss
 
 from src.nn.utils import RankedLogger
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -42,9 +43,8 @@ class TRMModule(LightningModule):
         # Model components
         self.input_embedding = nn.Embedding(num_colors + 1, hidden_size) # 0 (padding) + 10 colors
         
-        # L_net and H_net (two separate networks)
-        self.L_net = self._build_transformer(hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1)
-        self.H_net = self._build_transformer(hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1)
+        # a single network (not two separate networks)
+        self.lenet = self._build_transformer(hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1)
 
         # Output heads
         self.output_head = nn.Linear(hidden_size, num_colors)
@@ -89,16 +89,10 @@ class TRMModule(LightningModule):
             for _ in range(num_layers)
         ])
     
-    def net_L(self, x, y, z):
-        return self._net_forward(self.L_net, x, y, z)
-
-    def net_H(self, y, z):
-        return self._net_forward(self.H_net, y, z)
-
     def latent_recursion(self, x, y, z, n=6):
         for _ in range(n):  # latent reasoning
-            z = self.net_L(x, y, z)
-        y = self.net_H(y, z)  # refine output answer
+            z = self._net_forward(self.lenet, x, y, z)
+        y = self._net_forward(self.lenet, y, z) # refine output answer
         return y, z
 
     def deep_recursion(self, x, y, z, n, T):
@@ -134,25 +128,22 @@ class TRMModule(LightningModule):
 
         n_steps = 0
 
-        y, z = self.y_init, self.z_init
-
         for step in range(self.hparams.N_supervision):
             x_emb = self.input_embedding(x_input)
             x_emb = x_emb.view(batch_size, seq_len, self.hparams.hidden_size) # B, L, D
-            # print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
             (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
-            # print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}, y_true shape: {y_true.shape}')
-            loss = F.cross_entropy(
-                y_hat.view(-1, self.hparams.num_colors), 
-                y_true.view(-1),
+            loss = StableMaxCrossEntropyLoss(
+                y_hat.view(-1, self.hparams.num_colors), # [B*H*W, num_colors]
+                y_true.view(-1), # [B*H*W]
                 ignore_index=0
                 )
             # loss += F.binary_cross_entropy(q_hat, (y_hat == y_true).float())
             loss.backward()
             opt.step()
             opt.zero_grad()
-            if q_hat.mean() > 0:  # early-stopping
-                break
+            # if q_hat.mean() > 0:  # early-stopping
+            #     break
+            n_steps += 1
 
         if batch_idx % 10 == 0:
             log.info(f"Training step {batch_idx}, supervision steps: {step+1} loss = {loss.item():.4f}")
@@ -167,37 +158,39 @@ class TRMModule(LightningModule):
 
         x_input = batch['input']
         y_true = batch['output']
-                
-        y_pred = self(x_input)
 
-        loss = F.cross_entropy(
-            y_pred.permute(0, 3, 1, 2),
-            y_true,
-            ignore_index=0
-        )
-        
-        pred_classes = y_pred.argmax(dim=-1)
-        correct = (pred_classes == y_true).float()
-        mask = (y_true != 0).float()
-        
-        # Compute rate of exactly correct solutions (all non-masked elements correct)
-        batch_size = y_true.shape[0]
-        # Flatten spatial dims for comparison
-        pred_flat = pred_classes.view(batch_size, -1)
-        true_flat = y_true.view(batch_size, -1)
-        mask_flat = mask.view(batch_size, -1)
-        # For each sample, check if all non-masked elements are correct
-        # Only consider non-masked elements for exact correctness
-        exact_correct = ((pred_flat == true_flat) | (mask_flat == 0)).all(dim=1)
-        exact_accuracy = exact_correct.float().mean()
+        with torch.no_grad():
+            y_pred = self(x_input) # B, H, W, num_colors
 
-        accuracy = (correct * mask).sum() / mask.sum() if mask.sum() > 0 else correct.mean()
-        
-        self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('val/accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('val/exact_accuracy', exact_accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            loss = StableMaxCrossEntropyLoss(
+                y_pred.flatten(start_dim=0, end_dim=2), # [B*H*W, num_colors]
+                y_true.flatten(), # B*H*W
+                ignore_index=0
+            )
+            
+            pred_classes = y_pred.argmax(dim=-1)
+            correct = (pred_classes == y_true).float()
+            mask = (y_true != 0).float()
+            
+            # Compute rate of exactly correct solutions (all non-masked elements correct)
+            # mask is for padding so should be ignored to compute metrics
+            batch_size = y_true.shape[0]
+            # Flatten spatial dims for comparison
+            pred_flat = pred_classes.view(batch_size, -1)
+            true_flat = y_true.view(batch_size, -1)
+            mask_flat = mask.view(batch_size, -1)
+            # For each sample, check if all non-masked elements are correct
+            # Only consider non-masked elements for exact correctness
+            exact_correct = ((pred_flat == true_flat) | (mask_flat == 0)).all(dim=1)
+            exact_accuracy = exact_correct.float().mean()
 
-        log.info(f"Validation step {batch_idx}, loss = {loss.item():.4f}, accuracy = {accuracy.item():.4f} exact_accuracy = {exact_accuracy.item():.4f}")
+            accuracy = (correct * mask).sum() / mask.sum() if mask.sum() > 0 else correct.mean()
+            
+            self.log('val/loss', loss.item(), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log('val/accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log('val/exact_accuracy', exact_accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
+            log.info(f"Validation step {batch_idx}, loss = {loss.item():.4f}, accuracy = {accuracy.item():.4f} exact_accuracy = {exact_accuracy.item():.4f}")
 
         return {'loss': loss, 'accuracy': accuracy, 'exact_accuracy': exact_accuracy}
     
@@ -205,9 +198,6 @@ class TRMModule(LightningModule):
         """Forward pass for inference."""
         batch_size, height, width = x.shape
         seq_len = height * width
-
-        y = self.y_init
-        z = self.z_init
 
         # Initialize y and z - EXPAND to match batch and sequence
         y = self.y_init.expand(batch_size, seq_len, -1).clone()
@@ -217,22 +207,32 @@ class TRMModule(LightningModule):
         for i in range(self.hparams.N_supervision):
             x_emb = self.input_embedding(x).view(batch_size, seq_len, self.hparams.hidden_size)
             (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
-            if self.training:
-                if q_hat.mean() > 0:
-                    break
+            # if self.training:
+            #     if q_hat.mean() > 0:
+            #         break
             
         return y_hat.view(batch_size, height, width, self.hparams.num_colors)
     
     def configure_optimizers(self):
         """Simple warmup + constant LR (no decay)."""
         
-        optimizer = AdamW(
-            self.parameters(),
-            lr=self.hparams.learning_rate / self.hparams.N_supervision,
-            weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.95)
-        )
+        base_lr = self.hparams.learning_rate / self.hparams.N_supervision
+        embedding_lr = self.hparams.learning_rate_emb / self.hparams.N_supervision
+    
+        # Parameter groups
+        embedding_params = list(self.input_embedding.parameters())
+        other_params = [p for n, p in self.named_parameters() 
+                    if not n.startswith('input_embedding')]
         
+        optimizer = AdamW([
+            {'params': embedding_params, 'lr': embedding_lr},
+            {'params': other_params, 'lr': base_lr}
+        ],
+        weight_decay=self.hparams.weight_decay,
+        betas=(0.9, 0.95))
+        
+        return optimizer
+    
         # Just linear warmup, no decay after
         def lr_lambda(step):
             if step < self.hparams.warmup_steps:

@@ -1,11 +1,11 @@
 """
 HRM PyTorch Lightning Module - Following Figure 2 pseudocode exactly
 """
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional
+from typing import Dict
 from torch.optim import AdamW
 from lightning import LightningModule
 from src.nn.models.trm_block import TransformerBlock
@@ -28,6 +28,7 @@ class TRMModule(LightningModule):
                  N_supervision: int = 16,
                  ffn_expansion: int = 2,
                  learning_rate: float = 1e-4,
+                 learning_rate_emb: float = 1e-2,
                  weight_decay: float = 0.01,
                  warmup_steps: int = 2000,
                  max_steps: int = 100000,
@@ -39,7 +40,7 @@ class TRMModule(LightningModule):
         self.automatic_optimization = False
         
         # Model components
-        self.input_embedding = nn.Embedding(num_colors + 1, hidden_size)
+        self.input_embedding = nn.Embedding(num_colors + 1, hidden_size) # 0 (padding) + 10 colors
         
         # L_net and H_net (two separate networks)
         self.L_net = self._build_transformer(hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1)
@@ -179,14 +180,26 @@ class TRMModule(LightningModule):
         correct = (pred_classes == y_true).float()
         mask = (y_true != 0).float()
         
+        # Compute rate of exactly correct solutions (all non-masked elements correct)
+        batch_size = y_true.shape[0]
+        # Flatten spatial dims for comparison
+        pred_flat = pred_classes.view(batch_size, -1)
+        true_flat = y_true.view(batch_size, -1)
+        mask_flat = mask.view(batch_size, -1)
+        # For each sample, check if all non-masked elements are correct
+        # Only consider non-masked elements for exact correctness
+        exact_correct = ((pred_flat == true_flat) | (mask_flat == 0)).all(dim=1)
+        exact_accuracy = exact_correct.float().mean()
+
         accuracy = (correct * mask).sum() / mask.sum() if mask.sum() > 0 else correct.mean()
         
-        self.log('val/loss', loss, prog_bar=True)
-        self.log('val/accuracy', accuracy, prog_bar=True)
-        
-        log.info(f"Validation step {batch_idx}, loss = {loss.item():.4f}, accuracy = {accuracy.item():.4f}")
+        self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val/accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self.log('val/exact_accuracy', exact_accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
-        return {'loss': loss, 'accuracy': accuracy}
+        log.info(f"Validation step {batch_idx}, loss = {loss.item():.4f}, accuracy = {accuracy.item():.4f} exact_accuracy = {exact_accuracy.item():.4f}")
+
+        return {'loss': loss, 'accuracy': accuracy, 'exact_accuracy': exact_accuracy}
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass for inference."""
@@ -202,11 +215,8 @@ class TRMModule(LightningModule):
 
         # Run supervision steps
         for i in range(self.hparams.N_supervision):
-            # print(f'Forward pass supervision step {i+1}/{self.hparams.N_supervision}')
             x_emb = self.input_embedding(x).view(batch_size, seq_len, self.hparams.hidden_size)
-            # print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
             (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
-            # print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}')
             if self.training:
                 if q_hat.mean() > 0:
                     break
@@ -214,19 +224,33 @@ class TRMModule(LightningModule):
         return y_hat.view(batch_size, height, width, self.hparams.num_colors)
     
     def configure_optimizers(self):
-        """Configure optimizer."""
-        # Scale learning rate since we do N_supervision updates per batch
-        effective_lr = self.hparams.learning_rate #/ self.hparams.N_supervision
+        """Simple warmup + constant LR (no decay)."""
         
         optimizer = AdamW(
             self.parameters(),
-            lr=effective_lr,
+            lr=self.hparams.learning_rate / self.hparams.N_supervision,
             weight_decay=self.hparams.weight_decay,
             betas=(0.9, 0.95)
         )
         
-        return optimizer
-    
+        # Just linear warmup, no decay after
+        def lr_lambda(step):
+            if step < self.hparams.warmup_steps:
+                return step / max(1, self.hparams.warmup_steps)
+            else:
+                return 1.0  # Constant LR after warmup
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step',
+                'frequency': 1
+            }
+        }
+        
 if __name__ == "__main__":
     # Simple test
     model = TRMModule()

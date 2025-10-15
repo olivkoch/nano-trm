@@ -10,6 +10,7 @@ from torch.optim import AdamW
 from lightning import LightningModule
 from src.nn.models.trm_block import TransformerBlock
 from src.nn.utils.stable_max_loss import StableMaxCrossEntropyLoss
+from src.nn.utils.constants import PAD_VALUE
 
 from src.nn.utils import RankedLogger
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -41,8 +42,8 @@ class TRMModule(LightningModule):
         self.automatic_optimization = False
         
         # Model components
-        self.input_embedding = nn.Embedding(num_colors + 1, hidden_size) # 0 (padding) + 10 colors
-        
+        self.input_embedding = nn.Embedding(num_colors + 1, hidden_size, padding_idx=PAD_VALUE) # 0 (padding) + 10 colors
+
         # a single network (not two separate networks)
         self.lenet = self._build_transformer(hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1)
 
@@ -135,7 +136,7 @@ class TRMModule(LightningModule):
             loss = F.cross_entropy(
                 y_hat.view(-1, self.hparams.num_colors), # [B*H*W, num_colors]
                 y_true.view(-1), # [B*H*W]
-                ignore_index=0  # ignore padding
+                ignore_index=PAD_VALUE  # ignore padding
                 )
             # loss += F.binary_cross_entropy(q_hat, (y_hat == y_true).float())
             loss.backward()
@@ -161,6 +162,7 @@ class TRMModule(LightningModule):
 
         x_input = batch['input']
         y_true = batch['output']
+        height, width = y_true.shape[1], y_true.shape[2]
 
         with torch.no_grad():
             y_pred = self(x_input) # B, H, W, num_colors
@@ -168,7 +170,7 @@ class TRMModule(LightningModule):
             loss = F.cross_entropy(
                 y_pred.flatten(start_dim=0, end_dim=2), # [B*H*W, num_colors]
                 y_true.flatten(), # B*H*W
-                ignore_index=0  # ignore padding
+                ignore_index=PAD_VALUE  # ignore padding
             )
             
             pred_classes = y_pred.argmax(dim=-1)
@@ -186,6 +188,17 @@ class TRMModule(LightningModule):
             # Only consider non-masked elements for exact correctness
             exact_correct = ((pred_flat == true_flat) | (mask_flat == 0)).all(dim=1)
             exact_accuracy = exact_correct.float().mean()
+
+            # Print the task ids (batch indices) of exactly correctly predicted tasks
+            batch_ids = batch['task_ids']
+            exact_correct_indices = torch.nonzero(exact_correct).squeeze(-1).tolist()
+            exact_correct_task_ids = [batch_ids[i] for i in exact_correct_indices]
+            if exact_correct_task_ids:
+                log.info(f"Exactly correct task IDs: {exact_correct_task_ids}")
+            for task_index in exact_correct_indices:
+                log.info(f"Task {batch_ids[task_index]} predicted exactly correctly.")
+                log.info(f"Prediction:\n{pred_classes[task_index].view(height, width).cpu().numpy()}")
+                log.info(f"Ground truth:\n{true_flat[task_index].view(height, width).cpu().numpy()}")
 
             accuracy = (correct * mask).sum() / mask.sum() if mask.sum() > 0 else correct.mean()
             

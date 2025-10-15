@@ -6,19 +6,19 @@ Tests trained models on the evaluation dataset
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any
 import torch
 import numpy as np
 from tqdm import tqdm
 import pandas as pd
 from datetime import datetime
 
-from lightning import LightningModule
 from torch.utils.data import DataLoader
 
 # Import your modules (adjust paths as needed)
 from src.nn.data.arc_datamodule import ARCTaskDataset, TRMTransform, collate_fn
 from src.nn.models.mlp_module import ConvMLPModule
+from src.nn.models.trm_module import TRMModule
 
 
 class ARCEvaluator:
@@ -75,8 +75,7 @@ class ARCEvaluator:
             # Determine which model class to use based on hyperparameters
             if 'n_latent_recursions' in hparams:
                 # TRM model
-                from src.nn.models.trm_module import TRMLightningModule
-                model = TRMLightningModule.load_from_checkpoint(
+                model = TRMModule.load_from_checkpoint(
                     self.checkpoint_path,
                     map_location=self.device
                 )

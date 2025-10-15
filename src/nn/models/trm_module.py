@@ -52,8 +52,8 @@ class TRMModule(LightningModule):
         # reached the correct solution
         self.Q_head = nn.Linear(hidden_size, 1)  # Q_head returns 1 value: q[0]
         
-        self.y_init = torch.rand((1, 1, self.hparams.hidden_size))
-        self.z_init = torch.rand((1, 1, self.hparams.hidden_size))
+        self.register_buffer('y_init', torch.zeros(1, 1, hidden_size))
+        self.register_buffer('z_init', torch.zeros(1, 1, hidden_size))
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -99,39 +99,52 @@ class TRMModule(LightningModule):
         y = self.net_H(y, z)  # refine output answer
         return y, z
 
-    def deep_recursion(self, x, y, z, n=6, T=3):
+    def deep_recursion(self, x, y, z, n, T):
         # recursing T−1 times to improve y and z (no gradients needed)
         with torch.no_grad():
             for j in range(T-1):
                 y, z = self.latent_recursion(x, y, z, n)
         # recursing once to improve y and z
         y, z = self.latent_recursion(x, y, z, n)
-        return (y.detach(), z.detach()), self.output_head(y), self.Q_head(y)
-
+        
+        # Output predictions and Q value
+        y_hat = self.output_head(y)  # [batch, seq_len, num_colors]
+        
+        # Pool y for Q_head (average over sequence)
+        y_pooled = y.mean(dim=1)  # [batch, hidden_size]
+        q_hat = self.Q_head(y_pooled)  # [batch, 1]
+        
+        return (y.detach(), z.detach()), y_hat, q_hat
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         opt = self.optimizers()
         
         x_input = batch['input']
         y_true = batch['output']
+        y_true = y_true.flatten(start_dim=1)  # B, H*W
 
         batch_size, height, width = x_input.shape
         seq_len = height * width
 
-        if not self.y_init:
-            self.init_state(batch_size, seq_len)
-        
+        # Initialize y and z - EXPAND to match batch and sequence
+        y = self.y_init.expand(batch_size, seq_len, -1).clone()
+        z = self.z_init.expand(batch_size, seq_len, -1).clone()
+
         n_steps = 0
 
         y, z = self.y_init, self.z_init
 
         for step in range(self.hparams.N_supervision):
             x_emb = self.input_embedding(x_input)
-            x_emb = x_emb.view(batch_size, -1, self.hparams.hidden_size) # B, L, D
+            x_emb = x_emb.view(batch_size, seq_len, self.hparams.hidden_size) # B, L, D
             print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
-            (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z)
+            (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
             print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}, y_true shape: {y_true.shape}')
-            loss = F.cross_entropy(y_hat, y_true)
+            loss = F.cross_entropy(
+                y_hat.view(-1, self.hparams.num_colors), 
+                y_true.view(-1),
+                ignore_index=0
+                )
             # loss += F.binary_cross_entropy(q_hat, (y_hat == y_true).float())
             loss.backward()
             opt.step()
@@ -140,6 +153,7 @@ class TRMModule(LightningModule):
                 break
 
         log.info(f"Training step {batch_idx}, supervision steps: {step+1} loss = {loss.item():.4f}")
+
         self.log('train/loss', loss.item(), prog_bar=True)
         self.log('train/n_steps', float(n_steps))
         
@@ -173,16 +187,21 @@ class TRMModule(LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass for inference."""
         batch_size, height, width = x.shape
-        
+        seq_len = height * width
+
         y = self.y_init
         z = self.z_init
+
+        # Initialize y and z - EXPAND to match batch and sequence
+        y = self.y_init.expand(batch_size, seq_len, -1).clone()
+        z = self.z_init.expand(batch_size, seq_len, -1).clone()
 
         # Run supervision steps
         for i in range(self.hparams.N_supervision):
             print(f'Forward pass supervision step {i+1}/{self.hparams.N_supervision}')
-            x_emb = self.input_embedding(x).view(batch_size, -1, self.hparams.hidden_size)
+            x_emb = self.input_embedding(x).view(batch_size, seq_len, self.hparams.hidden_size)
             print(f'x_emb shape: {x_emb.shape}, y shape: {y.shape}, z shape: {z.shape}')
-            (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z)
+            (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
             print(f'y_hat shape: {y_hat.shape}, q_hat shape: {q_hat.shape}')
             if self.training:
                 if q_hat.mean() > 0:

@@ -7,7 +7,7 @@ num_layers: 2
 num_colors: 10
 n_latent_recursions: 1  # n in paper
 T_deep_recursions: 1    # T in paper
-N_supervision: 4
+N_supervision: 1
 learning_rate: 1e-7
 weight_decay: 0.01
 warmup_steps: 2000

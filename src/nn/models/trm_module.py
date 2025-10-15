@@ -132,15 +132,18 @@ class TRMModule(LightningModule):
             x_emb = self.input_embedding(x_input)
             x_emb = x_emb.view(batch_size, seq_len, self.hparams.hidden_size) # B, L, D
             (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
-            loss = StableMaxCrossEntropyLoss(
+            loss = F.cross_entropy(
                 y_hat.view(-1, self.hparams.num_colors), # [B*H*W, num_colors]
                 y_true.view(-1), # [B*H*W]
-                ignore_index=0
+                ignore_index=0  # ignore padding
                 )
             # loss += F.binary_cross_entropy(q_hat, (y_hat == y_true).float())
             loss.backward()
             opt.step()
             opt.zero_grad()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+
             # if q_hat.mean() > 0:  # early-stopping
             #     break
             n_steps += 1
@@ -162,10 +165,10 @@ class TRMModule(LightningModule):
         with torch.no_grad():
             y_pred = self(x_input) # B, H, W, num_colors
 
-            loss = StableMaxCrossEntropyLoss(
+            loss = F.cross_entropy(
                 y_pred.flatten(start_dim=0, end_dim=2), # [B*H*W, num_colors]
                 y_true.flatten(), # B*H*W
-                ignore_index=0
+                ignore_index=0  # ignore padding
             )
             
             pred_classes = y_pred.argmax(dim=-1)

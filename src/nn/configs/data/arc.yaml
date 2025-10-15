@@ -1,4 +1,4 @@
-_target_: src.nn.data.ARCDataModule
+_target_: src.nn.data.ARCDataModuleWithMetadata
 _recursive_: false
 data_dir: "data"
 batch_size: ${timekeeping.batch_size}

@@ -8,6 +8,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 from torch.utils.data import Dataset, DataLoader
 from lightning import LightningDataModule
+from src.nn.utils.constants import PAD_VALUE
 
 class TRMTransform:
     """
@@ -18,7 +19,7 @@ class TRMTransform:
     def __init__(self, 
                  max_grid_size: int = 30,
                  num_colors: int = 10,
-                 pad_value: int = 0,
+                 pad_value: int = PAD_VALUE,
                  augment: bool = False):
         """
         Initialize the transform.
@@ -331,7 +332,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
 
 
 # Example usage with custom collate
-class TRMDataModuleWithCollate(ARCDataModule):
+class ARCDataModuleWithMetadata(ARCDataModule):
     """Extended DataModule with custom collate function."""
     
     def train_dataloader(self):

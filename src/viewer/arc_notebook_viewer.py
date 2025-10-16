@@ -3,7 +3,11 @@ ARC-AGI Notebook Viewer for Neural Network Models
 Interactive visualization for Jupyter notebooks with PyTorch model support
 """
 
-import json
+"""
+ARC-AGI Notebook Viewer for Neural Network Models
+Interactive visualization for Jupyter notebooks with PyTorch model support
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -15,6 +19,9 @@ from IPython.display import display, HTML, clear_output
 import ipywidgets as widgets
 from ipywidgets import interact, interactive, fixed
 import torch
+
+# Import the DataModule
+from src.nn.data.arc_datamodule import ARCDataModule
 
 
 # ARC-AGI color palette (0-9)
@@ -35,18 +42,34 @@ ARC_COLORS = [
 class ARCNotebookViewer:
     """Interactive viewer for ARC-AGI tasks in Jupyter notebooks."""
     
-    def __init__(self, data_dir: str = "data"):
+    def __init__(self, 
+                 data_dir: str = "data",
+                 use_concept_data: bool = False,
+                 concept_data_dir: str = "data/concept"):
         """Initialize the viewer.
         
         Args:
             data_dir: Directory containing the JSON files
+            use_concept_data: If True, also load concept dataset
+            concept_data_dir: Directory containing concept dataset
         """
         self.data_dir = Path(data_dir)
+        self.use_concept_data = use_concept_data
+        self.concept_data_dir = concept_data_dir
+        
+        # Data storage
         self.training_challenges = None
         self.training_solutions = None
         self.evaluation_challenges = None
         self.evaluation_solutions = None
-        self.test_challenges = None
+        
+        # DataModule
+        self.datamodule = ARCDataModule(
+            data_dir=str(data_dir),
+            batch_size=1,  # Not used for visualization
+            use_concept_data=use_concept_data,
+            concept_data_dir=concept_data_dir
+        )
         
         # Create colormap
         self.cmap = ListedColormap(ARC_COLORS)
@@ -58,7 +81,7 @@ class ARCNotebookViewer:
         self.output_area = None
         
     def load_data(self, verbose: bool = True) -> Dict:
-        """Load all available data files.
+        """Load all available data files using ARCDataModule.
         
         Args:
             verbose: Whether to print loading information
@@ -66,27 +89,36 @@ class ARCNotebookViewer:
         Returns:
             Dictionary with loaded dataset statistics
         """
-        files = {
-            'training_challenges': 'arc-agi_training_challenges.json',
-            'training_solutions': 'arc-agi_training_solutions.json',
-            'evaluation_challenges': 'arc-agi_evaluation_challenges.json',
-            'evaluation_solutions': 'arc-agi_evaluation_solutions.json',
-            'test_challenges': 'arc-agi_test_challenges.json'
+        if verbose:
+            print("Loading data via ARCDataModule...")
+        
+        # Setup the datamodule (this loads the JSON files)
+        self.datamodule.setup()
+        
+        # Extract the raw challenge/solution dicts from the datamodule
+        train_dataset = self.datamodule.train_dataset
+        val_dataset = self.datamodule.val_dataset
+        
+        # Get the original tasks and solutions
+        self.training_challenges = train_dataset.tasks
+        self.training_solutions = train_dataset.solutions
+        self.evaluation_challenges = val_dataset.tasks
+        self.evaluation_solutions = val_dataset.solutions
+        
+        loaded = {
+            'training_challenges': len(self.training_challenges),
+            'training_solutions': len(self.training_solutions) if self.training_solutions else 0,
+            'evaluation_challenges': len(self.evaluation_challenges),
+            'evaluation_solutions': len(self.evaluation_solutions) if self.evaluation_solutions else 0,
         }
         
-        loaded = {}
-        for key, filename in files.items():
-            filepath = self.data_dir / filename
-            if filepath.exists():
-                with open(filepath, 'r') as f:
-                    data = json.load(f)
-                    setattr(self, key, data)
-                    loaded[key] = len(data) if isinstance(data, dict) else 0
-                    if verbose:
-                        print(f"✓ Loaded {filename}: {loaded[key]} tasks")
-            else:
-                if verbose:
-                    print(f"✗ Not found: {filename}")
+        if verbose:
+            print(f"✓ Loaded training set: {loaded['training_challenges']} tasks")
+            if self.training_solutions:
+                print(f"✓ Loaded training solutions: {loaded['training_solutions']} tasks")
+            print(f"✓ Loaded evaluation set: {loaded['evaluation_challenges']} tasks")
+            if self.evaluation_solutions:
+                print(f"✓ Loaded evaluation solutions: {loaded['evaluation_solutions']} tasks")
         
         return loaded
     
@@ -331,7 +363,7 @@ class ARCNotebookViewer:
             solutions = self.evaluation_solutions
         
         if challenges is None:
-            print(f"No {dataset} data loaded!")
+            print(f"No {dataset} data loaded! Call load_data() first.")
             return
         
         # Get task ID
@@ -378,7 +410,7 @@ class ARCNotebookViewer:
         """Generate predictions for a task using a PyTorch model.
         
         Args:
-            model: PyTorch model (e.g., ConvMLPModule)
+            model: PyTorch model (e.g., TRMModule)
             task_data: Task dictionary with 'test' key
             device: Device to run on
             
@@ -393,10 +425,13 @@ class ARCNotebookViewer:
         with torch.no_grad():
             for test_example in task_data.get('test', []):
                 # Get input grid
-                input_grid = torch.tensor(test_example['input'], dtype=torch.long).unsqueeze(0).to(device)
+                input_grid = np.array(test_example['input'])
                 
+                # Convert to tensor
+                input_tensor = torch.from_numpy(input_grid).long().unsqueeze(0).to(device)
+
                 # Get logits from model
-                logits = model(input_grid)  # [1, H, W, num_colors]
+                logits = model(input_tensor)  # [1, H, W, num_colors]
                 
                 # Get predicted classes
                 pred = logits.argmax(dim=-1).squeeze(0).cpu().numpy()  # [H, W]
@@ -445,7 +480,6 @@ class ARCNotebookViewer:
             'num_total': num_total,
             'has_solution': True
         }
-
 
     def _filter_tasks_by_correctness(self, task_ids: List[str], challenges: Dict, 
                                     solutions: Dict, model: torch.nn.Module,
@@ -500,7 +534,6 @@ class ARCNotebookViewer:
                 continue
         
         return filtered_ids
-
 
     def _select_tasks_to_visualize(self, task_ids: Optional[List[str]], challenges: Dict,
                                 solutions: Dict, model: Optional[torch.nn.Module],
@@ -566,7 +599,6 @@ class ARCNotebookViewer:
         
         return filtered_ids[:n_tasks]
 
-
     def _visualize_single_task(self, task_id: str, task_data: Dict, 
                             solution: Optional[Union[List, Dict]],
                             predictions: List[np.ndarray],
@@ -614,7 +646,7 @@ class ARCNotebookViewer:
         """Visualize model predictions compared to ground truth.
         
         Args:
-            model: PyTorch model (e.g., ConvMLPModule)
+            model: PyTorch model (e.g., TRMModule)
             task_ids: Specific task IDs to visualize (None for random)
             dataset: Which dataset to use ('training' or 'evaluation')
             n_tasks: Number of tasks to visualize if task_ids is None
@@ -625,6 +657,11 @@ class ARCNotebookViewer:
         Returns:
             Dictionary with summary statistics
         """
+        # Ensure data is loaded
+        if self.training_challenges is None:
+            print("Loading data...")
+            self.load_data()
+        
         # Get data
         if dataset == 'training':
             challenges = self.training_challenges
@@ -698,6 +735,75 @@ class ARCNotebookViewer:
             'task_results': task_results
         }
     
+    def compare_predictions(self, model: torch.nn.Module, task_id: str, 
+                           dataset: str = 'training', device: str = 'cpu') -> None:
+        """Show detailed comparison of predictions vs ground truth for a single task.
+        
+        Args:
+            model: PyTorch model
+            task_id: Task ID to analyze
+            dataset: Which dataset to use
+            device: Device to run model on
+        """
+        # Ensure data is loaded
+        if self.training_challenges is None:
+            print("Loading data...")
+            self.load_data()
+        
+        # Get data
+        if dataset == 'training':
+            challenges = self.training_challenges
+            solutions = self.training_solutions
+        else:
+            challenges = self.evaluation_challenges
+            solutions = self.evaluation_solutions
+        
+        if not challenges or task_id not in challenges:
+            print(f"Task {task_id} not found in {dataset} set!")
+            return
+        
+        task_data = challenges[task_id]
+        solution = solutions.get(task_id) if solutions else None
+        
+        # Get predictions
+        predictions = self.predict_with_model(model, task_data, device)
+        
+        print(f"🔍 Analysis for Task {task_id}")
+        print(f"   Model: {model.__class__.__name__}")
+        
+        # Create detailed visualization
+        fig = self.plot_task(task_id, task_data, solution, predictions)
+        plt.show()
+        
+        # Detailed comparison
+        if solution:
+            print(f"\n📊 Detailed Comparison:")
+            for i, pred in enumerate(predictions):
+                if i < len(solution):
+                    if isinstance(solution[i], dict) and 'output' in solution[i]:
+                        truth = solution[i]['output']
+                    else:
+                        truth = solution[i]
+                    
+                    pred_arr = np.array(pred)
+                    truth_arr = np.array(truth)
+                    
+                    is_correct = np.array_equal(pred_arr, truth_arr)
+                    
+                    print(f"\n   Test {i+1}:")
+                    print(f"     Prediction shape: {pred_arr.shape}")
+                    print(f"     Ground truth shape: {truth_arr.shape}")
+                    print(f"     Correct: {'✓' if is_correct else '✗'}")
+                    
+                    if not is_correct:
+                        # Show what's different
+                        if pred_arr.shape == truth_arr.shape:
+                            diff_count = np.sum(pred_arr != truth_arr)
+                            total_pixels = pred_arr.size
+                            print(f"     Pixels different: {diff_count}/{total_pixels} ({diff_count/total_pixels*100:.1f}%)")
+                        else:
+                            print(f"     Shape mismatch!")
+
     def compare_predictions(self, model: torch.nn.Module, task_id: str, 
                            dataset: str = 'training', device: str = 'cpu') -> None:
         """Show detailed comparison of predictions vs ground truth for a single task.

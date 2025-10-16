@@ -4,7 +4,7 @@ Unit tests for TRM Transformer components
 
 import torch
 import pytest
-from src.nn.models.trm_block import (
+from src.nn.modules.trm_block import (
     RMSNorm, 
     RotaryEmbedding, 
     SwiGLU, 

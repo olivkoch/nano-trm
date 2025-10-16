@@ -4,5 +4,7 @@ data_dir: "data"
 batch_size: ${timekeeping.batch_size}
 num_workers: ${timekeeping.num_workers}
 max_grid_size: 30
-augment_train: false
+augment_train: true
 samples_per_task: 100  # For augmentation
+use_concept_data: true
+concept_data_dir: "data/concept"

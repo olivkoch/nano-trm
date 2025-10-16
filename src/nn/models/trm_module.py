@@ -9,6 +9,7 @@ from torch.optim import AdamW
 from lightning import LightningModule
 from src.nn.modules.trm_block import TransformerBlock
 from src.nn.utils.constants import PAD_VALUE
+from src.nn.modules.hybrid_vision_embeddings import HybridDINOEmbedding
 
 from src.nn.utils import RankedLogger
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -32,6 +33,7 @@ class TRMModule(LightningModule):
                  weight_decay: float = 0.01,
                  warmup_steps: int = 2000,
                  max_steps: int = 100000,
+                 use_dino_embeddings: bool = True,
                  output_dir: str = None):
         super().__init__()
         self.save_hyperparameters()
@@ -40,7 +42,14 @@ class TRMModule(LightningModule):
         self.automatic_optimization = False
         
         # Model components
-        self.input_embedding = nn.Embedding(num_colors + 1, hidden_size, padding_idx=PAD_VALUE) # 0 (padding) + 10 colors
+        if use_dino_embeddings:
+            self.input_embedding = HybridDINOEmbedding(
+                    num_colors=num_colors + 1,
+                    hidden_size=hidden_size,
+                    freeze_dino=True
+            )
+        else:
+            self.input_embedding = nn.Embedding(num_colors + 1, hidden_size, padding_idx=PAD_VALUE) # 0 (padding) + 10 colors
 
         # a single network (not two separate networks)
         self.lenet = self._build_transformer(hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1)
@@ -147,7 +156,7 @@ class TRMModule(LightningModule):
             #     break
             n_steps += 1
 
-        if batch_idx % 10 == 0:
+        if batch_idx % 100 == 0:
             log.info(f"Training step {batch_idx}, supervision steps: {step+1} loss = {loss.item():.4f}")
 
         self.log('train/loss', loss.item(), prog_bar=True)
@@ -163,7 +172,8 @@ class TRMModule(LightningModule):
         height, width = y_true.shape[1], y_true.shape[2]
 
         with torch.no_grad():
-            y_pred = self(x_input) # B, H, W, num_colors
+  
+            y_pred = self(x_input)  # B, H, W, num_colors
 
             loss = F.cross_entropy(
                 y_pred.flatten(start_dim=0, end_dim=2), # [B*H*W, num_colors]
@@ -204,7 +214,8 @@ class TRMModule(LightningModule):
             self.log('val/accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
             self.log('val/exact_accuracy', exact_accuracy, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
-            log.info(f"Validation step {batch_idx}, loss = {loss.item():.4f}, accuracy = {accuracy.item():.4f} exact_accuracy = {exact_accuracy.item():.4f}")
+            if batch_idx % 100 == 0:
+                log.info(f"Validation step {batch_idx}, loss = {loss.item():.4f}, accuracy = {accuracy.item():.4f} exact_accuracy = {exact_accuracy.item():.4f}")
 
         return {'loss': loss, 'accuracy': accuracy, 'exact_accuracy': exact_accuracy}
     

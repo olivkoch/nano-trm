@@ -190,7 +190,10 @@ class ARCDataModule(LightningDataModule):
                  num_workers: int = 4,
                  max_grid_size: int = 30,
                  augment_train: bool = True,
-                 samples_per_task: int = 100):  # For augmentation
+                 samples_per_task: int = 100, # For augmentation
+                 use_concept_data: bool = False,
+                 concept_data_dir: str = "data/concept"
+                 ):  
         """
         Initialize DataModule.
         
@@ -209,7 +212,9 @@ class ARCDataModule(LightningDataModule):
         self.max_grid_size = max_grid_size
         self.augment_train = augment_train
         self.samples_per_task = samples_per_task
-        
+        self.use_concept_data = use_concept_data
+        self.concept_data_dir = concept_data_dir
+
         # Create transforms
         self.train_transform = TRMTransform(
             max_grid_size=max_grid_size,
@@ -227,7 +232,7 @@ class ARCDataModule(LightningDataModule):
         from pathlib import Path
         
         data_path = Path(self.data_dir)
-        
+
         # Load TRAINING data (for training)
         train_challenges_path = data_path / "arc-agi_training_challenges.json"
         train_solutions_path = data_path / "arc-agi_training_solutions.json"
@@ -259,7 +264,43 @@ class ARCDataModule(LightningDataModule):
         
         with open(eval_solutions_path, 'r') as f:
             eval_solutions = json.load(f)
-        
+
+        if self.use_concept_data:
+
+            concept_path = Path(self.concept_data_dir)
+
+            # Load TRAINING data (for training)
+            concept_train_challenges_path = concept_path / "concept_training_challenges.json"
+            concept_train_solutions_path = concept_path / "concept_training_solutions.json"
+
+            # Load EVALUATION data (for validation)
+            concept_eval_challenges_path = concept_path / "concept_evaluation_challenges.json"
+            concept_eval_solutions_path = concept_path / "concept_evaluation_solutions.json"
+            
+            # Check if files exist
+            if not concept_train_challenges_path.exists():
+                raise FileNotFoundError(f"Concept training challenges not found: {concept_train_challenges_path}")
+            if not concept_train_solutions_path.exists():
+                raise FileNotFoundError(f"Concept training solutions not found: {concept_train_solutions_path}")
+            if not concept_eval_challenges_path.exists():
+                raise FileNotFoundError(f"Concept evaluation challenges not found: {concept_eval_challenges_path}")
+            if not concept_eval_solutions_path.exists():
+                raise FileNotFoundError(f"Concept evaluation solutions not found: {concept_eval_solutions_path}")
+            
+            # Load training data
+            with open(concept_train_challenges_path, 'r') as f:
+                train_challenges.update(json.load(f))
+            
+            with open(concept_train_solutions_path, 'r') as f:
+                train_solutions.update(json.load(f))
+            
+            # Load evaluation data
+            with open(concept_eval_challenges_path, 'r') as f:
+                eval_challenges.update(json.load(f))
+            
+            with open(concept_eval_solutions_path, 'r') as f:
+                eval_solutions.update(json.load(f))
+
         # Create datasets
         self.train_dataset = ARCTaskDataset(
             train_challenges,

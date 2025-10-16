@@ -1,7 +1,7 @@
 _target_: src.nn.models.trm_module.TRMModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
 
-hidden_size: 512
+hidden_size: 32 # 512
 num_layers: 2
 # max_grid_size: 30
 num_colors: 10
@@ -14,5 +14,6 @@ learning_rate_emb: 1e-5
 weight_decay: 0.01
 warmup_steps: 2000
 max_steps: 100000
+use_dino_embeddings: true
 output_dir: None
 

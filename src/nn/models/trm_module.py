@@ -1,15 +1,13 @@
 """
 HRM PyTorch Lightning Module - Following Figure 2 pseudocode exactly
 """
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict
 from torch.optim import AdamW
 from lightning import LightningModule
-from src.nn.models.trm_block import TransformerBlock
-from src.nn.utils.stable_max_loss import StableMaxCrossEntropyLoss
+from src.nn.modules.trm_block import TransformerBlock
 from src.nn.utils.constants import PAD_VALUE
 
 from src.nn.utils import RankedLogger

@@ -4,7 +4,13 @@ This is an implementation of the [Transformer Reasoning Model (TRM)](https://arx
 
 # Data
 
+We are working with ARC-AGI-2 exclusively for now.
+
 You need to download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
+
+# Setup
+
+Install `uv`: `sudo snap install astral-uv --classic`
 
 # Training
 
@@ -20,4 +26,4 @@ To run an evaluation:
 
 # Visualization
 
-To visualize the results of a model, use the `neural_viewer.ipynb`
+To visualize the results of a model, use `notebooks/neural_viewer.ipynb`

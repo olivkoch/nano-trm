@@ -1,6 +1,7 @@
 """
 HRM PyTorch Lightning Module - Following Figure 2 pseudocode exactly
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,9 +11,17 @@ from lightning import LightningModule
 from src.nn.modules.trm_block import TransformerBlock
 from src.nn.utils.constants import PAD_VALUE
 from src.nn.modules.hybrid_vision_embeddings import HybridDINOEmbedding
+from src.nn.modules.utils import trunc_normal_init
 
 from src.nn.utils import RankedLogger
 log = RankedLogger(__name__, rank_zero_only=True)
+
+def trunc_normal_init(shape, std=1.0):
+    """Truncated normal initialization."""
+    t = torch.randn(shape) * std
+    # Truncate to [-2*std, 2*std]
+    t = torch.clamp(t, -2*std, 2*std)
+    return t
 
 class TRMModule(LightningModule):
     """
@@ -57,13 +66,15 @@ class TRMModule(LightningModule):
         # Output heads
         self.output_head = nn.Linear(hidden_size, num_colors)
 
+        self.embed_scale = math.sqrt(self.hparams.hidden_size)
+        
         # Halting head for adaptive computation
         # Only learn a halting probability through a Binary-Cross-Entropy loss of having
         # reached the correct solution
         self.Q_head = nn.Linear(hidden_size, 1)  # Q_head returns 1 value: q[0]
-        
-        self.register_buffer('y_init', torch.zeros(1, 1, hidden_size))
-        self.register_buffer('z_init', torch.zeros(1, 1, hidden_size))
+
+        self.register_buffer('y_init', trunc_normal_init((hidden_size,), std=0.02))
+        self.register_buffer('z_init', trunc_normal_init((1, 1, hidden_size), std=0.02))
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -103,20 +114,32 @@ class TRMModule(LightningModule):
         y = self._net_forward(self.lenet, y, z) # refine output answer
         return y, z
 
-    def deep_recursion(self, x, y, z, n, T):
-        # recursing T−1 times to improve y and z (no gradients needed)
+    def deep_recursion(self, x, y, z, L_cycles, H_cycles):
+        """
+        Args:
+            x: input embeddings [B, L, D]
+            y: high-level state (like z_H)
+            z: low-level state (like z_L)
+            L_cycles: inner loop iterations
+            H_cycles: outer loop iterations
+        """
+        # H_cycles-1 without gradient
         with torch.no_grad():
-            for j in range(T-1):
-                y, z = self.latent_recursion(x, y, z, n)
-        # recursing once to improve y and z
-        y, z = self.latent_recursion(x, y, z, n)
+            for _ in range(H_cycles - 1):
+                # L_cycles: update low-level from high-level + input
+                for _ in range(L_cycles):
+                    z = self._net_forward(self.lenet, z, y + x)  # z_L from z_H + input
+                # Update high-level from low-level
+                y = self._net_forward(self.lenet, y, z)  # z_H from z_L
         
-        # Output predictions and Q value
-        y_hat = self.output_head(y)  # [batch, seq_len, num_colors]
+        # Last H_cycle WITH gradient
+        for _ in range(L_cycles):
+            z = self._net_forward(self.lenet, z, y + x)
+        y = self._net_forward(self.lenet, y, z)
         
-        # Pool y for Q_head (average over sequence)
-        y_pooled = y.mean(dim=1)  # [batch, hidden_size]
-        q_hat = self.Q_head(y_pooled)  # [batch, 1]
+        # Output
+        y_hat = self.output_head(y)
+        q_hat = self.Q_head(y.mean(dim=1))
         
         return (y.detach(), z.detach()), y_hat, q_hat
 
@@ -137,7 +160,7 @@ class TRMModule(LightningModule):
         n_steps = 0
 
         for step in range(self.hparams.N_supervision):
-            x_emb = self.input_embedding(x_input)
+            x_emb = self.embed_scale * self.input_embedding(x_input)
             x_emb = x_emb.view(batch_size, seq_len, self.hparams.hidden_size) # B, L, D
             (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
             loss = F.cross_entropy(
@@ -230,7 +253,7 @@ class TRMModule(LightningModule):
 
         # Run supervision steps
         for i in range(self.hparams.N_supervision):
-            x_emb = self.input_embedding(x).view(batch_size, seq_len, self.hparams.hidden_size)
+            x_emb = self.embed_scale * self.input_embedding(x).view(batch_size, seq_len, self.hparams.hidden_size)
             (y, z), y_hat, q_hat = self.deep_recursion(x_emb, y, z, self.hparams.n_latent_recursions, self.hparams.T_deep_recursions)
             # if self.training:
             #     if q_hat.mean() > 0:

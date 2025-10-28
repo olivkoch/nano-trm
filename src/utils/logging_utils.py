@@ -27,7 +27,5 @@ def setup_logging(log_level: str, log_filename: str | None) -> None:
         logging.info("Also logging to %s", log_filename)
         os.makedirs(os.path.dirname(log_filename), exist_ok=True)
         file_handler = logging.FileHandler(filename=log_filename)
-        file_handler.setFormatter(
-            fmt=logging.Formatter(fmt=message_format, datefmt=date_format)
-        )
+        file_handler.setFormatter(fmt=logging.Formatter(fmt=message_format, datefmt=date_format))
         logging.getLogger().addHandler(file_handler)

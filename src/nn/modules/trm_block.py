@@ -1,14 +1,17 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 from src.nn.utils import RankedLogger
+
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -16,12 +19,13 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         # RMS normalization
-        norm = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        norm = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
         return self.weight * x / norm
 
 
 class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding (RoPE)."""
+
     def __init__(self, dim: int, max_seq_len: int = 2048):
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
@@ -54,7 +58,7 @@ def rotate_half(x):
 def apply_rotary_pos_emb(x, cos, sin):
     """
     Apply rotary position embedding.
-    
+
     Args:
         x: [batch, seq_len, num_heads, head_dim] or [batch, num_heads, seq_len, head_dim]
         cos: [1, seq_len, head_dim]
@@ -64,12 +68,13 @@ def apply_rotary_pos_emb(x, cos, sin):
     # We need to unsqueeze cos/sin to [1, seq_len, 1, head_dim] to broadcast over num_heads
     cos = cos.unsqueeze(2)  # [1, seq_len, 1, head_dim]
     sin = sin.unsqueeze(2)  # [1, seq_len, 1, head_dim]
-    
+
     return (x * cos) + (rotate_half(x) * sin)
 
 
 class SwiGLU(nn.Module):
     """SwiGLU activation function (Gated Linear Unit with Swish)."""
+
     def __init__(self, dim: int, hidden_dim: int, bias: bool = False):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
@@ -86,34 +91,37 @@ class SwiGLU(nn.Module):
 
 class TransformerBlock(nn.Module):
     """Single Transformer block with RMSNorm, Multi-head Self-Attention with RoPE, and SwiGLU FFN."""
-    def __init__(self, hidden_size: int, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1):
+
+    def __init__(
+        self, hidden_size: int, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        
+
         assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
-        
+
         # Pre-attention norm
         self.norm1 = RMSNorm(hidden_size)
-        
+
         # Self-attention (no bias as per paper)
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        
+
         # Rotary embeddings
         self.rotary_emb = RotaryEmbedding(self.head_dim)
-        
+
         # Pre-FFN norm
         self.norm2 = RMSNorm(hidden_size)
-        
+
         # SwiGLU FFN (hidden_dim = 4 * hidden_size as standard)
         self.ffn = SwiGLU(hidden_size, hidden_size * ffn_expansion, bias=False)
-        
+
         self.dropout = nn.Dropout(dropout)
-    
+
     def forward(self, x):
         """
         Args:
@@ -122,46 +130,48 @@ class TransformerBlock(nn.Module):
             [batch, seq_len, hidden_size]
         """
         batch_size, seq_len, _ = x.shape
-        
+
         # Self-attention with residual
         residual = x
         x = self.norm1(x)
-        
+
         # Multi-head attention
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
         v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        
+
         # Apply rotary embeddings to q and k
         # q and k are [batch, seq_len, num_heads, head_dim]
         cos, sin = self.rotary_emb(x, seq_len)
         q = apply_rotary_pos_emb(q, cos, sin)
         k = apply_rotary_pos_emb(k, cos, sin)
-        
+
         # Transpose for attention: [batch, num_heads, seq_len, head_dim]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        
+
         # Scaled dot-product attention
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_weights = self.dropout(attn_weights)
-        
+
         attn_output = torch.matmul(attn_weights, v)
-        
+
         # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        )
         attn_output = self.out_proj(attn_output)
         attn_output = self.dropout(attn_output)
-        
+
         x = residual + attn_output
-        
+
         # FFN with residual
         residual = x
         x = self.norm2(x)
         x = self.ffn(x)
         x = self.dropout(x)
         x = residual + x
-        
+
         return x

@@ -1,5 +1,5 @@
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import rich
 import rich.syntax
@@ -65,9 +65,7 @@ def print_config_tree(
         else:
             branch_content = str(config_group)
 
-        branch.add(
-            rich.syntax.Syntax(branch_content, "yaml", background_color="default")
-        )
+        branch.add(rich.syntax.Syntax(branch_content, "yaml", background_color="default"))
 
     # Print config tree
     rich.print(tree)

@@ -38,6 +38,7 @@ dependencies = [
     "hydra-colorlog>=1.2.0",
     "rich>=14.1.0",
     "transformers>=4.56.0",
+    "taskipy>=1.12.0",
 ]
 
 [project.optional-dependencies]
@@ -105,6 +106,9 @@ dev-dependencies = [
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+extend-exclude = ["*.ipynb"]
+
+[tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
     "W",   # pycodestyle warnings
@@ -118,6 +122,9 @@ select = [
 ignore = [
     "E501",  # line too long (handled by black)
     "B008",  # do not perform function calls in argument defaults
+    "UP006", # use `dict` instead of `Dict` - ignore for compatibility
+    "N806", # lower case variables
+    "C901", # too complex functions
 ]
 
 [tool.ruff.per-file-ignores]

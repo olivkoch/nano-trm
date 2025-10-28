@@ -1,13 +1,13 @@
+import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
-import warnings
 
 import hydra
 import torch
 from omegaconf import DictConfig
-from src.nn.evaluator import ARCEvaluator
-from datetime import datetime
 
+from src.nn.evaluator import ARCEvaluator
 from src.nn.utils import (
     RankedLogger,
     extras,
@@ -40,27 +40,29 @@ def evaluate(cfg: DictConfig) -> Optional[float]:
         checkpoint_path=cfg.checkpoint,
         data_dir=cfg.data_dir,
         batch_size=cfg.batch_size,
-        device=cfg.device
+        device=cfg.device,
     )
-    
+
     # Run evaluation
     results = evaluator.evaluate_full()
-    
+
     # Print results
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("EVALUATION RESULTS")
-    print("="*50)
-    print(f"Pixel Accuracy: {results['pixel_accuracy']:.4f} ({results['pixel_accuracy']*100:.2f}%)")
-    print(f"Task Accuracy: {results['task_accuracy']:.4f} ({results['task_accuracy']*100:.2f}%)")
+    print("=" * 50)
+    print(
+        f"Pixel Accuracy: {results['pixel_accuracy']:.4f} ({results['pixel_accuracy'] * 100:.2f}%)"
+    )
+    print(f"Task Accuracy: {results['task_accuracy']:.4f} ({results['task_accuracy'] * 100:.2f}%)")
     print(f"Tasks Solved: {results['tasks_correct']}/{results['total_tasks']}")
-    print("="*50)
-    
+    print("=" * 50)
+
     # Run per-task evaluation if requested
     if cfg.per_task:
         per_task_results = evaluator.evaluate_per_task()
         print("\nPer-Task Results:")
         print(per_task_results.head(20))
-        
+
         # Save per-task results
         output_path = Path(cfg.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -68,9 +70,13 @@ def evaluate(cfg: DictConfig) -> Optional[float]:
         per_task_file = output_path / f"per_task_results_{timestamp}.csv"
         per_task_results.to_csv(per_task_file, index=False)
         print(f"\nPer-task results saved to {per_task_file}")
-    
+
     # Save results
-    output_dir = cfg.output_dir if cfg.output_dir is not None else str(Path(cfg.checkpoint).parent / "evaluation_results")
+    output_dir = (
+        cfg.output_dir
+        if cfg.output_dir is not None
+        else str(Path(cfg.checkpoint).parent / "evaluation_results")
+    )
     print(f"Saving evaluation results to {output_dir}")
     evaluator.save_results(results, output_dir)
 

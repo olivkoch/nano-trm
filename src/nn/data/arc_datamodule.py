@@ -378,6 +378,7 @@ class ARCDataModuleWithPuzzles(LightningDataModule):
             pin_memory=True,
             collate_fn=collate_fn_with_puzzles,
             persistent_workers=True if self.num_workers > 0 else False,
+            drop_last=True  # Add this to ensure constant batch size
         )
 
     def val_dataloader(self):
@@ -389,6 +390,7 @@ class ARCDataModuleWithPuzzles(LightningDataModule):
             pin_memory=True,
             collate_fn=collate_fn_with_puzzles,
             persistent_workers=True if self.num_workers > 0 else False,
+            drop_last=True  # Add this to ensure constant batch size
         )
 
     def test_dataloader(self):

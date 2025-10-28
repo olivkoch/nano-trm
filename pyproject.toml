@@ -123,14 +123,22 @@ ignore = [
     "E501",  # line too long (handled by black)
     "B008",  # do not perform function calls in argument defaults
     "UP006", # use `dict` instead of `Dict` - ignore for compatibility
+    "N803", # lower case variables
     "N806", # lower case variables
+    "N815", # lower case variables
     "C901", # too complex functions
+    "F841", # unused variables
+    "E402", # import modules not at top of file
+    "E722", # do not use bare except
+    "B904", # except
+    "N812", # lower case import
+    "UP035", # deprecated typing
 ]
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # unused imports in __init__ files are ok
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["arc_baseline", "arc_evaluate", "arc_submit"]
 
 [tool.black]

@@ -1,6 +1,6 @@
 # An implementation of TRM
 
-This is an implementation of the [Transformer Reasoning Model (TRM)](https://arxiv.org/pdf/2510.04871v1)
+This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1)
 
 # Data
 

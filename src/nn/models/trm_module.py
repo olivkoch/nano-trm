@@ -186,12 +186,15 @@ class TRMModule(LightningModule):
 
         # Handle case when not attached to trainer (for testing)
         try:
-            opt = self.optimizers()
+            opts = self.optimizers()
+            if not isinstance(opts, list):
+                opts = [opts]
         except RuntimeError:
             # For testing without trainer
-            if not hasattr(self, "_optimizer"):
-                raise RuntimeError("No optimizer available. Set model._optimizer for testing.")
-            opt = self._optimizer
+            if not hasattr(self, '_optimizers'):
+                raise RuntimeError("No optimizer available.")
+            opts = self._optimizers if isinstance(self._optimizers, list) else [self._optimizers]
+
 
         # Initialize carry if first batch
         if self.carry is None:
@@ -239,8 +242,11 @@ class TRMModule(LightningModule):
         dense_params = [p for p in self.parameters() if p.grad is not None and not p.grad.is_sparse]
         if dense_params:
             torch.nn.utils.clip_grad_norm_(dense_params, max_norm=1.0)
-        opt.step()
-        opt.zero_grad()
+
+            # Step all optimizers
+        for opt in opts:
+            opt.step()
+            opt.zero_grad()
 
         avg_loss = total_loss / max(1, n_active_steps)
 
@@ -492,7 +498,7 @@ class TRMModule(LightningModule):
         self.carry = None
 
     def configure_optimizers(self):
-        """Configure optimizer with different learning rates for different parameter groups."""
+        """Configure optimizer with different learning rates and handle sparse gradients."""
         
         base_lr = self.hparams.learning_rate / self.hparams.N_supervision
         embedding_lr = self.hparams.learning_rate_emb / self.hparams.N_supervision
@@ -504,7 +510,7 @@ class TRMModule(LightningModule):
         
         for name, param in self.named_parameters():
             if 'puzzle_emb' in name:
-                # Sparse embeddings need special handling
+                # Sparse embeddings need SparseAdam
                 sparse_params.append(param)
             elif 'input_embedding' in name or 'pos_embedding' in name:
                 # Regular embeddings
@@ -513,27 +519,34 @@ class TRMModule(LightningModule):
                 # Everything else (transformer, heads, etc.)
                 other_params.append(param)
         
-        # Create parameter groups
-        param_groups = []
+        # Create optimizers list
+        optimizers = []
         
+        # Main optimizer for dense parameters
+        dense_params = []
         if other_params:
-            param_groups.append({'params': other_params, 'lr': base_lr})
-        
+            dense_params.append({'params': other_params, 'lr': base_lr})
         if embedding_params:
-            param_groups.append({'params': embedding_params, 'lr': embedding_lr})
+            dense_params.append({'params': embedding_params, 'lr': embedding_lr})
         
+        if dense_params:
+            main_optimizer = torch.optim.AdamW(
+                dense_params,
+                weight_decay=self.hparams.weight_decay,
+                betas=(0.9, 0.95)
+            )
+            optimizers.append(main_optimizer)
+        
+        # Separate optimizer for sparse embeddings
         if sparse_params:
-            # Sparse parameters use the embedding learning rate
-            param_groups.append({'params': sparse_params, 'lr': embedding_lr, 'sparse': True})
+            sparse_optimizer = torch.optim.SparseAdam(
+                sparse_params,
+                lr=embedding_lr,
+                betas=(0.9, 0.95)
+            )
+            optimizers.append(sparse_optimizer)
         
-        # AdamW handles sparse gradients automatically when sparse=True is set
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.95)
-        )
-        
-        return optimizer
+        return optimizers
 
         # Just linear warmup, no decay after
         def lr_lambda(step):

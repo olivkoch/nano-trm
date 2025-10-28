@@ -2,6 +2,8 @@
 
 This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1)
 
+Reference [code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
+
 # Data
 
 We are working with ARC-AGI-2 exclusively for now.

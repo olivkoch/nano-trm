@@ -1,6 +1,5 @@
 """
-TRM Transforms for PyTorch Lightning DataModule
-Preprocessing transforms for ARC-AGI tasks
+TRM DataModule with Puzzle ID support for PyTorch Lightning
 """
 
 import torch
@@ -10,17 +9,16 @@ from torch.utils.data import Dataset, DataLoader
 from lightning import LightningDataModule
 from src.nn.utils.constants import PAD_VALUE
 
+
 class TRMTransform:
-    """
-    Transform class for preprocessing ARC tasks for TRM model.
-    Can be used as a transform in a Dataset or DataModule.
-    """
+    """Transform class for preprocessing ARC tasks with puzzle ID support."""
     
     def __init__(self, 
                  max_grid_size: int = 30,
                  num_colors: int = 10,
                  pad_value: int = PAD_VALUE,
-                 augment: bool = False):
+                 augment: bool = False,
+                 puzzle_id_map: Optional[Dict[str, int]] = None):
         """
         Initialize the transform.
         
@@ -29,11 +27,13 @@ class TRMTransform:
             num_colors: Number of colors in ARC
             pad_value: Value to use for padding
             augment: Whether to apply data augmentation
+            puzzle_id_map: Mapping from task_id to puzzle_identifier
         """
         self.max_grid_size = max_grid_size
         self.num_colors = num_colors
         self.pad_value = pad_value
         self.augment = augment
+        self.puzzle_id_map = puzzle_id_map or {}
     
     def pad_grid(self, grid: np.ndarray) -> np.ndarray:
         """Pad a grid to fixed size."""
@@ -74,15 +74,7 @@ class TRMTransform:
         return input_grid, output_grid
     
     def __call__(self, sample: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        """
-        Transform a single sample.
-        
-        Args:
-            sample: Dictionary with 'input' and optionally 'output' grids
-            
-        Returns:
-            Dictionary with tensors ready for TRM
-        """
+        """Transform a single sample with puzzle identifier."""
         # Get input grid
         input_grid = np.array(sample['input'])
         
@@ -108,17 +100,20 @@ class TRMTransform:
             result['output'] = torch.from_numpy(output_padded).long()
             result['output_shape'] = torch.tensor(output_grid.shape)
         
-        # Add metadata if available
+        # Extract base task ID and get puzzle identifier
         if 'task_id' in sample:
             result['task_id'] = sample['task_id']
+            # Extract base task_id (remove _train_0, _test_0 suffixes)
+            base_task_id = sample['task_id'].split('_train_')[0].split('_test_')[0]
+            result['puzzle_identifier'] = self.puzzle_id_map.get(base_task_id, 0)
+        else:
+            result['puzzle_identifier'] = sample.get('puzzle_identifier', 0)
         
         return result
 
 
 class ARCTaskDataset(Dataset):
-    """
-    Dataset for ARC tasks that works with TRM transform.
-    """
+    """Dataset for ARC tasks with puzzle ID support."""
     
     def __init__(self, 
                  tasks: Dict[str, Dict],
@@ -178,11 +173,37 @@ class ARCTaskDataset(Dataset):
         return self.transform(sample)
 
 
-class ARCDataModule(LightningDataModule):
-    """
-    PyTorch Lightning DataModule for training on ARC tasks.
-    Uses full training set for training and evaluation set for validation.
-    """
+def collate_fn_with_puzzles(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Custom collate function that handles puzzle identifiers."""
+    # Stack inputs
+    inputs = torch.stack([sample['input'] for sample in batch])
+    
+    # Stack puzzle identifiers
+    puzzle_ids = torch.tensor([sample.get('puzzle_identifier', 0) for sample in batch], dtype=torch.long)
+    
+    # Create batch dict - using names that match reference
+    batch_dict = {
+        'input': inputs,  # Note: plural to match reference
+        'puzzle_identifiers': puzzle_ids  # Note: plural to match reference
+    }
+    
+    # Stack outputs if all samples have them
+    if all('output' in sample for sample in batch):
+        outputs = torch.stack([sample['output'] for sample in batch])
+        batch_dict['output'] = outputs  # Keep as 'output' for your existing code
+    
+    # Add metadata
+    if 'task_id' in batch[0]:
+        batch_dict['task_ids'] = [sample['task_id'] for sample in batch]
+    
+    if 'original_shape' in batch[0]:
+        batch_dict['original_shapes'] = torch.stack([sample['original_shape'] for sample in batch])
+    
+    return batch_dict
+
+
+class ARCDataModuleWithPuzzles(LightningDataModule):
+    """PyTorch Lightning DataModule with puzzle ID support."""
     
     def __init__(self,
                  data_dir: str = "data",
@@ -190,10 +211,9 @@ class ARCDataModule(LightningDataModule):
                  num_workers: int = 4,
                  max_grid_size: int = 30,
                  augment_train: bool = True,
-                 samples_per_task: int = 100, # For augmentation
+                 samples_per_task: int = 100,
                  use_concept_data: bool = False,
-                 concept_data_dir: str = "data/concept"
-                 ):  
+                 concept_data_dir: str = "data/concept"):
         """
         Initialize DataModule.
         
@@ -204,6 +224,8 @@ class ARCDataModule(LightningDataModule):
             max_grid_size: Maximum grid size for padding
             augment_train: Whether to augment training data
             samples_per_task: Number of augmented samples per task
+            use_concept_data: Whether to include concept ARC data
+            concept_data_dir: Directory containing concept ARC files
         """
         super().__init__()
         self.data_dir = data_dir
@@ -214,17 +236,10 @@ class ARCDataModule(LightningDataModule):
         self.samples_per_task = samples_per_task
         self.use_concept_data = use_concept_data
         self.concept_data_dir = concept_data_dir
-
-        # Create transforms
-        self.train_transform = TRMTransform(
-            max_grid_size=max_grid_size,
-            augment=augment_train
-        )
         
-        self.val_transform = TRMTransform(
-            max_grid_size=max_grid_size,
-            augment=False  # No augmentation for validation
-        )
+        # Will be populated in setup()
+        self.puzzle_id_map = {}
+        self.num_puzzles = 0
     
     def setup(self, stage: Optional[str] = None):
         """Load and setup datasets."""
@@ -232,7 +247,7 @@ class ARCDataModule(LightningDataModule):
         from pathlib import Path
         
         data_path = Path(self.data_dir)
-
+        
         # Load TRAINING data (for training)
         train_challenges_path = data_path / "arc-agi_training_challenges.json"
         train_solutions_path = data_path / "arc-agi_training_solutions.json"
@@ -264,15 +279,14 @@ class ARCDataModule(LightningDataModule):
         
         with open(eval_solutions_path, 'r') as f:
             eval_solutions = json.load(f)
-
+        
         if self.use_concept_data:
-
             concept_path = Path(self.concept_data_dir)
-
+            
             # Load TRAINING data (for training)
             concept_train_challenges_path = concept_path / "concept_training_challenges.json"
             concept_train_solutions_path = concept_path / "concept_training_solutions.json"
-
+            
             # Load EVALUATION data (for validation)
             concept_eval_challenges_path = concept_path / "concept_evaluation_challenges.json"
             concept_eval_solutions_path = concept_path / "concept_evaluation_solutions.json"
@@ -300,7 +314,27 @@ class ARCDataModule(LightningDataModule):
             
             with open(concept_eval_solutions_path, 'r') as f:
                 eval_solutions.update(json.load(f))
-
+        
+        # Create puzzle ID mapping (1-indexed, 0 reserved for unknown/padding)
+        all_task_ids = sorted(set(train_challenges.keys()) | set(eval_challenges.keys()))
+        self.puzzle_id_map = {task_id: i + 1 for i, task_id in enumerate(all_task_ids)}
+        self.num_puzzles = len(self.puzzle_id_map) + 1  # +1 for reserved 0
+        
+        print(f"✓ Created puzzle ID mapping for {len(self.puzzle_id_map)} unique puzzles")
+        
+        # Create transforms with puzzle ID mapping
+        self.train_transform = TRMTransform(
+            max_grid_size=self.max_grid_size,
+            augment=self.augment_train,
+            puzzle_id_map=self.puzzle_id_map
+        )
+        
+        self.val_transform = TRMTransform(
+            max_grid_size=self.max_grid_size,
+            augment=False,
+            puzzle_id_map=self.puzzle_id_map
+        )
+        
         # Create datasets
         self.train_dataset = ARCTaskDataset(
             train_challenges,
@@ -328,6 +362,7 @@ class ARCDataModule(LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
+            collate_fn=collate_fn_with_puzzles,
             persistent_workers=True if self.num_workers > 0 else False
         )
     
@@ -338,62 +373,10 @@ class ARCDataModule(LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
+            collate_fn=collate_fn_with_puzzles,
             persistent_workers=True if self.num_workers > 0 else False
         )
     
     def test_dataloader(self):
         # For testing, use evaluation dataset
         return self.val_dataloader()
-
-
-def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """
-    Custom collate function for batching ARC samples.
-    Handles variable-size outputs and missing values.
-    """
-    # Stack inputs
-    inputs = torch.stack([sample['input'] for sample in batch])
-    
-    # Create batch dict
-    batch_dict = {'input': inputs}
-    
-    # Stack outputs if all samples have them
-    if all('output' in sample for sample in batch):
-        outputs = torch.stack([sample['output'] for sample in batch])
-        batch_dict['output'] = outputs
-    
-    # Add other fields
-    if 'task_id' in batch[0]:
-        batch_dict['task_ids'] = [sample['task_id'] for sample in batch]
-    
-    if 'original_shape' in batch[0]:
-        batch_dict['original_shapes'] = torch.stack([sample['original_shape'] for sample in batch])
-    
-    return batch_dict
-
-
-# Example usage with custom collate
-class ARCDataModuleWithMetadata(ARCDataModule):
-    """Extended DataModule with custom collate function."""
-    
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            collate_fn=collate_fn,
-            persistent_workers=True if self.num_workers > 0 else False
-        )
-    
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            collate_fn=collate_fn,
-            persistent_workers=True if self.num_workers > 0 else False
-        )

@@ -1,5 +1,6 @@
-from pathlib import Path
 import shutil
+from pathlib import Path
+
 
 def download_directory(src: str, dst: Path):
     src_path = Path(src)
@@ -11,7 +12,8 @@ def download_directory(src: str, dst: Path):
             shutil.copy2(src_path, dst)
     else:
         raise FileNotFoundError(f"Source path does not exist: {src}")
-    
+
+
 def upload_directory(src: Path, dst: str):
     src_path = Path(src)
     dst_path = Path(dst)

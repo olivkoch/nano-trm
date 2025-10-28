@@ -21,14 +21,6 @@ from src.nn.utils.constants import PAD_VALUE
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
-def trunc_normal_init(shape, std=1.0):
-    """Truncated normal initialization."""
-    t = torch.randn(shape) * std
-    # Truncate to [-2*std, 2*std]
-    t = torch.clamp(t, -2 * std, 2 * std)
-    return t
-
-
 @dataclass
 class TRMCarry:
     """Carry structure for maintaining state across steps."""
@@ -196,7 +188,7 @@ class TRMModule(LightningModule):
         n_active_steps = 0
 
         # Run up to N_supervision steps for each sequence
-        for supervision_step in range(self.hparams.N_supervision):
+        for _ in range(self.hparams.N_supervision):
             # Forward pass
             self.carry, outputs = self.forward(self.carry, batch)
 

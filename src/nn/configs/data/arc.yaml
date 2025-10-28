@@ -1,10 +1,10 @@
-_target_: src.nn.data.ARCDataModuleWithMetadata
+_target_: src.nn.data.ARCDataModuleWithPuzzles
 _recursive_: false
 data_dir: "data"
 batch_size: ${timekeeping.batch_size}
 num_workers: ${timekeeping.num_workers}
 max_grid_size: 30
 augment_train: true
-samples_per_task: 100  # For augmentation
+samples_per_task: 1 # 100  # For augmentation
 use_concept_data: true
 concept_data_dir: "data/concept"

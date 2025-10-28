@@ -56,11 +56,20 @@ def train(cfg: DictConfig) -> Optional[float]:
 
     output_dir = Path(cfg["paths"]["output_dir"])
 
-    log.info(f"Instantiating model <{cfg.model._target_}>")
-    model: LightningModule = hydra.utils.instantiate(cfg.model, output_dir=output_dir)
-
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
+
+
+    # Setup datamodule to get num_puzzles
+    datamodule.setup(stage="fit")
+    
+    # Add num_puzzles to model config
+    if hasattr(datamodule, 'num_puzzles'):
+        cfg.model.num_puzzles = datamodule.num_puzzles
+        log.info(f"Setting model num_puzzles to {datamodule.num_puzzles}")
+        
+    log.info(f"Instantiating model <{cfg.model._target_}>")
+    model: LightningModule = hydra.utils.instantiate(cfg.model, output_dir=output_dir)
 
     log.info("Instantiating callbacks...")
     callbacks: list[Callback] = instantiate_callbacks(cfg.get("callbacks"))

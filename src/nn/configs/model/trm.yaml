@@ -15,5 +15,8 @@ weight_decay: 0.01
 warmup_steps: 2000
 max_steps: 100000
 use_dino_embeddings: true
+num_puzzles: 1000  # Should be set from datamodule
+puzzle_emb_dim: 512  # Puzzle embedding dimension
+puzzle_emb_len: 16   # How many tokens for puzzle embedding
 output_dir: None
 

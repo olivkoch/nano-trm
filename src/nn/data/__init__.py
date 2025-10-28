@@ -1,1 +1,1 @@
-from .arc_datamodule import ARCDataModule, ARCDataModuleWithMetadata  # noqa: F401
+from .arc_datamodule import ARCDataModuleWithPuzzles  # noqa: F401

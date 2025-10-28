@@ -77,7 +77,7 @@ def generate_unique_task_id(
             return task_id
 
     # Last resort: use random characters
-    for attempt in range(max_attempts):
+    for _ in range(max_attempts):
         random_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
         task_id = f"{concept_normalized}_{random_suffix}"
 
@@ -228,7 +228,7 @@ def split_tasks(
     eval_tasks = {}
 
     # Split each concept separately to maintain distribution
-    for concept, task_ids in tasks_by_concept.items():
+    for _, task_ids in tasks_by_concept.items():
         # Shuffle task IDs for this concept
         shuffled_ids = list(task_ids)
         random.shuffle(shuffled_ids)

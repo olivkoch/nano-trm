@@ -74,6 +74,12 @@ class TRMModule(LightningModule):
                 num_colors + 1, hidden_size, padding_idx=PAD_VALUE
             )  # 0 (padding) + 10 colors
 
+        # TODO: replace with RoPE or Casted Embeddings
+        self.pos_embedding = nn.Embedding(
+            max_grid_size * max_grid_size + puzzle_emb_len, 
+            hidden_size
+        )
+                
         # a single network (not two separate networks)
         self.lenet = self._build_transformer(
             hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1
@@ -114,6 +120,9 @@ class TRMModule(LightningModule):
         height, width = batch["input"].shape[1], batch["input"].shape[2]
         seq_len = height * width
 
+        # Account for puzzle embedding positions
+        total_seq_len = seq_len + self.puzzle_emb_len
+
         # Use the actual buffer names
         z_H_init = self.z_H_init.view(1, 1, -1)
         z_L_init = self.z_L_init.view(1, 1, -1)
@@ -126,8 +135,8 @@ class TRMModule(LightningModule):
                 current_data[k] = v
 
         return TRMCarry(
-            z_H=z_H_init.expand(batch_size, seq_len, -1).clone(),
-            z_L=z_L_init.expand(batch_size, seq_len, -1).clone(),
+            z_H=z_H_init.expand(batch_size, total_seq_len, -1).clone(),
+            z_L=z_L_init.expand(batch_size, total_seq_len, -1).clone(),
             steps=torch.zeros(batch_size, dtype=torch.int32, device=self.device),
             halted=torch.ones(batch_size, dtype=torch.bool, device=self.device),
             current_data=current_data,
@@ -233,28 +242,34 @@ class TRMModule(LightningModule):
 
         return torch.tensor(avg_loss)
 
-    def forward(
-        self, carry: TRMCarry, batch: Dict[str, torch.Tensor]
-    ) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
-        """
-        Single forward pass - matches reference's forward method.
-        This implements ONE step of reasoning, not the full supervision loop.
-        """
-        batch_size = batch["input"].shape[0]
-        height, width = batch["input"].shape[1], batch["input"].shape[2]
+    def forward(self, carry: TRMCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
+        """Forward pass matching reference implementation with puzzle embeddings."""
+        batch_size = batch['input'].shape[0]
+        height, width = batch['input'].shape[1], batch['input'].shape[2]
         seq_len = height * width
-
-        # Reset carry for halted sequences (they get new data)
+        
+        # Reset states for halted sequences
         reset_mask = carry.halted.view(-1, 1, 1)
+        
         z_H_init = self.z_H_init.view(1, 1, -1)
         z_L_init = self.z_L_init.view(1, 1, -1)
-
-        new_z_H = torch.where(reset_mask, z_H_init.expand(batch_size, seq_len, -1), carry.z_H)
-        new_z_L = torch.where(reset_mask, z_L_init.expand(batch_size, seq_len, -1), carry.z_L)
-
-        # Update steps (reset to 0 for halted sequences)
-        new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
-
+        
+        # Account for puzzle embedding positions in sequence length
+        total_seq_len = seq_len + self.puzzle_emb_len
+        
+        # Expand init states to total sequence length
+        new_z_H = torch.where(reset_mask, 
+                            z_H_init.expand(batch_size, total_seq_len, -1), 
+                            carry.z_H)
+        new_z_L = torch.where(reset_mask, 
+                            z_L_init.expand(batch_size, total_seq_len, -1), 
+                            carry.z_L)
+        
+        # Reset steps for halted sequences
+        new_steps = torch.where(carry.halted, 
+                                torch.zeros_like(carry.steps), 
+                                carry.steps)
+        
         # Update current_data for halted sequences
         new_current_data = {}
         for k in batch.keys():
@@ -262,56 +277,91 @@ class TRMModule(LightningModule):
                 mask = carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1))
                 new_current_data[k] = torch.where(mask, batch[k], carry.current_data[k])
             else:
-                # For non-tensors, just update for halted sequences
-                new_current_data[k] = batch[k]  # Or handle list updates if needed
+                new_current_data[k] = batch[k]
+        
+        # Get token embeddings from current data
+        x_input = new_current_data['input']
+        token_emb = self.embed_scale * self.input_embedding(x_input)
+        token_emb = token_emb.view(batch_size, seq_len, self.hparams.hidden_size)
+        
+        # Get and process puzzle embeddings
+        if self.puzzle_emb is not None and self.puzzle_emb_len > 0:
+            puzzle_ids = new_current_data['puzzle_identifiers']
+            puzzle_embedding = self.puzzle_emb(puzzle_ids)  # [B, puzzle_emb_dim]
+            
+            # Reshape puzzle embedding to sequence positions
+            # If puzzle_emb_dim doesn't divide evenly into hidden_size, pad
+            pad_count = self.puzzle_emb_len * self.hparams.hidden_size - puzzle_embedding.shape[-1]
+            if pad_count > 0:
+                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+            
+            # Reshape to [B, puzzle_emb_len, hidden_size]
+            puzzle_embedding = puzzle_embedding.view(batch_size, self.puzzle_emb_len, self.hparams.hidden_size)
+            
+            # Concatenate puzzle embeddings with token embeddings
+            x_emb = torch.cat([puzzle_embedding, token_emb], dim=1)  # [B, puzzle_len + seq_len, D]
+        else:
+            x_emb = token_emb
+            total_seq_len = seq_len
+        
+        # Apply position embeddings 
+        # Position embeddings should cover total_seq_len now
+        if hasattr(self, 'pos_embedding'):
+            positions = torch.arange(total_seq_len, device=x_emb.device)
+            positions = positions.unsqueeze(0).expand(batch_size, -1)
+            pos_emb = self.pos_embedding(positions)
+            x_emb = x_emb + pos_emb
 
-        # Get embeddings from current data
-        x_input = new_current_data["input"]
-        x_emb = self.embed_scale * self.input_embedding(x_input)
-        x_emb = x_emb.view(batch_size, seq_len, self.hparams.hidden_size)
-
-        # Deep recursion (ONE iteration)
+        # Deep recursion with updated states
         z_H, z_L = new_z_H, new_z_L
-
+        
         # H_cycles-1 without gradient
         with torch.no_grad():
             for _ in range(self.hparams.T_deep_recursions - 1):
                 for _ in range(self.hparams.n_latent_recursions):
                     z_L = self._net_forward(self.lenet, z_L, z_H + x_emb)
                 z_H = self._net_forward(self.lenet, z_H, z_L)
-
+        
         # Last H_cycle WITH gradient
         for _ in range(self.hparams.n_latent_recursions):
             z_L = self._net_forward(self.lenet, z_L, z_H + x_emb)
         z_H = self._net_forward(self.lenet, z_H, z_L)
-
-        # Outputs
-        logits = self.output_head(z_H)
-        q_halt_logits = self.Q_head(z_H[:, 0])  # Use first position
-
-        outputs = {"logits": logits, "q_halt_logits": q_halt_logits}
-
+        
+        # Compute outputs - only from grid positions (skip puzzle positions)
+        if self.puzzle_emb_len > 0:
+            # Skip puzzle embedding positions when computing output
+            grid_z_H = z_H[:, self.puzzle_emb_len:, :]  # [B, seq_len, D]
+            logits = self.output_head(grid_z_H)
+            # Use first puzzle position for Q-head (like reference)
+            q_halt_logits = self.Q_head(z_H[:, 0, :])
+        else:
+            logits = self.output_head(z_H)
+            q_halt_logits = self.Q_head(z_H[:, 0, :])
+        
+        outputs = {
+            'logits': logits,  # [B, seq_len, num_colors]
+            'q_halt_logits': q_halt_logits  # [B, 1]
+        }
+        
         # Update carry for next iteration
         with torch.no_grad():
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.hparams.N_supervision
-
+            
             # Halting logic
             if self.training:
-                # During training: halt based on Q-values or max steps
                 halted = is_last_step | (q_halt_logits.squeeze() > 0)
             else:
-                # During inference: always run max steps for consistency
                 halted = is_last_step
-
+        
         new_carry = TRMCarry(
             z_H=z_H.detach(),
             z_L=z_L.detach(),
             steps=new_steps,
             halted=halted,
-            current_data=new_current_data,
+            current_data=new_current_data
         )
-
+        
         return new_carry, outputs
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
@@ -470,11 +520,3 @@ class TRMModule(LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
         }
-
-
-if __name__ == "__main__":
-    # Simple test
-    model = TRMModule()
-    x = torch.randint(0, 10, (2, 10, 10))  # Batch of 2, 10x10 grid with values in [0, 9]
-    y = model(x)
-    print(y.shape)  # Should be (2, 10, 10, num_colors)

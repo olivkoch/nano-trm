@@ -13,6 +13,7 @@ from lightning import LightningModule
 from torch.optim import AdamW
 
 from src.nn.modules.hybrid_vision_embeddings import HybridDINOEmbedding
+from src.nn.modules.sparse_embeddings import CastedSparseEmbedding
 from src.nn.modules.trm_block import TransformerBlock
 from src.nn.modules.utils import trunc_normal_init
 from src.nn.utils import RankedLogger
@@ -106,10 +107,13 @@ class TRMModule(LightningModule):
 
         # Add puzzle embeddings
         if puzzle_emb_dim > 0:
-            self.puzzle_emb = nn.Embedding(num_puzzles, puzzle_emb_dim)
+            self.puzzle_emb = CastedSparseEmbedding(
+                num_puzzles, 
+                puzzle_emb_dim,
+                init_std=0.0,  # Reference uses 0 init
+                cast_to=torch.bfloat16
+            )
             self.puzzle_emb_len = puzzle_emb_len
-            # Initialize to small values (reference uses 0)
-            nn.init.normal_(self.puzzle_emb.weight, mean=0.0, std=0.01)
         else:
             self.puzzle_emb = None
             self.puzzle_emb_len = 0
@@ -231,7 +235,10 @@ class TRMModule(LightningModule):
                 break
 
         # Single optimizer step after all supervision steps
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        # Only clip non-sparse gradients
+        dense_params = [p for p in self.parameters() if p.grad is not None and not p.grad.is_sparse]
+        if dense_params:
+            torch.nn.utils.clip_grad_norm_(dense_params, max_norm=1.0)
         opt.step()
         opt.zero_grad()
 
@@ -485,26 +492,47 @@ class TRMModule(LightningModule):
         self.carry = None
 
     def configure_optimizers(self):
-        """Simple warmup + constant LR (no decay)."""
-
+        """Configure optimizer with different learning rates for different parameter groups."""
+        
         base_lr = self.hparams.learning_rate / self.hparams.N_supervision
         embedding_lr = self.hparams.learning_rate_emb / self.hparams.N_supervision
-
-        # Parameter groups
-        embedding_params = list(self.input_embedding.parameters())
-        other_params = [
-            p for n, p in self.named_parameters() if not n.startswith("input_embedding")
-        ]
-
-        optimizer = AdamW(
-            [
-                {"params": embedding_params, "lr": embedding_lr},
-                {"params": other_params, "lr": base_lr},
-            ],
+        
+        # Separate parameters into groups
+        embedding_params = []
+        sparse_params = []
+        other_params = []
+        
+        for name, param in self.named_parameters():
+            if 'puzzle_emb' in name:
+                # Sparse embeddings need special handling
+                sparse_params.append(param)
+            elif 'input_embedding' in name or 'pos_embedding' in name:
+                # Regular embeddings
+                embedding_params.append(param)
+            else:
+                # Everything else (transformer, heads, etc.)
+                other_params.append(param)
+        
+        # Create parameter groups
+        param_groups = []
+        
+        if other_params:
+            param_groups.append({'params': other_params, 'lr': base_lr})
+        
+        if embedding_params:
+            param_groups.append({'params': embedding_params, 'lr': embedding_lr})
+        
+        if sparse_params:
+            # Sparse parameters use the embedding learning rate
+            param_groups.append({'params': sparse_params, 'lr': embedding_lr, 'sparse': True})
+        
+        # AdamW handles sparse gradients automatically when sparse=True is set
+        optimizer = torch.optim.AdamW(
+            param_groups,
             weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.95),
+            betas=(0.9, 0.95)
         )
-
+        
         return optimizer
 
         # Just linear warmup, no decay after

@@ -63,60 +63,25 @@ def test_model_forward():
 def test_training_step():
     """Test a single training step."""
     print("\nTesting training step...")
-    
+
     model, batch = test_model_forward()
-    
-    # Set up optimizers for manual optimization testing
-    # Create both dense and sparse optimizers like configure_optimizers does
-    base_lr = 1e-4 / model.hparams.N_supervision
-    embedding_lr = 1e-3 / model.hparams.N_supervision
-    
-    # Separate parameters
-    embedding_params = []
-    sparse_params = []
-    other_params = []
-    
-    for name, param in model.named_parameters():
-        if 'puzzle_emb' in name:
-            sparse_params.append(param)
-        elif 'input_embedding' in name or 'pos_embedding' in name:
-            embedding_params.append(param)
-        else:
-            other_params.append(param)
-    
-    # Create optimizers
-    optimizers = []
-    
-    # Dense optimizer
-    dense_params = []
-    if other_params:
-        dense_params.append({'params': other_params, 'lr': base_lr})
-    if embedding_params:
-        dense_params.append({'params': embedding_params, 'lr': embedding_lr})
-    
-    if dense_params:
-        dense_opt = torch.optim.AdamW(dense_params, weight_decay=0.01, betas=(0.9, 0.95))
-        optimizers.append(dense_opt)
-    
-    # Sparse optimizer
-    if sparse_params:
-        sparse_opt = torch.optim.SparseAdam(sparse_params, lr=embedding_lr, betas=(0.9, 0.95))
-        optimizers.append(sparse_opt)
-    
-    # Store optimizers for testing
-    model._optimizers = optimizers
-    
+
+    # Manual optimization setup
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    model._optimizer = optimizer  # Store optimizer directly for testing
+
     # Simulate training step
     model.train()
     model.carry = None  # Start fresh
-    
-    # Run one training step
+
+    # Run one step
     loss = model.training_step(batch, 0)
     print(f"Training loss: {loss.item():.4f}")
-    
+
     # Check carry state
     print(f"Carry steps: {model.carry.steps}")
     print(f"Carry halted: {model.carry.halted}")
+
 
 if __name__ == "__main__":
     test_data_loading()

@@ -9,11 +9,14 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from adam_atan2 import AdamATan2
 from lightning import LightningModule
-from torch.optim import AdamW
 
 from src.nn.modules.hybrid_vision_embeddings import HybridDINOEmbedding
-from src.nn.modules.sparse_embeddings import CastedSparseEmbedding
+from src.nn.modules.sparse_embeddings import (
+    CastedSparseEmbedding,
+    CastedSparseEmbeddingSignSGD_Distributed,
+)
 from src.nn.modules.trm_block import TransformerBlock
 from src.nn.modules.utils import trunc_normal_init
 from src.nn.utils import RankedLogger
@@ -54,7 +57,8 @@ class TRMModule(LightningModule):
         warmup_steps: int = 2000,
         max_steps: int = 100000,
         use_dino_embeddings: bool = True,
-        num_puzzles: int = 1000,  # Should be set from datamodule
+        num_puzzles: int = 0,  # Should be set from datamodule
+        batch_size: int = 0,  # Should be set from datamodule
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
         output_dir: str = None,
@@ -77,10 +81,9 @@ class TRMModule(LightningModule):
 
         # TODO: replace with RoPE or Casted Embeddings
         self.pos_embedding = nn.Embedding(
-            max_grid_size * max_grid_size + puzzle_emb_len, 
-            hidden_size
+            max_grid_size * max_grid_size + puzzle_emb_len, hidden_size
         )
-                
+
         # a single network (not two separate networks)
         self.lenet = self._build_transformer(
             hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1
@@ -108,13 +111,18 @@ class TRMModule(LightningModule):
         # Add puzzle embeddings
         if puzzle_emb_dim > 0:
             self.puzzle_emb = CastedSparseEmbedding(
-                num_puzzles, 
-                puzzle_emb_dim,
+                num_embeddings=num_puzzles,
+                embedding_dim=puzzle_emb_dim,
+                batch_size=batch_size,
                 init_std=0.0,  # Reference uses 0 init
-                cast_to=torch.bfloat16
+                cast_to=torch.bfloat16,
             )
             self.puzzle_emb_len = puzzle_emb_len
+            log.info(f"Created puzzle_emb with batch_size={batch_size}")
+            log.info(f"puzzle_emb.local_weights.shape: {self.puzzle_emb.local_weights.shape}")
+            log.info(f"puzzle_emb.weights.shape: {self.puzzle_emb.weights.shape}")
         else:
+            log.info("puzzle_emb_dim <= 0, not creating puzzle embeddings")
             self.puzzle_emb = None
             self.puzzle_emb_len = 0
 
@@ -186,12 +194,14 @@ class TRMModule(LightningModule):
 
         # Handle case when not attached to trainer (for testing)
         try:
-            opt = self.optimizers()
+            opts = self.optimizers()
+            if not isinstance(opts, list):
+                opts = [opts]
         except RuntimeError:
             # For testing without trainer
-            if not hasattr(self, "_optimizer"):
-                raise RuntimeError("No optimizer available. Set model._optimizer for testing.")
-            opt = self._optimizer
+            if not hasattr(self, "_optimizers"):
+                raise RuntimeError("No optimizer available. Set model._optimizers for testing.")
+            opts = self._optimizers
 
         # Initialize carry if first batch
         if self.carry is None:
@@ -236,47 +246,68 @@ class TRMModule(LightningModule):
 
         # Single optimizer step after all supervision steps
         # Only clip non-sparse gradients
-        dense_params = [p for p in self.parameters() if p.grad is not None and not p.grad.is_sparse]
-        if dense_params:
-            torch.nn.utils.clip_grad_norm_(dense_params, max_norm=1.0)
-        opt.step()
-        opt.zero_grad()
+        # dense_params = [p for p in self.parameters() if p.grad is not None and not p.grad.is_sparse]
+        # if dense_params:
+        #     torch.nn.utils.clip_grad_norm_(dense_params, max_norm=1.0)
+        for opt in opts:
+            # Lightning wraps optimizers in LightningOptimizer which adds closure arg
+            # Get the actual optimizer to avoid this
+            if hasattr(opt, "_optimizer"):
+                opt._optimizer.step()
+                opt._optimizer.zero_grad()
+            else:
+                opt.step()
+                opt.zero_grad()
 
         avg_loss = total_loss / max(1, n_active_steps)
 
-        self.log("train/loss", avg_loss, prog_bar=True)
-        self.log("train/avg_steps", self.carry.steps.float().mean(), prog_bar=True)
+        self.log(
+            "train/loss",
+            avg_loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+            rank_zero_only=True,
+            logger=True,
+        )
+        self.log(
+            "train/avg_steps",
+            self.carry.steps.float().mean(),
+            prog_bar=True,
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+            rank_zero_only=True,
+            logger=True,
+        )
 
         return torch.tensor(avg_loss)
 
-    def forward(self, carry: TRMCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
+    def forward(
+        self, carry: TRMCarry, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
         """Forward pass matching reference implementation with puzzle embeddings."""
-        batch_size = batch['input'].shape[0]
-        height, width = batch['input'].shape[1], batch['input'].shape[2]
+        batch_size = batch["input"].shape[0]
+        height, width = batch["input"].shape[1], batch["input"].shape[2]
         seq_len = height * width
-        
+
         # Reset states for halted sequences
         reset_mask = carry.halted.view(-1, 1, 1)
-        
+
         z_H_init = self.z_H_init.view(1, 1, -1)
         z_L_init = self.z_L_init.view(1, 1, -1)
-        
+
         # Account for puzzle embedding positions in sequence length
         total_seq_len = seq_len + self.puzzle_emb_len
-        
+
         # Expand init states to total sequence length
-        new_z_H = torch.where(reset_mask, 
-                            z_H_init.expand(batch_size, total_seq_len, -1), 
-                            carry.z_H)
-        new_z_L = torch.where(reset_mask, 
-                            z_L_init.expand(batch_size, total_seq_len, -1), 
-                            carry.z_L)
-        
+        new_z_H = torch.where(reset_mask, z_H_init.expand(batch_size, total_seq_len, -1), carry.z_H)
+        new_z_L = torch.where(reset_mask, z_L_init.expand(batch_size, total_seq_len, -1), carry.z_L)
+
         # Reset steps for halted sequences
-        new_steps = torch.where(carry.halted, 
-                                torch.zeros_like(carry.steps), 
-                                carry.steps)
-        
+        new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
+
         # Update current_data for halted sequences
         new_current_data = {}
         for k in batch.keys():
@@ -285,35 +316,37 @@ class TRMModule(LightningModule):
                 new_current_data[k] = torch.where(mask, batch[k], carry.current_data[k])
             else:
                 new_current_data[k] = batch[k]
-        
+
         # Get token embeddings from current data
-        x_input = new_current_data['input']
+        x_input = new_current_data["input"]
         token_emb = self.embed_scale * self.input_embedding(x_input)
         token_emb = token_emb.view(batch_size, seq_len, self.hparams.hidden_size)
-        
+
         # Get and process puzzle embeddings
         if self.puzzle_emb is not None and self.puzzle_emb_len > 0:
-            puzzle_ids = new_current_data['puzzle_identifiers']
+            puzzle_ids = new_current_data["puzzle_identifiers"]
             puzzle_embedding = self.puzzle_emb(puzzle_ids)  # [B, puzzle_emb_dim]
-            
+
             # Reshape puzzle embedding to sequence positions
             # If puzzle_emb_dim doesn't divide evenly into hidden_size, pad
             pad_count = self.puzzle_emb_len * self.hparams.hidden_size - puzzle_embedding.shape[-1]
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
-            
+
             # Reshape to [B, puzzle_emb_len, hidden_size]
-            puzzle_embedding = puzzle_embedding.view(batch_size, self.puzzle_emb_len, self.hparams.hidden_size)
-            
+            puzzle_embedding = puzzle_embedding.view(
+                batch_size, self.puzzle_emb_len, self.hparams.hidden_size
+            )
+
             # Concatenate puzzle embeddings with token embeddings
             x_emb = torch.cat([puzzle_embedding, token_emb], dim=1)  # [B, puzzle_len + seq_len, D]
         else:
             x_emb = token_emb
             total_seq_len = seq_len
-        
-        # Apply position embeddings 
+
+        # Apply position embeddings
         # Position embeddings should cover total_seq_len now
-        if hasattr(self, 'pos_embedding'):
+        if hasattr(self, "pos_embedding"):
             positions = torch.arange(total_seq_len, device=x_emb.device)
             positions = positions.unsqueeze(0).expand(batch_size, -1)
             pos_emb = self.pos_embedding(positions)
@@ -321,54 +354,54 @@ class TRMModule(LightningModule):
 
         # Deep recursion with updated states
         z_H, z_L = new_z_H, new_z_L
-        
+
         # H_cycles-1 without gradient
         with torch.no_grad():
             for _ in range(self.hparams.T_deep_recursions - 1):
                 for _ in range(self.hparams.n_latent_recursions):
                     z_L = self._net_forward(self.lenet, z_L, z_H + x_emb)
                 z_H = self._net_forward(self.lenet, z_H, z_L)
-        
+
         # Last H_cycle WITH gradient
         for _ in range(self.hparams.n_latent_recursions):
             z_L = self._net_forward(self.lenet, z_L, z_H + x_emb)
         z_H = self._net_forward(self.lenet, z_H, z_L)
-        
+
         # Compute outputs - only from grid positions (skip puzzle positions)
         if self.puzzle_emb_len > 0:
             # Skip puzzle embedding positions when computing output
-            grid_z_H = z_H[:, self.puzzle_emb_len:, :]  # [B, seq_len, D]
+            grid_z_H = z_H[:, self.puzzle_emb_len :, :]  # [B, seq_len, D]
             logits = self.output_head(grid_z_H)
             # Use first puzzle position for Q-head (like reference)
             q_halt_logits = self.Q_head(z_H[:, 0, :])
         else:
             logits = self.output_head(z_H)
             q_halt_logits = self.Q_head(z_H[:, 0, :])
-        
+
         outputs = {
-            'logits': logits,  # [B, seq_len, num_colors]
-            'q_halt_logits': q_halt_logits  # [B, 1]
+            "logits": logits,  # [B, seq_len, num_colors]
+            "q_halt_logits": q_halt_logits,  # [B, 1]
         }
-        
+
         # Update carry for next iteration
         with torch.no_grad():
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.hparams.N_supervision
-            
+
             # Halting logic
             if self.training:
                 halted = is_last_step | (q_halt_logits.squeeze() > 0)
             else:
                 halted = is_last_step
-        
+
         new_carry = TRMCarry(
             z_H=z_H.detach(),
             z_L=z_L.detach(),
             steps=new_steps,
             halted=halted,
-            current_data=new_current_data
+            current_data=new_current_data,
         )
-        
+
         return new_carry, outputs
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
@@ -493,58 +526,86 @@ class TRMModule(LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer with different learning rates for different parameter groups."""
-        
+
         base_lr = self.hparams.learning_rate / self.hparams.N_supervision
         embedding_lr = self.hparams.learning_rate_emb / self.hparams.N_supervision
-        
-        # Separate parameters into groups
-        embedding_params = []
-        sparse_params = []
-        other_params = []
-        
+
+        # Collect parameters for main optimizer
+        main_params = []
         for name, param in self.named_parameters():
-            if 'puzzle_emb' in name:
-                # Sparse embeddings need special handling
-                sparse_params.append(param)
-            elif 'input_embedding' in name or 'pos_embedding' in name:
-                # Regular embeddings
-                embedding_params.append(param)
-            else:
-                # Everything else (transformer, heads, etc.)
-                other_params.append(param)
-        
-        # Create parameter groups
-        param_groups = []
-        
-        if other_params:
-            param_groups.append({'params': other_params, 'lr': base_lr})
-        
-        if embedding_params:
-            param_groups.append({'params': embedding_params, 'lr': embedding_lr})
-        
-        if sparse_params:
-            # Sparse parameters use the embedding learning rate
-            param_groups.append({'params': sparse_params, 'lr': embedding_lr, 'sparse': True})
-        
-        # AdamW handles sparse gradients automatically when sparse=True is set
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.95)
-        )
-        
-        return optimizer
+            if "puzzle_emb" not in name:  # Exclude puzzle_emb
+                main_params.append(param)
 
-        # Just linear warmup, no decay after
-        def lr_lambda(step):
-            if step < self.hparams.warmup_steps:
-                return step / max(1, self.hparams.warmup_steps)
-            else:
-                return 1.0  # Constant LR after warmup
+        optimizers = []
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # Main optimizer
+        if main_params:
+            # Use AdamATan2 if available
+            try:
+                main_opt = AdamATan2(
+                    main_params,
+                    lr=base_lr,
+                    weight_decay=self.hparams.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+            except ImportError:
+                main_opt = torch.optim.AdamW(
+                    main_params,
+                    lr=base_lr,
+                    weight_decay=self.hparams.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+            optimizers.append(main_opt)
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
-        }
+        # Sparse embedding optimizer - use buffers() like reference
+        # if hasattr(self, 'puzzle_emb') and self.puzzle_emb is not None:
+        #     sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
+        #         self.puzzle_emb.buffers(),  # Use .buffers() method like reference
+        #         lr=embedding_lr,
+        #         weight_decay=self.hparams.weight_decay,
+        #         world_size=1  # or get from trainer if distributed
+        #     )
+        #     optimizers.append(sparse_opt)
+
+        # Debug: Let's see what buffers() actually returns
+        if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
+            print("Debugging puzzle_emb buffers:")
+            buffer_list = list(self.puzzle_emb.buffers())
+            print(f"  Number of buffers: {len(buffer_list)}")
+            for i, buf in enumerate(buffer_list):
+                print(
+                    f"  Buffer {i}: shape={buf.shape}, dtype={buf.dtype}, requires_grad={buf.requires_grad}, is_leaf={buf.is_leaf}"
+                )
+                if buf.requires_grad and not buf.is_leaf:
+                    # This is local_weights - recreate as leaf
+                    buffer_list[i] = buf.detach().requires_grad_(True)
+                    print(
+                        f"  Fixed Buffer {i}: shape={buf.shape}, dtype={buf.dtype}, requires_grad={buf.requires_grad}, is_leaf={buf.is_leaf}"
+                    )
+
+            # Try to match what the optimizer expects
+            # The optimizer's step() method expects exactly 3 items
+            # Let's ensure we're passing them in the right format
+            sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
+                buffer_list,  # This should be a list of 3 tensors
+                lr=embedding_lr,
+                weight_decay=self.hparams.weight_decay,
+                world_size=1,
+            )
+            optimizers.append(sparse_opt)
+
+        return optimizers
+
+        # # Just linear warmup, no decay after
+        # def lr_lambda(step):
+        #     if step < self.hparams.warmup_steps:
+        #         return step / max(1, self.hparams.warmup_steps)
+        #     else:
+        #         return 1.0  # Constant LR after warmup
+
+        # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        # return {
+        #     "optimizer": optimizer,
+        #     "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        # }

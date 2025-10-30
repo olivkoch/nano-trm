@@ -18,6 +18,7 @@ timekeeping:
 trainer:
   accumulate_grad_batches: 1
   val_check_interval: 0.25  # Check 4x per epoch
+  log_every_n_steps: 1
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

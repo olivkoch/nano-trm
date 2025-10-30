@@ -1,8 +1,13 @@
 # debug_trm.py
 import torch
+from adam_atan2 import AdamATan2
 
 from src.nn.data.arc_datamodule import ARCDataModuleWithPuzzles
 from src.nn.models.trm_module import TRMModule
+from src.nn.modules.sparse_embeddings import (
+    CastedSparseEmbedding,
+    CastedSparseEmbeddingSignSGD_Distributed,
+)
 
 
 def test_data_loading():
@@ -45,6 +50,7 @@ def test_model_forward():
         N_supervision=3,
         n_latent_recursions=1,
         T_deep_recursions=1,
+        batch_size=dm.batch_size,
     )
 
     # Test initial carry
@@ -66,9 +72,46 @@ def test_training_step():
 
     model, batch = test_model_forward()
 
-    # Manual optimization setup
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    model._optimizer = optimizer  # Store optimizer directly for testing
+    # Manual optimization setup with proper optimizers
+    base_lr = 1e-4 / model.hparams.N_supervision
+    embedding_lr = 1e-3 / model.hparams.N_supervision
+
+    optimizers = []
+
+    # Collect parameters for main optimizer (excluding sparse embeddings)
+    main_params = []
+
+    # Collect other parameters
+    for name, param in model.named_parameters():
+        if "puzzle_emb" not in name:  # Exclude puzzle_emb as it's handled separately
+            main_params.append(param)
+
+    # Main optimizer (use AdamATan2 if available, else AdamW)
+    if main_params:
+        try:
+            main_opt = AdamATan2(main_params, lr=base_lr, weight_decay=0.01, betas=(0.9, 0.95))
+        except:
+            # Fallback to AdamW if AdamATan2 not available
+            main_opt = torch.optim.AdamW(
+                main_params, lr=base_lr, weight_decay=0.01, betas=(0.9, 0.95)
+            )
+        optimizers.append(main_opt)
+
+    # Sparse embedding optimizer
+    for _, module in model.named_modules():
+        if isinstance(module, CastedSparseEmbedding):
+            # Pass the three components directly as a list, NOT a list of lists
+            sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
+                [module.local_weights, module.local_ids, module.weights],  # Single list
+                world_size=1,
+                lr=embedding_lr,
+                weight_decay=0.01,
+            )
+            optimizers.append(sparse_opt)
+            break  # Only one sparse embedding module
+
+    # Store optimizers for testing
+    model._optimizers = optimizers
 
     # Simulate training step
     model.train()
@@ -82,9 +125,14 @@ def test_training_step():
     print(f"Carry steps: {model.carry.steps}")
     print(f"Carry halted: {model.carry.halted}")
 
+    # Check if parameters are updating
+    print(f"Number of optimizers: {len(optimizers)}")
+    for i, opt in enumerate(optimizers):
+        print(f"Optimizer {i}: {type(opt).__name__}")
+
 
 if __name__ == "__main__":
-    test_data_loading()
-    test_model_forward()
+    # test_data_loading()
+    # test_model_forward()
     test_training_step()
     print("\n✅ All tests passed!")

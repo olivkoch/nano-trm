@@ -21,6 +21,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 dependencies = [
     "numpy>=1.24.0,<2.0.0",
     "scipy>=1.10.0",
@@ -132,7 +135,9 @@ ignore = [
     "E722", # do not use bare except
     "B904", # except
     "N812", # lower case import
+    "N801", # naming conventions
     "UP035", # deprecated typing
+    "B011", # allow asserts
 ]
 
 [tool.ruff.lint.per-file-ignores]

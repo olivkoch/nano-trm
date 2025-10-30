@@ -67,7 +67,10 @@ def train(cfg: DictConfig) -> Optional[float]:
     # Add num_puzzles to model config
     if hasattr(datamodule, "num_puzzles"):
         cfg.model.num_puzzles = datamodule.num_puzzles
-        log.info(f"Setting model num_puzzles to {datamodule.num_puzzles}")
+        cfg.model.batch_size = datamodule.batch_size
+        log.info(
+            f"Setting model num_puzzles to {datamodule.num_puzzles} and batch_size to {datamodule.batch_size}"
+        )
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model, output_dir=output_dir)

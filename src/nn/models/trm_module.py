@@ -186,6 +186,69 @@ class TRMModule(LightningModule):
             ]
         )
 
+    def compute_loss_and_metrics(self, carry, batch):
+        """Compute loss and metrics without circular reference."""
+        # Get model outputs
+        new_carry, outputs = self.forward(carry, batch)
+
+        # Extract labels
+        y_true = batch["output"]
+        batch_size = y_true.shape[0]
+        y_true_flat = y_true.flatten(start_dim=1)
+
+        with torch.no_grad():
+            # Compute masks and correctness
+            mask = y_true_flat != PAD_VALUE
+            loss_counts = mask.sum(-1)
+            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
+
+            # Predictions and correctness
+            preds = torch.argmax(outputs["logits"], dim=-1)
+            is_correct = mask & (preds == y_true_flat)
+            seq_is_correct = is_correct.sum(-1) == loss_counts
+
+            # Metrics (only for halted sequences)
+            valid_metrics = new_carry.halted & (loss_counts > 0)
+            metrics = {
+                "count": valid_metrics.sum(),
+                "accuracy": torch.where(
+                    valid_metrics, (is_correct.float() / loss_divisor).sum(-1), 0
+                ).sum(),
+                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+                "q_halt_accuracy": (
+                    valid_metrics & ((outputs["q_halt_logits"].squeeze() >= 0) == seq_is_correct)
+                ).sum(),
+                "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
+            }
+
+        # Compute losses - IMPORTANT: These are per-sequence losses that will be summed
+        lm_loss_per_token = F.cross_entropy(
+            outputs["logits"].view(-1, self.hparams.num_colors),
+            y_true_flat.view(-1),
+            ignore_index=PAD_VALUE,
+            reduction="none",
+        ).view(batch_size, -1)
+
+        # Normalize by number of valid tokens per sequence, then sum
+        lm_loss = (lm_loss_per_token / loss_divisor).sum(-1).mean()  # Changed: mean instead of sum
+
+        q_halt_loss = F.binary_cross_entropy_with_logits(
+            outputs["q_halt_logits"].squeeze(),
+            seq_is_correct.float(),
+            reduction="mean",  # Changed: mean instead of sum
+        )
+
+        metrics.update(
+            {
+                "lm_loss": lm_loss.detach(),
+                "q_halt_loss": q_halt_loss.detach(),
+            }
+        )
+
+        total_loss = lm_loss + 0.5 * q_halt_loss
+
+        return new_carry, total_loss, metrics, new_carry.halted.all()
+
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """
         Training step that implements supervision through multiple forward passes.
@@ -207,51 +270,59 @@ class TRMModule(LightningModule):
         if self.carry is None:
             self.carry = self.initial_carry(batch)
 
+        # Accumulate metrics
+        accumulated_metrics = {}
         total_loss = 0.0
         n_active_steps = 0
 
-        # Run up to N_supervision steps for each sequence
+        # Run supervision steps
         for _ in range(self.hparams.N_supervision):
-            # Forward pass
-            self.carry, outputs = self.forward(self.carry, batch)
+            # Forward with loss computation
+            self.carry, loss, metrics, all_halted = self.compute_loss_and_metrics(self.carry, batch)
 
-            # Compute loss only for non-halted sequences
+            # Only backprop for non-halted sequences
             active_mask = ~self.carry.halted
             if active_mask.any():
-                y_true = batch["output"].flatten(start_dim=1)
-                logits = outputs["logits"]
-
-                # Compute loss
-                loss = (
-                    F.cross_entropy(
-                        logits.view(-1, self.hparams.num_colors),
-                        y_true.view(-1),
-                        ignore_index=PAD_VALUE,
-                        reduction="none",
-                    )
-                    .view(logits.shape[0], -1)
-                    .mean(dim=1)
-                )  # Per-sequence loss
-
-                # Only backprop for active sequences
-                masked_loss = (loss * active_mask.float()).sum() / active_mask.float().sum()
+                masked_loss = loss * active_mask.float().sum() / batch["input"].shape[0]
                 masked_loss.backward()
-
                 total_loss += masked_loss.item()
                 n_active_steps += 1
 
-            # Check if all sequences have halted
-            if self.carry.halted.all():
+                # Accumulate metrics
+                for k, v in metrics.items():
+                    accumulated_metrics[k] = accumulated_metrics.get(k, 0) + v.item()
+
+            if all_halted:
                 break
 
-        # Single optimizer step after all supervision steps
-        # Only clip non-sparse gradients
-        # dense_params = [p for p in self.parameters() if p.grad is not None and not p.grad.is_sparse]
-        # if dense_params:
-        #     torch.nn.utils.clip_grad_norm_(dense_params, max_norm=1.0)
+        # Clip gradients for all parameters (both dense and sparse)
+        if n_active_steps > 0:  # Only if we actually computed gradients
+            # Get all parameters with gradients
+            params_with_grad = []
+
+            # Add regular parameters
+            for param in self.parameters():
+                if param.grad is not None:
+                    params_with_grad.append(param)
+
+            # Add sparse embedding buffers if they have gradients
+            if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
+                for buf in self.puzzle_emb.buffers():
+                    if hasattr(buf, "grad") and buf.grad is not None:
+                        # For sparse gradients, we need to handle them differently
+                        if buf.grad.is_sparse:
+                            # Clip sparse gradients by value
+                            buf.grad = buf.grad.coalesce()
+                            buf.grad._values().clamp_(-1.0, 1.0)
+                        else:
+                            params_with_grad.append(buf)
+
+            # Clip dense gradients by norm
+            if params_with_grad:
+                torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=1.0)
+
+        # Optimizer step
         for opt in opts:
-            # Lightning wraps optimizers in LightningOptimizer which adds closure arg
-            # Get the actual optimizer to avoid this
             if hasattr(opt, "_optimizer"):
                 opt._optimizer.step()
                 opt._optimizer.zero_grad()
@@ -259,30 +330,34 @@ class TRMModule(LightningModule):
                 opt.step()
                 opt.zero_grad()
 
-        avg_loss = total_loss / max(1, n_active_steps)
+        # Log metrics
+        if accumulated_metrics.get("count", 0) > 0:
+            count = accumulated_metrics["count"]
+            self.log("train/loss", total_loss / max(1, n_active_steps), prog_bar=True, on_step=True)
+            self.log("train/accuracy", accumulated_metrics.get("accuracy", 0) / count, on_step=True)
+            self.log(
+                "train/exact_accuracy",
+                accumulated_metrics.get("exact_accuracy", 0) / count,
+                prog_bar=True,
+                on_step=True,
+            )
+            self.log(
+                "train/q_halt_accuracy",
+                accumulated_metrics.get("q_halt_accuracy", 0) / count,
+                on_step=True,
+            )
+            self.log(
+                "train/steps",
+                accumulated_metrics.get("steps", 0) / count,
+                prog_bar=True,
+                on_step=True,
+            )
+            self.log("train/lm_loss", accumulated_metrics.get("lm_loss", 0) / count, on_step=True)
+            self.log(
+                "train/q_halt_loss", accumulated_metrics.get("q_halt_loss", 0) / count, on_step=True
+            )
 
-        self.log(
-            "train/loss",
-            avg_loss,
-            prog_bar=True,
-            on_step=True,
-            on_epoch=False,
-            sync_dist=True,
-            rank_zero_only=True,
-            logger=True,
-        )
-        self.log(
-            "train/avg_steps",
-            self.carry.steps.float().mean(),
-            prog_bar=True,
-            on_step=True,
-            on_epoch=False,
-            sync_dist=True,
-            rank_zero_only=True,
-            logger=True,
-        )
-
-        return torch.tensor(avg_loss)
+        return torch.tensor(total_loss / max(1, n_active_steps))
 
     def forward(
         self, carry: TRMCarry, batch: Dict[str, torch.Tensor]
@@ -405,111 +480,72 @@ class TRMModule(LightningModule):
         return new_carry, outputs
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """
-        Validation step following reference approach.
-        Since we need complete solutions for validation, we run up to halt_max_steps
-        iterations, similar to how the model would process multiple batches during training.
-        """
+        """Simplified validation using loss head."""
 
-        x_input = batch["input"]
-        y_true = batch["output"]
-        batch_size, height, width = x_input.shape
+        batch_size = batch["input"].shape[0]
 
         with torch.no_grad():
-            # Create fresh carry for validation (don't use self.carry from training)
+            # Create fresh carry for validation
             carry = self.initial_carry(batch)
 
-            # Run up to halt_max_steps (N_supervision) iterations
-            # This simulates what would happen across multiple training batches
-            final_logits = None
-            steps_taken = []
+            # Accumulate metrics across all supervision steps
+            accumulated_metrics = {}
+            total_loss = 0.0
+            n_steps = 0
 
-            for step in range(self.hparams.N_supervision):
-                # Forward pass (single iteration)
-                carry, outputs = self.forward(carry, batch)
+            # Run up to N_supervision iterations
+            for _ in range(self.hparams.N_supervision):
+                # Forward with loss computation
+                carry, loss, metrics, all_halted = self.compute_loss_and_metrics(carry, batch)
 
-                # Keep track of latest predictions
-                final_logits = outputs["logits"]
+                # Accumulate metrics
+                for k, v in metrics.items():
+                    accumulated_metrics[k] = accumulated_metrics.get(k, 0) + v.item()
 
-                # Track when each sequence halts
-                if step == 0:
-                    steps_taken = torch.ones_like(carry.steps)
-                else:
-                    # Only update steps for sequences that haven't halted yet
-                    steps_taken = torch.where(carry.halted, steps_taken, carry.steps)
+                total_loss += loss.item()
+                n_steps += 1
 
-                # If all sequences have halted, we can stop early
-                if carry.halted.all():
+                if all_halted:
                     break
 
-            # Compute metrics using final predictions
-            y_pred = final_logits.view(batch_size, height, width, self.hparams.num_colors)
-
-            # Loss
-            loss = F.cross_entropy(
-                y_pred.flatten(start_dim=0, end_dim=2),  # [B*H*W, num_colors]
-                y_true.flatten(),  # [B*H*W]
-                ignore_index=PAD_VALUE,
-            )
-
-            # Accuracy metrics
-            pred_classes = y_pred.argmax(dim=-1)
-            mask = (y_true != PAD_VALUE).float()
-            correct = (pred_classes == y_true).float()
-
-            # Per-element accuracy
-            accuracy = (correct * mask).sum() / mask.sum() if mask.sum() > 0 else correct.mean()
-
-            # Exact accuracy (entire grid correct)
-            pred_flat = pred_classes.view(batch_size, -1)
-            true_flat = y_true.view(batch_size, -1)
-            mask_flat = mask.view(batch_size, -1)
-
-            # Check if all non-masked elements are correct for each sample
-            exact_correct = ((pred_flat == true_flat) | (mask_flat == 0)).all(dim=1)
-            exact_accuracy = exact_correct.float().mean()
+            # Compute averages
+            count = accumulated_metrics.get("count", batch_size)
+            if count > 0:
+                avg_metrics = {
+                    "val/loss": total_loss / (n_steps * batch_size),
+                    "val/accuracy": accumulated_metrics.get("accuracy", 0) / count,
+                    "val/exact_accuracy": accumulated_metrics.get("exact_accuracy", 0) / count,
+                    "val/q_halt_accuracy": accumulated_metrics.get("q_halt_accuracy", 0) / count,
+                    "val/steps": accumulated_metrics.get("steps", 0) / count,
+                    "val/lm_loss": accumulated_metrics.get("lm_loss", 0) / count,
+                    "val/q_halt_loss": accumulated_metrics.get("q_halt_loss", 0) / count,
+                }
+            else:
+                avg_metrics = {
+                    f"val/{k}": 0.0
+                    for k in [
+                        "loss",
+                        "accuracy",
+                        "exact_accuracy",
+                        "q_halt_accuracy",
+                        "steps",
+                        "lm_loss",
+                        "q_halt_loss",
+                    ]
+                }
 
             # Log metrics
-            self.log(
-                "val/loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
-            )
-            self.log(
-                "val/accuracy",
-                accuracy,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,
-            )
-            self.log(
-                "val/exact_accuracy",
-                exact_accuracy,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,
-            )
-            self.log(
-                "val/avg_steps",
-                steps_taken.float().mean(),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-            )
+            for name, value in avg_metrics.items():
+                self.log(
+                    name,
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=(name in ["val/loss", "val/exact_accuracy"]),
+                    sync_dist=True,
+                )
 
-            # Optional: Log which tasks were solved correctly
-            if exact_correct.any() and batch_idx % 100 == 0:
-                batch_ids = batch.get("task_ids", torch.arange(batch_size))
-                correct_indices = torch.nonzero(exact_correct).squeeze(-1)
-                for idx in correct_indices[:5]:  # Log first 5 correct solutions
-                    log.info(f"Task {batch_ids[idx]} solved correctly in {steps_taken[idx]} steps")
-
-        return {
-            "loss": loss,
-            "accuracy": accuracy,
-            "exact_accuracy": exact_accuracy,
-            "avg_steps": steps_taken.float().mean(),
-        }
+            return avg_metrics
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Test step - same as validation."""
@@ -557,35 +593,15 @@ class TRMModule(LightningModule):
                 )
             optimizers.append(main_opt)
 
-        # Sparse embedding optimizer - use buffers() like reference
-        # if hasattr(self, 'puzzle_emb') and self.puzzle_emb is not None:
-        #     sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
-        #         self.puzzle_emb.buffers(),  # Use .buffers() method like reference
-        #         lr=embedding_lr,
-        #         weight_decay=self.hparams.weight_decay,
-        #         world_size=1  # or get from trainer if distributed
-        #     )
-        #     optimizers.append(sparse_opt)
-
-        # Debug: Let's see what buffers() actually returns
+        # Force sparse embedding to be leaf tensors
         if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
-            print("Debugging puzzle_emb buffers:")
             buffer_list = list(self.puzzle_emb.buffers())
-            print(f"  Number of buffers: {len(buffer_list)}")
             for i, buf in enumerate(buffer_list):
-                print(
-                    f"  Buffer {i}: shape={buf.shape}, dtype={buf.dtype}, requires_grad={buf.requires_grad}, is_leaf={buf.is_leaf}"
-                )
                 if buf.requires_grad and not buf.is_leaf:
                     # This is local_weights - recreate as leaf
                     buffer_list[i] = buf.detach().requires_grad_(True)
-                    print(
-                        f"  Fixed Buffer {i}: shape={buf.shape}, dtype={buf.dtype}, requires_grad={buf.requires_grad}, is_leaf={buf.is_leaf}"
-                    )
 
-            # Try to match what the optimizer expects
-            # The optimizer's step() method expects exactly 3 items
-            # Let's ensure we're passing them in the right format
+            # Add sparse embedding optimizer
             sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
                 buffer_list,  # This should be a list of 3 tensors
                 lr=embedding_lr,

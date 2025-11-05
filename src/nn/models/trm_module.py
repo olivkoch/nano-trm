@@ -3,13 +3,19 @@ HRM PyTorch Lightning Module - Following Figure 2 pseudocode exactly
 """
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from adam_atan2 import AdamATan2
+
+try:
+    from adam_atan2 import AdamATan2
+except ImportError:
+    print("Failed to import adam2")
+
 from lightning import LightningModule
 
 from src.nn.modules.hybrid_vision_embeddings import HybridDINOEmbedding
@@ -18,9 +24,8 @@ from src.nn.modules.sparse_embeddings import (
     CastedSparseEmbeddingSignSGD_Distributed,
 )
 from src.nn.modules.trm_block import TransformerBlock
-from src.nn.modules.utils import trunc_normal_init
+from src.nn.modules.utils import stablemax_cross_entropy, trunc_normal_init
 from src.nn.utils import RankedLogger
-from src.nn.utils.constants import PAD_VALUE
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -56,9 +61,11 @@ class TRMModule(LightningModule):
         weight_decay: float = 0.01,
         warmup_steps: int = 2000,
         max_steps: int = 100000,
-        use_dino_embeddings: bool = True,
+        halt_exploration_prob: float = 0.1,
+        use_dino_embeddings: bool = False,
         num_puzzles: int = 0,  # Should be set from datamodule
         batch_size: int = 0,  # Should be set from datamodule
+        pad_value: int = -1,  # Should be set from datamodule
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
         output_dir: str = None,
@@ -76,7 +83,7 @@ class TRMModule(LightningModule):
             )
         else:
             self.input_embedding = nn.Embedding(
-                num_colors + 1, hidden_size, padding_idx=PAD_VALUE
+                num_colors + 1, hidden_size, padding_idx=self.hparams.pad_value
             )  # 0 (padding) + 10 colors
 
         # TODO: replace with RoPE or Casted Embeddings
@@ -98,12 +105,18 @@ class TRMModule(LightningModule):
         # Only learn a halting probability through a Binary-Cross-Entropy loss of having
         # reached the correct solution
         self.Q_head = nn.Linear(hidden_size, 1)  # Q_head returns 1 value: q[0]
-
+        with torch.no_grad():
+            self.Q_head.weight.zero_()
+            if self.Q_head.bias is not None:
+                self.Q_head.bias.fill_(-5.0)  # Strong negative bias
+                
         # State for carry (persisted across training steps)
         self.carry = None
 
         self.register_buffer("z_H_init", trunc_normal_init((hidden_size,), std=0.02))
         self.register_buffer("z_L_init", trunc_normal_init((hidden_size,), std=0.02))
+
+        self.last_step_time = None
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -141,10 +154,10 @@ class TRMModule(LightningModule):
 
         current_data = {}
         for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                current_data[k] = torch.empty_like(v)
-            else:
-                current_data[k] = v
+            # if isinstance(v, torch.Tensor):
+            current_data[k] = torch.empty_like(v)
+            # else:
+            #     current_data[k] = v
 
         return TRMCarry(
             z_H=z_H_init.expand(batch_size, total_seq_len, -1).clone(),
@@ -198,7 +211,7 @@ class TRMModule(LightningModule):
 
         with torch.no_grad():
             # Compute masks and correctness
-            mask = y_true_flat != PAD_VALUE
+            mask = y_true_flat != self.hparams.pad_value
             loss_counts = mask.sum(-1)
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
 
@@ -222,20 +235,17 @@ class TRMModule(LightningModule):
             }
 
         # Compute losses - IMPORTANT: These are per-sequence losses that will be summed
-        lm_loss_per_token = F.cross_entropy(
-            outputs["logits"].view(-1, self.hparams.num_colors),
-            y_true_flat.view(-1),
-            ignore_index=PAD_VALUE,
-            reduction="none",
-        ).view(batch_size, -1)
+        lm_loss_per_token = stablemax_cross_entropy(
+            outputs["logits"], y_true_flat, ignore_index=self.hparams.pad_value, valid_mask=mask
+        )
 
         # Normalize by number of valid tokens per sequence, then sum
-        lm_loss = (lm_loss_per_token / loss_divisor).sum(-1).mean()  # Changed: mean instead of sum
+        lm_loss = (lm_loss_per_token / loss_divisor).sum()
 
         q_halt_loss = F.binary_cross_entropy_with_logits(
             outputs["q_halt_logits"].squeeze(),
             seq_is_correct.float(),
-            reduction="mean",  # Changed: mean instead of sum
+            reduction="sum",
         )
 
         metrics.update(
@@ -254,6 +264,17 @@ class TRMModule(LightningModule):
         Training step that implements supervision through multiple forward passes.
         Each sequence can run up to N_supervision (halt_max_steps) times.
         """
+        # Time since last step
+        if self.last_step_time is not None:
+            gap = time.time() - self.last_step_time
+            if gap > 0.05:  # Log large gaps
+                log.info(f"Gap between steps: {gap:.3f}s")
+
+        t_start = time.time()
+        
+        batch_size = batch["input"].shape[0]
+
+        # log.info(f"Batch data samples: input: {batch['input'][:25]} \n output: {batch['output'][:25]} \n puzzle_identifiers: {batch['puzzle_identifiers'][:25]}")
 
         # Handle case when not attached to trainer (for testing)
         try:
@@ -270,56 +291,40 @@ class TRMModule(LightningModule):
         if self.carry is None:
             self.carry = self.initial_carry(batch)
 
-        # Accumulate metrics
-        accumulated_metrics = {}
-        total_loss = 0.0
-        n_active_steps = 0
+        # Forward with loss computation
+        t0_loss = time.time()
+        self.carry, loss, metrics, all_halted = self.compute_loss_and_metrics(self.carry, batch)
+        t1_loss = time.time()
+        # log.info(f"Forward pass time: {t1_loss - t0_loss:.4f}s")
 
-        # Run supervision steps
-        for _ in range(self.hparams.N_supervision):
-            # Forward with loss computation
-            self.carry, loss, metrics, all_halted = self.compute_loss_and_metrics(self.carry, batch)
+        # log.info(f"training_step: loss={loss.item():.4f}, all_halted={all_halted}")
 
-            # Only backprop for non-halted sequences
-            active_mask = ~self.carry.halted
-            if active_mask.any():
-                masked_loss = loss * active_mask.float().sum() / batch["input"].shape[0]
-                masked_loss.backward()
-                total_loss += masked_loss.item()
-                n_active_steps += 1
-
-                # Accumulate metrics
-                for k, v in metrics.items():
-                    accumulated_metrics[k] = accumulated_metrics.get(k, 0) + v.item()
-
-            if all_halted:
-                break
+        scaled_loss = loss / batch_size
+        scaled_loss.backward()
 
         # Clip gradients for all parameters (both dense and sparse)
-        if n_active_steps > 0:  # Only if we actually computed gradients
-            # Get all parameters with gradients
-            params_with_grad = []
+        params_with_grad = []
 
-            # Add regular parameters
-            for param in self.parameters():
-                if param.grad is not None:
-                    params_with_grad.append(param)
+        # Add regular parameters
+        for param in self.parameters():
+            if param.grad is not None:
+                params_with_grad.append(param)
 
-            # Add sparse embedding buffers if they have gradients
-            if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
-                for buf in self.puzzle_emb.buffers():
-                    if hasattr(buf, "grad") and buf.grad is not None:
-                        # For sparse gradients, we need to handle them differently
-                        if buf.grad.is_sparse:
-                            # Clip sparse gradients by value
-                            buf.grad = buf.grad.coalesce()
-                            buf.grad._values().clamp_(-1.0, 1.0)
-                        else:
-                            params_with_grad.append(buf)
+        # Add sparse embedding buffers if they have gradients
+        if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
+            for buf in self.puzzle_emb.buffers():
+                if hasattr(buf, "grad") and buf.grad is not None:
+                    # For sparse gradients, we need to handle them differently
+                    if buf.grad.is_sparse:
+                        # Clip sparse gradients by value
+                        buf.grad = buf.grad.coalesce()
+                        buf.grad._values().clamp_(-1.0, 1.0)
+                    else:
+                        params_with_grad.append(buf)
 
-            # Clip dense gradients by norm
-            if params_with_grad:
-                torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=1.0)
+        # Clip dense gradients by norm
+        if params_with_grad:
+            torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=1.0)
 
         # Optimizer step
         for opt in opts:
@@ -331,33 +336,41 @@ class TRMModule(LightningModule):
                 opt.zero_grad()
 
         # Log metrics
-        if accumulated_metrics.get("count", 0) > 0:
-            count = accumulated_metrics["count"]
-            self.log("train/loss", total_loss / max(1, n_active_steps), prog_bar=True, on_step=True)
-            self.log("train/accuracy", accumulated_metrics.get("accuracy", 0) / count, on_step=True)
-            self.log(
-                "train/exact_accuracy",
-                accumulated_metrics.get("exact_accuracy", 0) / count,
-                prog_bar=True,
-                on_step=True,
-            )
-            self.log(
-                "train/q_halt_accuracy",
-                accumulated_metrics.get("q_halt_accuracy", 0) / count,
-                on_step=True,
-            )
-            self.log(
-                "train/steps",
-                accumulated_metrics.get("steps", 0) / count,
-                prog_bar=True,
-                on_step=True,
-            )
-            self.log("train/lm_loss", accumulated_metrics.get("lm_loss", 0) / count, on_step=True)
-            self.log(
-                "train/q_halt_loss", accumulated_metrics.get("q_halt_loss", 0) / count, on_step=True
-            )
+        if metrics.get("count", 0) > 0:
+            with torch.no_grad():
+                count = metrics["count"]
+                self.log("train/accuracy", metrics.get("accuracy", 0) / count, on_step=True)
+                self.log(
+                    "train/exact_accuracy",
+                    metrics.get("exact_accuracy", 0) / count,
+                    prog_bar=True,
+                    on_step=True,
+                )
+                self.log(
+                    "train/q_halt_accuracy",
+                    metrics.get("q_halt_accuracy", 0) / count,
+                    on_step=True,
+                )
+                self.log(
+                    "train/steps",
+                    metrics.get("steps", 0) / count,
+                    prog_bar=True,
+                    on_step=True,
+                )
 
-        return torch.tensor(total_loss / max(1, n_active_steps))
+                log.info(f"Logging lm_loss {metrics.get('lm_loss', 0) / count} \t count = {count.item()}")
+
+                self.log("train/lm_loss", metrics.get("lm_loss", 0) / count, on_step=True)
+                self.log("train/q_halt_loss", metrics.get("q_halt_loss", 0) / count, on_step=True)
+
+                avg_halt_steps = metrics.get("steps", 0) / metrics["count"]
+                early_halt_rate = avg_halt_steps < self.hparams.N_supervision
+                self.log("train/early_halt_rate", early_halt_rate, on_step=True)
+
+        t_end = time.time()
+        # log.info(f"Total training_step time: {t_end - t_start:.4f}s")
+        self.last_step_time = time.time()
+        return loss
 
     def forward(
         self, carry: TRMCarry, batch: Dict[str, torch.Tensor]
@@ -366,6 +379,8 @@ class TRMModule(LightningModule):
         batch_size = batch["input"].shape[0]
         height, width = batch["input"].shape[1], batch["input"].shape[2]
         seq_len = height * width
+        
+        assert batch_size == self.hparams.batch_size
 
         # Reset states for halted sequences
         reset_mask = carry.halted.view(-1, 1, 1)
@@ -386,11 +401,8 @@ class TRMModule(LightningModule):
         # Update current_data for halted sequences
         new_current_data = {}
         for k in batch.keys():
-            if isinstance(batch[k], torch.Tensor):
-                mask = carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1))
-                new_current_data[k] = torch.where(mask, batch[k], carry.current_data[k])
-            else:
-                new_current_data[k] = batch[k]
+            mask = carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1))
+            new_current_data[k] = torch.where(mask, batch[k], carry.current_data[k])
 
         # Get token embeddings from current data
         x_input = new_current_data["input"]
@@ -413,6 +425,8 @@ class TRMModule(LightningModule):
                 batch_size, self.puzzle_emb_len, self.hparams.hidden_size
             )
 
+            puzzle_embedding = self.embed_scale * puzzle_embedding
+
             # Concatenate puzzle embeddings with token embeddings
             x_emb = torch.cat([puzzle_embedding, token_emb], dim=1)  # [B, puzzle_len + seq_len, D]
         else:
@@ -425,7 +439,7 @@ class TRMModule(LightningModule):
             positions = torch.arange(total_seq_len, device=x_emb.device)
             positions = positions.unsqueeze(0).expand(batch_size, -1)
             pos_emb = self.pos_embedding(positions)
-            x_emb = x_emb + pos_emb
+            x_emb = 0.7071067812 * (x_emb + pos_emb)
 
         # Deep recursion with updated states
         z_H, z_L = new_z_H, new_z_L
@@ -458,15 +472,38 @@ class TRMModule(LightningModule):
             "q_halt_logits": q_halt_logits,  # [B, 1]
         }
 
-        # Update carry for next iteration
+        # Update carry for next iteration with exploration
         with torch.no_grad():
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.hparams.N_supervision
 
-            # Halting logic
+            # Base halting decision
+            halted = is_last_step
+
             if self.training:
                 halted = is_last_step | (q_halt_logits.squeeze() > 0)
+
+            # # Halting logic with exploration (only during training)
+            # if self.training and self.hparams.N_supervision > 1:
+            #     # Halt signal based on Q-value
+            #     halted = halted | (q_halt_logits.squeeze() > 0)
+
+            #     # Exploration: randomly force minimum steps before allowing halt
+            #     if self.hparams.halt_exploration_prob > 0:
+            #         # Sample whether to explore for each sequence
+            #         explore_mask = torch.rand_like(q_halt_logits.squeeze()) < self.hparams.halt_exploration_prob
+
+            #         # If exploring, sample a minimum number of steps (2 to N_supervision)
+            #         min_halt_steps = torch.where(
+            #             explore_mask,
+            #             torch.randint_like(new_steps, low=2, high=self.hparams.N_supervision + 1),
+            #             torch.ones_like(new_steps)  # No minimum if not exploring
+            #         )
+
+            #         # Only allow halting after minimum steps
+            #         halted = halted & (new_steps >= min_halt_steps)
             else:
+                # During validation/testing, always run max steps
                 halted = is_last_step
 
         new_carry = TRMCarry(
@@ -482,6 +519,8 @@ class TRMModule(LightningModule):
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Simplified validation using loss head."""
 
+        # log.info(f"*" * 50)
+        # log.info("Calling validation!")
         batch_size = batch["input"].shape[0]
 
         with torch.no_grad():
@@ -544,7 +583,7 @@ class TRMModule(LightningModule):
                     prog_bar=(name in ["val/loss", "val/exact_accuracy"]),
                     sync_dist=True,
                 )
-
+            log.info(f"\t [val] Logging accuracy = {avg_metrics['val/accuracy']} and exact accuracy {avg_metrics['val/exact_accuracy']}")
             return avg_metrics
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
@@ -563,8 +602,8 @@ class TRMModule(LightningModule):
     def configure_optimizers(self):
         """Configure optimizer with different learning rates for different parameter groups."""
 
-        base_lr = self.hparams.learning_rate / self.hparams.N_supervision
-        embedding_lr = self.hparams.learning_rate_emb / self.hparams.N_supervision
+        base_lr = self.hparams.learning_rate  # / self.hparams.N_supervision
+        embedding_lr = self.hparams.learning_rate_emb  # / self.hparams.N_supervision
 
         # Collect parameters for main optimizer
         main_params = []
@@ -584,7 +623,7 @@ class TRMModule(LightningModule):
                     weight_decay=self.hparams.weight_decay,
                     betas=(0.9, 0.95),
                 )
-            except ImportError:
+            except NameError:
                 main_opt = torch.optim.AdamW(
                     main_params,
                     lr=base_lr,

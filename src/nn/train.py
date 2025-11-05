@@ -68,6 +68,9 @@ def train(cfg: DictConfig) -> Optional[float]:
     if hasattr(datamodule, "num_puzzles"):
         cfg.model.num_puzzles = datamodule.num_puzzles
         cfg.model.batch_size = datamodule.batch_size
+        cfg.model.pad_value = datamodule.pad_value
+        cfg.model.max_grid_size = datamodule.max_grid_size
+        cfg.model.num_colors = datamodule.num_colors
         log.info(
             f"Setting model num_puzzles to {datamodule.num_puzzles} and batch_size to {datamodule.batch_size}"
         )

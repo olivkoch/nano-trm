@@ -9,8 +9,6 @@ import torch
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader, Dataset
 
-from src.nn.utils.constants import PAD_VALUE
-
 
 class TRMTransform:
     """Transform class for preprocessing ARC tasks with puzzle ID support."""
@@ -19,7 +17,7 @@ class TRMTransform:
         self,
         max_grid_size: int = 30,
         num_colors: int = 10,
-        pad_value: int = PAD_VALUE,
+        pad_value: int = 10,
         augment: bool = False,
         puzzle_id_map: Optional[Dict[str, int]] = None,
     ):
@@ -220,6 +218,7 @@ class ARCDataModuleWithPuzzles(LightningDataModule):
         augment_train: bool = True,
         samples_per_task: int = 100,
         use_concept_data: bool = False,
+        pad_value: int = 10,
         concept_data_dir: str = "data/concept",
     ):
         """
@@ -248,6 +247,7 @@ class ARCDataModuleWithPuzzles(LightningDataModule):
         # Will be populated in setup()
         self.puzzle_id_map = {}
         self.num_puzzles = 0
+        self.pad_value = pad_value
 
     def setup(self, stage: Optional[str] = None):
         """Load and setup datasets."""
@@ -343,10 +343,14 @@ class ARCDataModuleWithPuzzles(LightningDataModule):
             max_grid_size=self.max_grid_size,
             augment=self.augment_train,
             puzzle_id_map=self.puzzle_id_map,
+            pad_value=self.pad_value,
         )
 
         self.val_transform = TRMTransform(
-            max_grid_size=self.max_grid_size, augment=False, puzzle_id_map=self.puzzle_id_map
+            max_grid_size=self.max_grid_size,
+            augment=False,
+            puzzle_id_map=self.puzzle_id_map,
+            pad_value=self.pad_value,
         )
 
         # Create datasets
@@ -378,7 +382,7 @@ class ARCDataModuleWithPuzzles(LightningDataModule):
             pin_memory=True,
             collate_fn=collate_fn_with_puzzles,
             persistent_workers=True if self.num_workers > 0 else False,
-            drop_last=True  # Add this to ensure constant batch size
+            drop_last=True,  # Add this to ensure constant batch size
         )
 
     def val_dataloader(self):
@@ -390,7 +394,7 @@ class ARCDataModuleWithPuzzles(LightningDataModule):
             pin_memory=True,
             collate_fn=collate_fn_with_puzzles,
             persistent_workers=True if self.num_workers > 0 else False,
-            drop_last=True  # Add this to ensure constant batch size
+            drop_last=True,  # Add this to ensure constant batch size
         )
 
     def test_dataloader(self):

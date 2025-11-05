@@ -1,22 +1,27 @@
 _target_: src.nn.models.trm_module.TRMModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
 
-hidden_size: 512
-num_layers: 2
-# max_grid_size: 30
-num_colors: 10
-n_latent_recursions: 1  # n in paper
-T_deep_recursions: 1    # T in paper
-N_supervision: 8
-ffn_expansion: 2 # swiglu expansion factor
-learning_rate: 1e-4
-learning_rate_emb: 1e-3
-weight_decay: 0.01
-warmup_steps: 2000
-max_steps: 100000
-use_dino_embeddings: false
-num_puzzles: 1000  # Should be set from datamodule
-puzzle_emb_dim: 512  # Puzzle embedding dimension
-puzzle_emb_len: 16   # How many tokens for puzzle embedding
+ffn_expansion: ${model_tuning.ffn_expansion}
+hidden_size: ${model_tuning.hidden_size}
+num_layers: ${model_tuning.num_layers}
+n_latent_recursions: ${model_tuning.n_latent_recursions}  # n in paper
+T_deep_recursions: ${model_tuning.T_deep_recursions}    # T in paper
+N_supervision: ${model_tuning.N_supervision}
+learning_rate: ${model_tuning.learning_rate}
+learning_rate_emb: ${model_tuning.learning_rate_emb}
+weight_decay: ${model_tuning.weight_decay}
+halt_exploration_prob: ${model_tuning.halt_exploration_prob}
+warmup_steps: ${model_tuning.warmup_steps}
+max_steps: ${model_tuning.max_steps}
+use_dino_embeddings: ${model_tuning.use_dino_embeddings}
+puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
+puzzle_emb_len: ${model_tuning.puzzle_emb_len}
 output_dir: None
+
+# Should be set from datamodule
+num_puzzles: 0  
+batch_size: 0
+pad_value: 0
+max_grid_size: 0 
+num_colors: 0
 

@@ -3,21 +3,29 @@ HRM PyTorch Lightning Module - Following Figure 2 pseudocode exactly
 """
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from adam_atan2 import AdamATan2
+except ImportError:
+    print("Failed to import adam2")
+
 from lightning import LightningModule
-from torch.optim import AdamW
 
 from src.nn.modules.hybrid_vision_embeddings import HybridDINOEmbedding
-from src.nn.modules.sparse_embeddings import CastedSparseEmbedding
+from src.nn.modules.sparse_embeddings import (
+    CastedSparseEmbedding,
+    CastedSparseEmbeddingSignSGD_Distributed,
+)
 from src.nn.modules.trm_block import TransformerBlock
-from src.nn.modules.utils import trunc_normal_init
+from src.nn.modules.utils import stablemax_cross_entropy, trunc_normal_init
 from src.nn.utils import RankedLogger
-from src.nn.utils.constants import PAD_VALUE
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -53,8 +61,11 @@ class TRMModule(LightningModule):
         weight_decay: float = 0.01,
         warmup_steps: int = 2000,
         max_steps: int = 100000,
-        use_dino_embeddings: bool = True,
-        num_puzzles: int = 1000,  # Should be set from datamodule
+        halt_exploration_prob: float = 0.1,
+        use_dino_embeddings: bool = False,
+        num_puzzles: int = 0,  # Should be set from datamodule
+        batch_size: int = 0,  # Should be set from datamodule
+        pad_value: int = -1,  # Should be set from datamodule
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
         output_dir: str = None,
@@ -72,15 +83,14 @@ class TRMModule(LightningModule):
             )
         else:
             self.input_embedding = nn.Embedding(
-                num_colors + 1, hidden_size, padding_idx=PAD_VALUE
+                num_colors + 1, hidden_size, padding_idx=self.hparams.pad_value
             )  # 0 (padding) + 10 colors
 
         # TODO: replace with RoPE or Casted Embeddings
         self.pos_embedding = nn.Embedding(
-            max_grid_size * max_grid_size + puzzle_emb_len, 
-            hidden_size
+            max_grid_size * max_grid_size + puzzle_emb_len, hidden_size
         )
-                
+
         # a single network (not two separate networks)
         self.lenet = self._build_transformer(
             hidden_size, num_layers, num_heads=8, ffn_expansion=ffn_expansion, dropout=0.1
@@ -95,12 +105,18 @@ class TRMModule(LightningModule):
         # Only learn a halting probability through a Binary-Cross-Entropy loss of having
         # reached the correct solution
         self.Q_head = nn.Linear(hidden_size, 1)  # Q_head returns 1 value: q[0]
-
+        with torch.no_grad():
+            self.Q_head.weight.zero_()
+            if self.Q_head.bias is not None:
+                self.Q_head.bias.fill_(-5.0)  # Strong negative bias
+                
         # State for carry (persisted across training steps)
         self.carry = None
 
         self.register_buffer("z_H_init", trunc_normal_init((hidden_size,), std=0.02))
         self.register_buffer("z_L_init", trunc_normal_init((hidden_size,), std=0.02))
+
+        self.last_step_time = None
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -108,13 +124,18 @@ class TRMModule(LightningModule):
         # Add puzzle embeddings
         if puzzle_emb_dim > 0:
             self.puzzle_emb = CastedSparseEmbedding(
-                num_puzzles, 
-                puzzle_emb_dim,
+                num_embeddings=num_puzzles,
+                embedding_dim=puzzle_emb_dim,
+                batch_size=batch_size,
                 init_std=0.0,  # Reference uses 0 init
-                cast_to=torch.bfloat16
+                cast_to=torch.bfloat16,
             )
             self.puzzle_emb_len = puzzle_emb_len
+            log.info(f"Created puzzle_emb with batch_size={batch_size}")
+            log.info(f"puzzle_emb.local_weights.shape: {self.puzzle_emb.local_weights.shape}")
+            log.info(f"puzzle_emb.weights.shape: {self.puzzle_emb.weights.shape}")
         else:
+            log.info("puzzle_emb_dim <= 0, not creating puzzle embeddings")
             self.puzzle_emb = None
             self.puzzle_emb_len = 0
 
@@ -133,10 +154,10 @@ class TRMModule(LightningModule):
 
         current_data = {}
         for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                current_data[k] = torch.empty_like(v)
-            else:
-                current_data[k] = v
+            # if isinstance(v, torch.Tensor):
+            current_data[k] = torch.empty_like(v)
+            # else:
+            #     current_data[k] = v
 
         return TRMCarry(
             z_H=z_H_init.expand(batch_size, total_seq_len, -1).clone(),
@@ -178,305 +199,392 @@ class TRMModule(LightningModule):
             ]
         )
 
+    def compute_loss_and_metrics(self, carry, batch):
+        """Compute loss and metrics without circular reference."""
+        # Get model outputs
+        new_carry, outputs = self.forward(carry, batch)
+
+        # Extract labels
+        y_true = batch["output"]
+        batch_size = y_true.shape[0]
+        y_true_flat = y_true.flatten(start_dim=1)
+
+        with torch.no_grad():
+            # Compute masks and correctness
+            mask = y_true_flat != self.hparams.pad_value
+            loss_counts = mask.sum(-1)
+            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
+
+            # Predictions and correctness
+            preds = torch.argmax(outputs["logits"], dim=-1)
+            is_correct = mask & (preds == y_true_flat)
+            seq_is_correct = is_correct.sum(-1) == loss_counts
+
+            # Metrics (only for halted sequences)
+            valid_metrics = new_carry.halted & (loss_counts > 0)
+            metrics = {
+                "count": valid_metrics.sum(),
+                "accuracy": torch.where(
+                    valid_metrics, (is_correct.float() / loss_divisor).sum(-1), 0
+                ).sum(),
+                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+                "q_halt_accuracy": (
+                    valid_metrics & ((outputs["q_halt_logits"].squeeze() >= 0) == seq_is_correct)
+                ).sum(),
+                "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
+            }
+
+        # Compute losses - IMPORTANT: These are per-sequence losses that will be summed
+        lm_loss_per_token = stablemax_cross_entropy(
+            outputs["logits"], y_true_flat, ignore_index=self.hparams.pad_value, valid_mask=mask
+        )
+
+        # Normalize by number of valid tokens per sequence, then sum
+        lm_loss = (lm_loss_per_token / loss_divisor).sum()
+
+        q_halt_loss = F.binary_cross_entropy_with_logits(
+            outputs["q_halt_logits"].squeeze(),
+            seq_is_correct.float(),
+            reduction="sum",
+        )
+
+        metrics.update(
+            {
+                "lm_loss": lm_loss.detach(),
+                "q_halt_loss": q_halt_loss.detach(),
+            }
+        )
+
+        total_loss = lm_loss + 0.5 * q_halt_loss
+
+        return new_carry, total_loss, metrics, new_carry.halted.all()
+
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """
         Training step that implements supervision through multiple forward passes.
         Each sequence can run up to N_supervision (halt_max_steps) times.
         """
+        # Time since last step
+        if self.last_step_time is not None:
+            gap = time.time() - self.last_step_time
+            if gap > 0.05:  # Log large gaps
+                log.info(f"Gap between steps: {gap:.3f}s")
+
+        t_start = time.time()
+        
+        batch_size = batch["input"].shape[0]
+
+        # log.info(f"Batch data samples: input: {batch['input'][:25]} \n output: {batch['output'][:25]} \n puzzle_identifiers: {batch['puzzle_identifiers'][:25]}")
 
         # Handle case when not attached to trainer (for testing)
         try:
-            opt = self.optimizers()
+            opts = self.optimizers()
+            if not isinstance(opts, list):
+                opts = [opts]
         except RuntimeError:
             # For testing without trainer
-            if not hasattr(self, "_optimizer"):
-                raise RuntimeError("No optimizer available. Set model._optimizer for testing.")
-            opt = self._optimizer
+            if not hasattr(self, "_optimizers"):
+                raise RuntimeError("No optimizer available. Set model._optimizers for testing.")
+            opts = self._optimizers
 
         # Initialize carry if first batch
         if self.carry is None:
             self.carry = self.initial_carry(batch)
 
-        total_loss = 0.0
-        n_active_steps = 0
+        # Forward with loss computation
+        t0_loss = time.time()
+        self.carry, loss, metrics, all_halted = self.compute_loss_and_metrics(self.carry, batch)
+        t1_loss = time.time()
+        # log.info(f"Forward pass time: {t1_loss - t0_loss:.4f}s")
 
-        # Run up to N_supervision steps for each sequence
-        for _ in range(self.hparams.N_supervision):
-            # Forward pass
-            self.carry, outputs = self.forward(self.carry, batch)
+        # log.info(f"training_step: loss={loss.item():.4f}, all_halted={all_halted}")
 
-            # Compute loss only for non-halted sequences
-            active_mask = ~self.carry.halted
-            if active_mask.any():
-                y_true = batch["output"].flatten(start_dim=1)
-                logits = outputs["logits"]
+        scaled_loss = loss / batch_size
+        scaled_loss.backward()
 
-                # Compute loss
-                loss = (
-                    F.cross_entropy(
-                        logits.view(-1, self.hparams.num_colors),
-                        y_true.view(-1),
-                        ignore_index=PAD_VALUE,
-                        reduction="none",
-                    )
-                    .view(logits.shape[0], -1)
-                    .mean(dim=1)
-                )  # Per-sequence loss
+        # Clip gradients for all parameters (both dense and sparse)
+        params_with_grad = []
 
-                # Only backprop for active sequences
-                masked_loss = (loss * active_mask.float()).sum() / active_mask.float().sum()
-                masked_loss.backward()
+        # Add regular parameters
+        for param in self.parameters():
+            if param.grad is not None:
+                params_with_grad.append(param)
 
-                total_loss += masked_loss.item()
-                n_active_steps += 1
+        # Add sparse embedding buffers if they have gradients
+        if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
+            for buf in self.puzzle_emb.buffers():
+                if hasattr(buf, "grad") and buf.grad is not None:
+                    # For sparse gradients, we need to handle them differently
+                    if buf.grad.is_sparse:
+                        # Clip sparse gradients by value
+                        buf.grad = buf.grad.coalesce()
+                        buf.grad._values().clamp_(-1.0, 1.0)
+                    else:
+                        params_with_grad.append(buf)
 
-            # Check if all sequences have halted
-            if self.carry.halted.all():
-                break
+        # Clip dense gradients by norm
+        if params_with_grad:
+            torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=1.0)
 
-        # Single optimizer step after all supervision steps
-        # Only clip non-sparse gradients
-        dense_params = [p for p in self.parameters() if p.grad is not None and not p.grad.is_sparse]
-        if dense_params:
-            torch.nn.utils.clip_grad_norm_(dense_params, max_norm=1.0)
-        opt.step()
-        opt.zero_grad()
+        # Optimizer step
+        for opt in opts:
+            if hasattr(opt, "_optimizer"):
+                opt._optimizer.step()
+                opt._optimizer.zero_grad()
+            else:
+                opt.step()
+                opt.zero_grad()
 
-        avg_loss = total_loss / max(1, n_active_steps)
+        # Log metrics
+        if metrics.get("count", 0) > 0:
+            with torch.no_grad():
+                count = metrics["count"]
+                self.log("train/accuracy", metrics.get("accuracy", 0) / count, on_step=True)
+                self.log(
+                    "train/exact_accuracy",
+                    metrics.get("exact_accuracy", 0) / count,
+                    prog_bar=True,
+                    on_step=True,
+                )
+                self.log(
+                    "train/q_halt_accuracy",
+                    metrics.get("q_halt_accuracy", 0) / count,
+                    on_step=True,
+                )
+                self.log(
+                    "train/steps",
+                    metrics.get("steps", 0) / count,
+                    prog_bar=True,
+                    on_step=True,
+                )
 
-        self.log("train/loss", avg_loss, prog_bar=True)
-        self.log("train/avg_steps", self.carry.steps.float().mean(), prog_bar=True)
+                log.info(f"Logging lm_loss {metrics.get('lm_loss', 0) / count} \t count = {count.item()}")
 
-        return torch.tensor(avg_loss)
+                self.log("train/lm_loss", metrics.get("lm_loss", 0) / count, on_step=True)
+                self.log("train/q_halt_loss", metrics.get("q_halt_loss", 0) / count, on_step=True)
 
-    def forward(self, carry: TRMCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
+                avg_halt_steps = metrics.get("steps", 0) / metrics["count"]
+                early_halt_rate = avg_halt_steps < self.hparams.N_supervision
+                self.log("train/early_halt_rate", early_halt_rate, on_step=True)
+
+        t_end = time.time()
+        # log.info(f"Total training_step time: {t_end - t_start:.4f}s")
+        self.last_step_time = time.time()
+        return loss
+
+    def forward(
+        self, carry: TRMCarry, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[TRMCarry, Dict[str, torch.Tensor]]:
         """Forward pass matching reference implementation with puzzle embeddings."""
-        batch_size = batch['input'].shape[0]
-        height, width = batch['input'].shape[1], batch['input'].shape[2]
+        batch_size = batch["input"].shape[0]
+        height, width = batch["input"].shape[1], batch["input"].shape[2]
         seq_len = height * width
         
+        assert batch_size == self.hparams.batch_size
+
         # Reset states for halted sequences
         reset_mask = carry.halted.view(-1, 1, 1)
-        
+
         z_H_init = self.z_H_init.view(1, 1, -1)
         z_L_init = self.z_L_init.view(1, 1, -1)
-        
+
         # Account for puzzle embedding positions in sequence length
         total_seq_len = seq_len + self.puzzle_emb_len
-        
+
         # Expand init states to total sequence length
-        new_z_H = torch.where(reset_mask, 
-                            z_H_init.expand(batch_size, total_seq_len, -1), 
-                            carry.z_H)
-        new_z_L = torch.where(reset_mask, 
-                            z_L_init.expand(batch_size, total_seq_len, -1), 
-                            carry.z_L)
-        
+        new_z_H = torch.where(reset_mask, z_H_init.expand(batch_size, total_seq_len, -1), carry.z_H)
+        new_z_L = torch.where(reset_mask, z_L_init.expand(batch_size, total_seq_len, -1), carry.z_L)
+
         # Reset steps for halted sequences
-        new_steps = torch.where(carry.halted, 
-                                torch.zeros_like(carry.steps), 
-                                carry.steps)
-        
+        new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
+
         # Update current_data for halted sequences
         new_current_data = {}
         for k in batch.keys():
-            if isinstance(batch[k], torch.Tensor):
-                mask = carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1))
-                new_current_data[k] = torch.where(mask, batch[k], carry.current_data[k])
-            else:
-                new_current_data[k] = batch[k]
-        
+            mask = carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1))
+            new_current_data[k] = torch.where(mask, batch[k], carry.current_data[k])
+
         # Get token embeddings from current data
-        x_input = new_current_data['input']
+        x_input = new_current_data["input"]
         token_emb = self.embed_scale * self.input_embedding(x_input)
         token_emb = token_emb.view(batch_size, seq_len, self.hparams.hidden_size)
-        
+
         # Get and process puzzle embeddings
         if self.puzzle_emb is not None and self.puzzle_emb_len > 0:
-            puzzle_ids = new_current_data['puzzle_identifiers']
+            puzzle_ids = new_current_data["puzzle_identifiers"]
             puzzle_embedding = self.puzzle_emb(puzzle_ids)  # [B, puzzle_emb_dim]
-            
+
             # Reshape puzzle embedding to sequence positions
             # If puzzle_emb_dim doesn't divide evenly into hidden_size, pad
             pad_count = self.puzzle_emb_len * self.hparams.hidden_size - puzzle_embedding.shape[-1]
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
-            
+
             # Reshape to [B, puzzle_emb_len, hidden_size]
-            puzzle_embedding = puzzle_embedding.view(batch_size, self.puzzle_emb_len, self.hparams.hidden_size)
-            
+            puzzle_embedding = puzzle_embedding.view(
+                batch_size, self.puzzle_emb_len, self.hparams.hidden_size
+            )
+
+            puzzle_embedding = self.embed_scale * puzzle_embedding
+
             # Concatenate puzzle embeddings with token embeddings
             x_emb = torch.cat([puzzle_embedding, token_emb], dim=1)  # [B, puzzle_len + seq_len, D]
         else:
             x_emb = token_emb
             total_seq_len = seq_len
-        
-        # Apply position embeddings 
+
+        # Apply position embeddings
         # Position embeddings should cover total_seq_len now
-        if hasattr(self, 'pos_embedding'):
+        if hasattr(self, "pos_embedding"):
             positions = torch.arange(total_seq_len, device=x_emb.device)
             positions = positions.unsqueeze(0).expand(batch_size, -1)
             pos_emb = self.pos_embedding(positions)
-            x_emb = x_emb + pos_emb
+            x_emb = 0.7071067812 * (x_emb + pos_emb)
 
         # Deep recursion with updated states
         z_H, z_L = new_z_H, new_z_L
-        
+
         # H_cycles-1 without gradient
         with torch.no_grad():
             for _ in range(self.hparams.T_deep_recursions - 1):
                 for _ in range(self.hparams.n_latent_recursions):
                     z_L = self._net_forward(self.lenet, z_L, z_H + x_emb)
                 z_H = self._net_forward(self.lenet, z_H, z_L)
-        
+
         # Last H_cycle WITH gradient
         for _ in range(self.hparams.n_latent_recursions):
             z_L = self._net_forward(self.lenet, z_L, z_H + x_emb)
         z_H = self._net_forward(self.lenet, z_H, z_L)
-        
+
         # Compute outputs - only from grid positions (skip puzzle positions)
         if self.puzzle_emb_len > 0:
             # Skip puzzle embedding positions when computing output
-            grid_z_H = z_H[:, self.puzzle_emb_len:, :]  # [B, seq_len, D]
+            grid_z_H = z_H[:, self.puzzle_emb_len :, :]  # [B, seq_len, D]
             logits = self.output_head(grid_z_H)
             # Use first puzzle position for Q-head (like reference)
             q_halt_logits = self.Q_head(z_H[:, 0, :])
         else:
             logits = self.output_head(z_H)
             q_halt_logits = self.Q_head(z_H[:, 0, :])
-        
+
         outputs = {
-            'logits': logits,  # [B, seq_len, num_colors]
-            'q_halt_logits': q_halt_logits  # [B, 1]
+            "logits": logits,  # [B, seq_len, num_colors]
+            "q_halt_logits": q_halt_logits,  # [B, 1]
         }
-        
-        # Update carry for next iteration
+
+        # Update carry for next iteration with exploration
         with torch.no_grad():
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.hparams.N_supervision
-            
-            # Halting logic
+
+            # Base halting decision
+            halted = is_last_step
+
             if self.training:
                 halted = is_last_step | (q_halt_logits.squeeze() > 0)
+
+            # # Halting logic with exploration (only during training)
+            # if self.training and self.hparams.N_supervision > 1:
+            #     # Halt signal based on Q-value
+            #     halted = halted | (q_halt_logits.squeeze() > 0)
+
+            #     # Exploration: randomly force minimum steps before allowing halt
+            #     if self.hparams.halt_exploration_prob > 0:
+            #         # Sample whether to explore for each sequence
+            #         explore_mask = torch.rand_like(q_halt_logits.squeeze()) < self.hparams.halt_exploration_prob
+
+            #         # If exploring, sample a minimum number of steps (2 to N_supervision)
+            #         min_halt_steps = torch.where(
+            #             explore_mask,
+            #             torch.randint_like(new_steps, low=2, high=self.hparams.N_supervision + 1),
+            #             torch.ones_like(new_steps)  # No minimum if not exploring
+            #         )
+
+            #         # Only allow halting after minimum steps
+            #         halted = halted & (new_steps >= min_halt_steps)
             else:
+                # During validation/testing, always run max steps
                 halted = is_last_step
-        
+
         new_carry = TRMCarry(
             z_H=z_H.detach(),
             z_L=z_L.detach(),
             steps=new_steps,
             halted=halted,
-            current_data=new_current_data
+            current_data=new_current_data,
         )
-        
+
         return new_carry, outputs
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
-        """
-        Validation step following reference approach.
-        Since we need complete solutions for validation, we run up to halt_max_steps
-        iterations, similar to how the model would process multiple batches during training.
-        """
+        """Simplified validation using loss head."""
 
-        x_input = batch["input"]
-        y_true = batch["output"]
-        batch_size, height, width = x_input.shape
+        # log.info(f"*" * 50)
+        # log.info("Calling validation!")
+        batch_size = batch["input"].shape[0]
 
         with torch.no_grad():
-            # Create fresh carry for validation (don't use self.carry from training)
+            # Create fresh carry for validation
             carry = self.initial_carry(batch)
 
-            # Run up to halt_max_steps (N_supervision) iterations
-            # This simulates what would happen across multiple training batches
-            final_logits = None
-            steps_taken = []
+            # Accumulate metrics across all supervision steps
+            accumulated_metrics = {}
+            total_loss = 0.0
+            n_steps = 0
 
-            for step in range(self.hparams.N_supervision):
-                # Forward pass (single iteration)
-                carry, outputs = self.forward(carry, batch)
+            # Run up to N_supervision iterations
+            for _ in range(self.hparams.N_supervision):
+                # Forward with loss computation
+                carry, loss, metrics, all_halted = self.compute_loss_and_metrics(carry, batch)
 
-                # Keep track of latest predictions
-                final_logits = outputs["logits"]
+                # Accumulate metrics
+                for k, v in metrics.items():
+                    accumulated_metrics[k] = accumulated_metrics.get(k, 0) + v.item()
 
-                # Track when each sequence halts
-                if step == 0:
-                    steps_taken = torch.ones_like(carry.steps)
-                else:
-                    # Only update steps for sequences that haven't halted yet
-                    steps_taken = torch.where(carry.halted, steps_taken, carry.steps)
+                total_loss += loss.item()
+                n_steps += 1
 
-                # If all sequences have halted, we can stop early
-                if carry.halted.all():
+                if all_halted:
                     break
 
-            # Compute metrics using final predictions
-            y_pred = final_logits.view(batch_size, height, width, self.hparams.num_colors)
-
-            # Loss
-            loss = F.cross_entropy(
-                y_pred.flatten(start_dim=0, end_dim=2),  # [B*H*W, num_colors]
-                y_true.flatten(),  # [B*H*W]
-                ignore_index=PAD_VALUE,
-            )
-
-            # Accuracy metrics
-            pred_classes = y_pred.argmax(dim=-1)
-            mask = (y_true != PAD_VALUE).float()
-            correct = (pred_classes == y_true).float()
-
-            # Per-element accuracy
-            accuracy = (correct * mask).sum() / mask.sum() if mask.sum() > 0 else correct.mean()
-
-            # Exact accuracy (entire grid correct)
-            pred_flat = pred_classes.view(batch_size, -1)
-            true_flat = y_true.view(batch_size, -1)
-            mask_flat = mask.view(batch_size, -1)
-
-            # Check if all non-masked elements are correct for each sample
-            exact_correct = ((pred_flat == true_flat) | (mask_flat == 0)).all(dim=1)
-            exact_accuracy = exact_correct.float().mean()
+            # Compute averages
+            count = accumulated_metrics.get("count", batch_size)
+            if count > 0:
+                avg_metrics = {
+                    "val/loss": total_loss / (n_steps * batch_size),
+                    "val/accuracy": accumulated_metrics.get("accuracy", 0) / count,
+                    "val/exact_accuracy": accumulated_metrics.get("exact_accuracy", 0) / count,
+                    "val/q_halt_accuracy": accumulated_metrics.get("q_halt_accuracy", 0) / count,
+                    "val/steps": accumulated_metrics.get("steps", 0) / count,
+                    "val/lm_loss": accumulated_metrics.get("lm_loss", 0) / count,
+                    "val/q_halt_loss": accumulated_metrics.get("q_halt_loss", 0) / count,
+                }
+            else:
+                avg_metrics = {
+                    f"val/{k}": 0.0
+                    for k in [
+                        "loss",
+                        "accuracy",
+                        "exact_accuracy",
+                        "q_halt_accuracy",
+                        "steps",
+                        "lm_loss",
+                        "q_halt_loss",
+                    ]
+                }
 
             # Log metrics
-            self.log(
-                "val/loss", loss.item(), on_step=False, on_epoch=True, prog_bar=True, sync_dist=True
-            )
-            self.log(
-                "val/accuracy",
-                accuracy,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,
-            )
-            self.log(
-                "val/exact_accuracy",
-                exact_accuracy,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,
-            )
-            self.log(
-                "val/avg_steps",
-                steps_taken.float().mean(),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-            )
-
-            # Optional: Log which tasks were solved correctly
-            if exact_correct.any() and batch_idx % 100 == 0:
-                batch_ids = batch.get("task_ids", torch.arange(batch_size))
-                correct_indices = torch.nonzero(exact_correct).squeeze(-1)
-                for idx in correct_indices[:5]:  # Log first 5 correct solutions
-                    log.info(f"Task {batch_ids[idx]} solved correctly in {steps_taken[idx]} steps")
-
-        return {
-            "loss": loss,
-            "accuracy": accuracy,
-            "exact_accuracy": exact_accuracy,
-            "avg_steps": steps_taken.float().mean(),
-        }
+            for name, value in avg_metrics.items():
+                self.log(
+                    name,
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=(name in ["val/loss", "val/exact_accuracy"]),
+                    sync_dist=True,
+                )
+            log.info(f"\t [val] Logging accuracy = {avg_metrics['val/accuracy']} and exact accuracy {avg_metrics['val/exact_accuracy']}")
+            return avg_metrics
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Test step - same as validation."""
@@ -493,58 +601,66 @@ class TRMModule(LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer with different learning rates for different parameter groups."""
-        
-        base_lr = self.hparams.learning_rate / self.hparams.N_supervision
-        embedding_lr = self.hparams.learning_rate_emb / self.hparams.N_supervision
-        
-        # Separate parameters into groups
-        embedding_params = []
-        sparse_params = []
-        other_params = []
-        
+
+        base_lr = self.hparams.learning_rate  # / self.hparams.N_supervision
+        embedding_lr = self.hparams.learning_rate_emb  # / self.hparams.N_supervision
+
+        # Collect parameters for main optimizer
+        main_params = []
         for name, param in self.named_parameters():
-            if 'puzzle_emb' in name:
-                # Sparse embeddings need special handling
-                sparse_params.append(param)
-            elif 'input_embedding' in name or 'pos_embedding' in name:
-                # Regular embeddings
-                embedding_params.append(param)
-            else:
-                # Everything else (transformer, heads, etc.)
-                other_params.append(param)
-        
-        # Create parameter groups
-        param_groups = []
-        
-        if other_params:
-            param_groups.append({'params': other_params, 'lr': base_lr})
-        
-        if embedding_params:
-            param_groups.append({'params': embedding_params, 'lr': embedding_lr})
-        
-        if sparse_params:
-            # Sparse parameters use the embedding learning rate
-            param_groups.append({'params': sparse_params, 'lr': embedding_lr, 'sparse': True})
-        
-        # AdamW handles sparse gradients automatically when sparse=True is set
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.95)
-        )
-        
-        return optimizer
+            if "puzzle_emb" not in name:  # Exclude puzzle_emb
+                main_params.append(param)
 
-        # Just linear warmup, no decay after
-        def lr_lambda(step):
-            if step < self.hparams.warmup_steps:
-                return step / max(1, self.hparams.warmup_steps)
-            else:
-                return 1.0  # Constant LR after warmup
+        optimizers = []
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # Main optimizer
+        if main_params:
+            # Use AdamATan2 if available
+            try:
+                main_opt = AdamATan2(
+                    main_params,
+                    lr=base_lr,
+                    weight_decay=self.hparams.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+            except NameError:
+                main_opt = torch.optim.AdamW(
+                    main_params,
+                    lr=base_lr,
+                    weight_decay=self.hparams.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+            optimizers.append(main_opt)
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
-        }
+        # Force sparse embedding to be leaf tensors
+        if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
+            buffer_list = list(self.puzzle_emb.buffers())
+            for i, buf in enumerate(buffer_list):
+                if buf.requires_grad and not buf.is_leaf:
+                    # This is local_weights - recreate as leaf
+                    buffer_list[i] = buf.detach().requires_grad_(True)
+
+            # Add sparse embedding optimizer
+            sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
+                buffer_list,  # This should be a list of 3 tensors
+                lr=embedding_lr,
+                weight_decay=self.hparams.weight_decay,
+                world_size=1,
+            )
+            optimizers.append(sparse_opt)
+
+        return optimizers
+
+        # # Just linear warmup, no decay after
+        # def lr_lambda(step):
+        #     if step < self.hparams.warmup_steps:
+        #         return step / max(1, self.hparams.warmup_steps)
+        #     else:
+        #         return 1.0  # Constant LR after warmup
+
+        # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        # return {
+        #     "optimizer": optimizer,
+        #     "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        # }

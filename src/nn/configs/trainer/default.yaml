@@ -3,7 +3,7 @@ _target_: lightning.pytorch.trainer.Trainer
 min_epochs: 1 # Prevents early stopping
 max_epochs: ${timekeeping.max_epochs}
 
-accelerator: gpu
+accelerator: cpu
 devices: 1
 
 # Perform a validation loop every N training epochs

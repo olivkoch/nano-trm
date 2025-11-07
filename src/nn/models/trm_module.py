@@ -130,10 +130,10 @@ class TRMModule(LightningModule):
         # State for carry (persisted across training steps)
         self.carry = None
 
-        # self.z_H_init = nn.Buffer(trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        # self.z_L_init = nn.Buffer(trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.z_H_init = self.register_buffer("z_H_init", trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.z_L_init = self.register_buffer("z_L_init", trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.z_H_init = nn.Buffer(trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.z_L_init = nn.Buffer(trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        # self.register_buffer("z_H_init", trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        # self.register_buffer("z_L_init", trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)        
         
         self.last_step_time = None
 
@@ -158,10 +158,12 @@ class TRMModule(LightningModule):
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
+        
+        input = input.view(input.shape[0], -1) # flatten 2D input
         embedding = self.input_embedding(input.to(torch.int32))
 
         # Puzzle embeddings
-        if self.hparams.puzzle_emb_ndim > 0:
+        if self.hparams.puzzle_emb_dim > 0:
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
 
             pad_count = self.puzzle_emb_len * self.hparams.hidden_size - puzzle_embedding.shape[-1]
@@ -175,23 +177,22 @@ class TRMModule(LightningModule):
     
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["input"].shape[0]
+        device = batch["input"].device
 
         return TRMCarry(
-            inner_carry=self.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
-            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+            inner_carry=self.empty_carry(batch_size, device),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+            steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
+            current_data={k: torch.empty_like(v, device=device) for k, v in batch.items()}
         )
 
-    def empty_carry(self, batch_size: int) -> TRMInnerCarry:
+    def empty_carry(self, batch_size: int, device: torch.device) -> TRMInnerCarry:
         return TRMInnerCarry(
-            z_H=torch.empty(batch_size, self.hparams.seq_len + self.puzzle_emb_len, self.hparams.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.hparams.seq_len + self.puzzle_emb_len, self.hparams.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, self.hparams.seq_len + self.puzzle_emb_len, self.hparams.hidden_size, dtype=self.forward_dtype, device=device),
+            z_L=torch.empty(batch_size, self.hparams.seq_len + self.puzzle_emb_len, self.hparams.hidden_size, dtype=self.forward_dtype, device=device),
         )
 
     def reset_carry(self, reset_flag: torch.Tensor, carry: TRMInnerCarry) -> TRMInnerCarry:
-        print(self.z_H_init.device)
-        print(carry.z_H.device)
         return TRMInnerCarry(
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.z_H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.z_L_init, carry.z_L),
@@ -210,17 +211,17 @@ class TRMModule(LightningModule):
         z_H, z_L = carry.z_H, carry.z_L
         # H_cycles-1 without grad
         with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
-                for _L_step in range(self.config.L_cycles):
+            for _H_step in range(self.hparams.H_cycles-1):
+                for _L_step in range(self.hparams.L_cycles):
                     z_L = self.lenet(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.lenet(z_H, z_L, **seq_info)
         # 1 with grad
-        for _L_step in range(self.config.L_cycles):
+        for _L_step in range(self.hparams.L_cycles):
             z_L = self.lenet(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.lenet(z_H, z_L, **seq_info)
 
         # LM Outputs
-        new_carry = TRMCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        new_carry = TRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
@@ -292,9 +293,10 @@ class TRMModule(LightningModule):
             # Metrics (only for halted sequences)
             valid_metrics = new_carry.halted & (loss_counts > 0)
 
-            # acc = torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum()
+            acc = torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum()
 
             # print(f"{loss_counts=} {loss_divisor=} {is_correct=} {seq_is_correct=} {acc=}")
+            # print(f"acc = {acc.item()}")
 
             # assert acc < 1e-6
             

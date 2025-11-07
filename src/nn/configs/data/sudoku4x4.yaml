@@ -3,8 +3,8 @@ _recursive_: false
 batch_size: ${timekeeping.batch_size}
 num_workers: ${timekeeping.num_workers}
 
-num_train_puzzles: 1000
-num_val_puzzles: 200
+num_train_puzzles: 2000
+num_val_puzzles: 400
 num_test_puzzles: 200
 max_grid_size: 6
 min_givens: 6

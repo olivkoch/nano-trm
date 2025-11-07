@@ -5,7 +5,7 @@ defaults:
   - override /data: sudoku4x4
   - override /model: trm
   - override /callbacks: default
-  - override /trainer: cpu
+  - override /trainer: gpu
 
 tags: ["arc", "trm"]
 
@@ -36,6 +36,7 @@ trainer:
   accumulate_grad_batches: 1
   # val_check_interval: .25  # Check 4x per epoch
   log_every_n_steps: 10
+  # accelerator: cpu
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

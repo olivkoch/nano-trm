@@ -5,6 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.nn.utils import RankedLogger
+from src.nn.modules.utils import trunc_normal_init_
+from torch.nn.functional import scaled_dot_product_attention
+from typing import Tuple, List
+import einops
+
+CosSin = Tuple[torch.Tensor, torch.Tensor]
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -22,32 +28,59 @@ class RMSNorm(nn.Module):
         norm = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
         return self.weight * x / norm
 
+class CastedLinear(nn.Module):
+    def __init__(self,
+                 in_features: int,
+                 out_features: int,
+                 bias: bool):
+        super().__init__()
+        # Truncated LeCun normal init
+        self.weight = nn.Parameter(
+            trunc_normal_init_(torch.empty((out_features, in_features)), std=1.0 / (in_features ** 0.5))
+        )
+        self.bias = None
+        if bias:
+            # Zero init bias
+            self.bias = nn.Parameter(torch.zeros((out_features, )))
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
+
+
+class CastedEmbedding(nn.Module):
+    def __init__(self,
+                 num_embeddings: int,
+                 embedding_dim: int,
+                 init_std: float,
+                 cast_to: torch.dtype):
+        super().__init__()
+        self.cast_to = cast_to
+
+        # Truncated LeCun normal init
+        self.embedding_weight = nn.Parameter(
+            trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=init_std)
+        )
+        
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.embedding(input, self.embedding_weight.to(self.cast_to))
+
 
 class RotaryEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE)."""
-
-    def __init__(self, dim: int, max_seq_len: int = 2048):
+    def __init__(self, dim, max_position_embeddings, base, device=None):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.max_seq_len = max_seq_len
 
-    def forward(self, x, seq_len: int):
-        """
-        Args:
-            x: input tensor (used only for device/dtype)
-            seq_len: sequence length
-        Returns:
-            cos: [1, seq_len, head_dim]
-            sin: [1, seq_len, head_dim]
-        """
-        t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-        freqs = torch.outer(t, self.inv_freq)  # [seq_len, head_dim/2]
-        emb = torch.cat([freqs, freqs], dim=-1)  # [seq_len, head_dim]
-        cos = emb.cos()[None, :, :]  # [1, seq_len, head_dim]
-        sin = emb.sin()[None, :, :]  # [1, seq_len, head_dim]
-        return cos, sin
+        # RoPE
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
 
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos_cached = nn.Buffer(emb.cos(), persistent=False)
+        self.sin_cached = nn.Buffer(emb.sin(), persistent=False)
+
+    def forward(self):
+        return self.cos_cached, self.sin_cached
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -72,106 +105,152 @@ def apply_rotary_pos_emb(x, cos, sin):
     return (x * cos) + (rotate_half(x) * sin)
 
 
-class SwiGLU(nn.Module):
-    """SwiGLU activation function (Gated Linear Unit with Swish)."""
-
-    def __init__(self, dim: int, hidden_dim: int, bias: bool = False):
+class LinearSwish(nn.Module):
+    def __init__(self, hidden_size: int, reverse=False):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w2 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
+
+        self.linear = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.reverse = reverse
 
     def forward(self, x):
-        # SwiGLU(x, W, V, W2) = (Swish(xW) ⊗ xV)W2
-        # where Swish(x) = x * sigmoid(x)
-        swish = F.silu(self.w1(x))  # SiLU is Swish
-        x_V = self.w2(x)
-        return self.w3(swish * x_V)
+        if self.reverse:
+            return F.silu(self.linear(x))
+        else:
+            return self.linear(F.silu(x))
 
 
-class TransformerBlock(nn.Module):
-    """Single Transformer block with RMSNorm, Multi-head Self-Attention with RoPE, and SwiGLU FFN."""
-
-    def __init__(
-        self, hidden_size: int, num_heads: int = 8, ffn_expansion: int = 2, dropout: float = 0.1
-    ):
+class SwiGLU(nn.Module):
+    def __init__(self, hidden_size: int, expansion: float):
         super().__init__()
+        inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
+
+        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
+        self.down_proj    = CastedLinear(inter, hidden_size, bias=False)
+
+    def forward(self, x):
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+    
+class Attention(nn.Module):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.output_size = head_dim * num_heads
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.causal = causal
+
+        self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
+        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # hidden_states: [bs, seq_len, num_heads, head_dim]
+        qkv = self.qkv_proj(hidden_states)
+
+        # Split head
+        qkv = qkv.view(batch_size, seq_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+        query = qkv[:, :, :self.num_heads]
+        key = qkv[:, :, self.num_heads: self.num_heads + self.num_key_value_heads]
+        value = qkv[:, :, self.num_heads + self.num_key_value_heads:]
+
+        # RoPE
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        # flash attn
+        query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
+        attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
+        attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
+        attn_output = attn_output.contiguous().view(batch_size, seq_len, self.output_size)  # type: ignore
+        return self.o_proj(attn_output)
+
+class ReasoningBlockConfig:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        expansion: int,
+        rms_norm_eps: float,
+        mlp_t: bool = False,
+        seq_len: int = 0,
+        puzzle_emb_ndim: int = 0,
+        puzzle_emb_len: int = 0,
+    ) -> None:
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
+        self.expansion = expansion
+        self.rms_norm_eps = rms_norm_eps
+        self.mlp_t = mlp_t
+        self.puzzle_emb_ndim = puzzle_emb_ndim
+        self.puzzle_emb_len = puzzle_emb_len
+        self.seq_len = seq_len
 
-        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
 
-        # Pre-attention norm
-        self.norm1 = RMSNorm(hidden_size)
+class ReasoningBlock(nn.Module):
+    def __init__(self, config: ReasoningBlockConfig) -> None:
+        super().__init__()
 
-        # Self-attention (no bias as per paper)
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-
-        # Rotary embeddings
-        self.rotary_emb = RotaryEmbedding(self.head_dim)
-
-        # Pre-FFN norm
-        self.norm2 = RMSNorm(hidden_size)
-
-        # SwiGLU FFN (hidden_dim = 4 * hidden_size as standard)
-        self.ffn = SwiGLU(hidden_size, hidden_size * ffn_expansion, bias=False)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        """
-        Args:
-            x: [batch, seq_len, hidden_size]
-        Returns:
-            [batch, seq_len, hidden_size]
-        """
-        batch_size, seq_len, _ = x.shape
-
-        # Self-attention with residual
-        residual = x
-        x = self.norm1(x)
-
-        # Multi-head attention
-        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-
-        # Apply rotary embeddings to q and k
-        # q and k are [batch, seq_len, num_heads, head_dim]
-        cos, sin = self.rotary_emb(x, seq_len)
-        q = apply_rotary_pos_emb(q, cos, sin)
-        k = apply_rotary_pos_emb(k, cos, sin)
-
-        # Transpose for attention: [batch, num_heads, seq_len, head_dim]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Scaled dot-product attention
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        attn_output = torch.matmul(attn_weights, v)
-
-        # Reshape and project
-        attn_output = (
-            attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        self.config = config
+        if self.config.mlp_t:
+            self.puzzle_emb_len = -(config.puzzle_emb_ndim // -config.hidden_size) if config.puzzle_emb_len == 0 else config.puzzle_emb_len
+            self.mlp_t = SwiGLU(
+                hidden_size=config.seq_len + config.puzzle_emb_len, # L
+                expansion=config.expansion,
+            )
+        else:
+            self.self_attn = Attention(
+                hidden_size=config.hidden_size,
+                head_dim=config.hidden_size // config.num_heads,
+                num_heads=config.num_heads,
+                num_key_value_heads=config.num_heads,
+                causal=False
+            )
+        self.mlp = SwiGLU(
+            hidden_size=config.hidden_size,
+            expansion=config.expansion,
         )
-        attn_output = self.out_proj(attn_output)
-        attn_output = self.dropout(attn_output)
+        self.norm_eps = config.rms_norm_eps
 
-        x = residual + attn_output
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+        # B, L, D = hidden_states.shape
+        # Post Norm
+        if self.config.mlp_t:
+            hidden_states = hidden_states.transpose(1,2)
+            out = self.mlp_t(hidden_states)
+            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+            hidden_states = hidden_states.transpose(1,2)
+        else:
+            # Self Attention
+            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+        # Fully Connected
+        out = self.mlp(hidden_states)
+        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+        return hidden_states
+    
+class ReasoningModule(nn.Module):
+    def __init__(self, layers: List[ReasoningBlock]):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(layers)
 
-        # FFN with residual
-        residual = x
-        x = self.norm2(x)
-        x = self.ffn(x)
-        x = self.dropout(x)
-        x = residual + x
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+        hidden_states = hidden_states + input_injection
+        for layer in self.layers:
+            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+        return hidden_states
+    
+def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
 
-        return x
+    variance = hidden_states.square().mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
+    return hidden_states.to(input_dtype)
+
+
+def _find_multiple(a, b):
+    return (-(a // -b)) * b

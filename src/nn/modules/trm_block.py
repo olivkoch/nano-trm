@@ -82,28 +82,24 @@ class RotaryEmbedding(nn.Module):
     def forward(self):
         return self.cos_cached, self.sin_cached
 
-def rotate_half(x):
+def rotate_half(x: torch.Tensor):
     """Rotates half the hidden dims of the input."""
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([-x2, x1], dim=-1)
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(x, cos, sin):
-    """
-    Apply rotary position embedding.
+def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    # q, k: [bs, seq_len, num_heads, head_dim]
+    # cos, sin: [seq_len, head_dim]
+    orig_dtype = q.dtype
+    q = q.to(cos.dtype)
+    k = k.to(cos.dtype)
 
-    Args:
-        x: [batch, seq_len, num_heads, head_dim] or [batch, num_heads, seq_len, head_dim]
-        cos: [1, seq_len, head_dim]
-        sin: [1, seq_len, head_dim]
-    """
-    # x is [batch, seq_len, num_heads, head_dim]
-    # We need to unsqueeze cos/sin to [1, seq_len, 1, head_dim] to broadcast over num_heads
-    cos = cos.unsqueeze(2)  # [1, seq_len, 1, head_dim]
-    sin = sin.unsqueeze(2)  # [1, seq_len, 1, head_dim]
+    q_embed = (q * cos.unsqueeze(-2)) + (rotate_half(q) * sin.unsqueeze(-2))
+    k_embed = (k * cos.unsqueeze(-2)) + (rotate_half(k) * sin.unsqueeze(-2))
 
-    return (x * cos) + (rotate_half(x) * sin)
-
+    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
 
 class LinearSwish(nn.Module):
     def __init__(self, hidden_size: int, reverse=False):

@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from typing import Dict, List, Optional, Tuple
 import os
 import json
-
+from src.nn.utils.constants import IGNORE_LABEL_ID
 
 class Sudoku4x4Dataset(Dataset):
     """
@@ -124,8 +124,8 @@ class Sudoku4x4Dataset(Dataset):
         solution_shifted = solution + 2  # Values 1-4 -> 3-6
         
         # Create padded arrays
-        inp_padded = np.zeros((self.max_grid_size, self.max_grid_size), dtype=np.int32)
-        labels_padded = np.zeros((self.max_grid_size, self.max_grid_size), dtype=np.int32)
+        inp_padded = np.zeros((self.max_grid_size, self.max_grid_size), dtype=np.int32) + IGNORE_LABEL_ID
+        labels_padded = np.zeros((self.max_grid_size, self.max_grid_size), dtype=np.int32) + IGNORE_LABEL_ID
         
         # Fill in the actual data
         inp_padded[:4, :4] = puzzle_shifted
@@ -256,7 +256,7 @@ class Sudoku4x4DataModule(LightningDataModule):
 
         # Metadata matching reference
         self.num_puzzles = 1  # All Sudoku puzzles share ID 0
-        self.vocab_size = 3 + num_colors   # 0=PAD, 1=EOS, 2=empty, 3-6=values 1-4
+        self.vocab_size = 3 + num_colors   # -100=PAD, 1=EOS, 2=empty, 3-6=values 1-4
         self.seq_len = max_grid_size * max_grid_size
         
     def setup(self, stage: Optional[str] = None):

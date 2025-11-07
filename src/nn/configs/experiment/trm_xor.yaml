@@ -1,0 +1,41 @@
+# @package _global_
+
+# Fairness-aware detection using multiple fairness losses
+defaults:
+  - override /data: xor
+  - override /model: trm
+  - override /callbacks: default
+  - override /trainer: cpu
+
+tags: ["arc", "trm"]
+
+timekeeping:
+  max_epochs: 1
+  batch_size: 8
+  num_workers: 0
+
+model_tuning:
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-4
+  weight_decay: 0.0
+  num_heads: 8
+  halt_exploration_prob: 0.0
+  N_supervision: 2
+  H_cycles: 2
+  L_cycles: 1
+  num_layers: 1
+  warmup_steps: 0
+  max_steps: 0
+  puzzle_emb_dim: 4
+  puzzle_emb_len: 4
+  hidden_size: 64
+  ffn_expansion: 2
+  rope_theta: 10000
+
+trainer:
+  accumulate_grad_batches: 1
+  # val_check_interval: .25  # Check 4x per epoch
+  log_every_n_steps: 10
+
+save_dir: /tmp/ml-experiments
+append_wandb_name_to_save_dir: true

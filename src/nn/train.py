@@ -49,6 +49,17 @@ def flatten_config(cfg, parent_key="", sep="."):
     _flatten(config_dict)
     return dict(items)
 
+def update_model_config(cfg: DictConfig, datamodule: LightningDataModule):
+    # Add num_puzzles to model config
+    cfg.model.num_puzzles = datamodule.num_puzzles
+    cfg.model.batch_size = datamodule.batch_size
+    cfg.model.pad_value = datamodule.pad_value
+    cfg.model.max_grid_size = datamodule.max_grid_size
+    cfg.model.vocab_size = datamodule.vocab_size
+    cfg.model.seq_len = cfg.model.max_grid_size * cfg.model.max_grid_size
+    log.info(
+        f"Setting model config from data module:  num_puzzles = {datamodule.num_puzzles} batch_size = {datamodule.batch_size} vocab_size = {datamodule.vocab_size}"
+    )
 
 @task_wrapper
 def train(cfg: DictConfig) -> Optional[float]:
@@ -64,16 +75,7 @@ def train(cfg: DictConfig) -> Optional[float]:
     # Setup datamodule to get num_puzzles
     datamodule.setup(stage="fit")
 
-    # Add num_puzzles to model config
-    if hasattr(datamodule, "num_puzzles"):
-        cfg.model.num_puzzles = datamodule.num_puzzles
-        cfg.model.batch_size = datamodule.batch_size
-        cfg.model.pad_value = datamodule.pad_value
-        cfg.model.max_grid_size = datamodule.max_grid_size
-        cfg.model.num_colors = datamodule.num_colors
-        log.info(
-            f"Setting model num_puzzles to {datamodule.num_puzzles} and batch_size to {datamodule.batch_size}"
-        )
+    update_model_config(cfg, datamodule)
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model, output_dir=output_dir)

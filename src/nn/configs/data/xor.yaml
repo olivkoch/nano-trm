@@ -1,0 +1,12 @@
+_target_: src.nn.data.XORDataModule
+_recursive_: false
+batch_size: ${timekeeping.batch_size}
+num_workers: ${timekeeping.num_workers}
+num_train_puzzles: 1000
+num_val_puzzles: 200
+num_examples_per_puzzle: 3
+grid_size: 3
+max_grid_size: 6
+seed: 42
+pad_value: 0
+

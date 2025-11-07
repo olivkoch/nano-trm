@@ -1,0 +1,15 @@
+_target_: src.nn.data.Sudoku4x4DataModule
+_recursive_: false
+batch_size: ${timekeeping.batch_size}
+num_workers: ${timekeeping.num_workers}
+
+num_train_puzzles: 1000
+num_val_puzzles: 200
+num_test_puzzles: 200
+max_grid_size: 6
+min_givens: 6
+max_givens: 10
+seed: 42
+generate_on_fly: True
+data_dir: null
+pad_value: 0

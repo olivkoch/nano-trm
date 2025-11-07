@@ -1,2 +1,3 @@
 from .arc_datamodule import ARCDataModuleWithPuzzles
-from .xor_datamodule import XORDataModule  # noqa: F401
+from .xor_datamodule import XORDataModule
+from .sudoku4x4_datamodule import Sudoku4x4DataModule

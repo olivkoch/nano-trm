@@ -54,7 +54,7 @@ def log_stablemax(x, dim=-1):
 
     return result
 
-def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
+def stablemax_cross_entropy(logits, labels, ignore_index: int = 0, valid_mask=None):
     # Detect device type and use appropriate dtype
     if logits.device.type == 'mps':
         # MPS doesn't support float64, use float32

@@ -10,6 +10,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src.nn.utils.constants import IGNORE_LABEL_ID
 
 try:
     from adam_atan2 import AdamATan2
@@ -85,7 +86,7 @@ class TRMModule(LightningModule):
         # CRITICAL: Manual optimization
         self.automatic_optimization = False
 
-        self.forward_dtype = torch.bfloat16
+        self.forward_dtype = torch.float32
 
         # Token embeddings
         self.embed_scale = math.sqrt(hidden_size)
@@ -144,7 +145,7 @@ class TRMModule(LightningModule):
                 embedding_dim=puzzle_emb_dim,
                 batch_size=batch_size,
                 init_std=0.0,  # Reference uses 0 init
-                cast_to=torch.bfloat16,
+                cast_to=self.forward_dtype,
             )
             self.puzzle_emb_len = puzzle_emb_len
             log.info(f"Created puzzle_emb with batch_size={batch_size}")
@@ -158,7 +159,6 @@ class TRMModule(LightningModule):
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
-        
         input = input.view(input.shape[0], -1) # flatten 2D input
         embedding = self.input_embedding(input.to(torch.int32))
 
@@ -269,29 +269,32 @@ class TRMModule(LightningModule):
         """Compute loss and metrics without circular reference."""
         # Get model outputs
         new_carry, outputs = self.forward(carry, batch)
+        labels = new_carry.current_data["output"].flatten(start_dim=1)
 
         # Extract labels
-        y_true = batch["output"]
-        y_true_flat = y_true.flatten(start_dim=1)
+        # y_true = batch["output"]
+        # y_true_flat = y_true.flatten(start_dim=1)
 
         with torch.no_grad():
-            # Compute masks and correctness
-            mask = y_true_flat != self.hparams.pad_value
-            loss_counts = mask.sum(-1)
-            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
-            
-            # Predictions and correctness
-            preds = torch.argmax(outputs["logits"], dim=-1)
+            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
 
-            # print(f"{preds=}")
-            # print(f"{y_true=}")
+            # print(f"{outputs['preds']=}")
+            # print(f"{labels=}")
             # print(f"{outputs['logits']=}")
 
-            is_correct = mask & (preds == y_true_flat)
-            seq_is_correct = is_correct.sum(-1) == loss_counts
+            # Correctness
+            mask = (labels != IGNORE_LABEL_ID)
+            loss_counts = mask.sum(-1)
+            
+            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
 
-            # Metrics (only for halted sequences)
+            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
+            seq_is_correct = is_correct.sum(-1) == loss_counts
+                        
+            # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
+
+            # print(f"{valid_metrics=}")
 
             acc = torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum()
 
@@ -313,29 +316,19 @@ class TRMModule(LightningModule):
             }
 
         # Compute losses - IMPORTANT: These are per-sequence losses that will be summed
-        lm_loss_per_token = stablemax_cross_entropy(
-            outputs["logits"], y_true_flat, ignore_index=self.hparams.pad_value, valid_mask=mask
-        )
+        lm_loss = (stablemax_cross_entropy(
+            outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask
+        ) / loss_divisor).sum()
 
-        # Normalize by number of valid tokens per sequence, then sum
-        lm_loss = (lm_loss_per_token / loss_divisor).sum()
-
-        q_halt_loss = F.binary_cross_entropy_with_logits(
-            outputs["q_halt_logits"].squeeze(),
-            seq_is_correct.float(),
-            reduction="sum",
-        )
-
-        metrics.update(
-            {
-                "lm_loss": lm_loss.detach(),
-                "q_halt_loss": q_halt_loss.detach(),
-            }
-        )
+        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        metrics.update({
+            "lm_loss": lm_loss.detach(),
+            "q_halt_loss": q_halt_loss.detach(),
+        })
 
         total_loss = lm_loss + 0.5 * q_halt_loss
 
-        # print(f"{lm_loss=} {q_halt_loss=} total_loss={total_loss=}")
+        # print(f"[{self.training=}]\t{lm_loss=} \t {q_halt_loss=} total_loss={total_loss=}")
         
         return new_carry, total_loss, metrics, new_carry.halted.all()
     
@@ -377,34 +370,12 @@ class TRMModule(LightningModule):
         t1_loss = time.time()
         # log.info(f"Forward pass time: {t1_loss - t0_loss:.4f}s")
 
-        # log.info(f"training_step: loss={loss.item():.4f}, all_halted={all_halted} count = {metrics.get('count', 0)}")
+        log.info(f"training_step: loss={loss.item():.4f}, all_halted={all_halted} count = {metrics.get('count', 0)} accuracy = {metrics.get('accuracy', 0)} exact_accuracy = {metrics.get('exact_accuracy', 0)}")
 
         scaled_loss = loss / batch_size
         scaled_loss.backward()
 
-        # Clip gradients for all parameters (both dense and sparse)
-        params_with_grad = []
-
-        # Add regular parameters
-        for param in self.parameters():
-            if param.grad is not None:
-                params_with_grad.append(param)
-
-        # Add sparse embedding buffers if they have gradients
-        if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
-            for buf in self.puzzle_emb.buffers():
-                if hasattr(buf, "grad") and buf.grad is not None:
-                    # For sparse gradients, we need to handle them differently
-                    if buf.grad.is_sparse:
-                        # Clip sparse gradients by value
-                        buf.grad = buf.grad.coalesce()
-                        buf.grad._values().clamp_(-1.0, 1.0)
-                    else:
-                        params_with_grad.append(buf)
-
-        # Clip dense gradients by norm
-        if params_with_grad:
-            torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
         # Optimizer step
         for opt in opts:
@@ -438,7 +409,7 @@ class TRMModule(LightningModule):
                     on_step=True,
                 )
 
-                # log.info(f"Logging lm_loss {metrics.get('lm_loss', 0) / batch_size} \t count = {count.item()} -> train/accuracy = {metrics.get('accuracy', 0) / count} train/exact_accuracy = {metrics.get('exact_accuracy', 0) / count}")
+                log.info(f"Logging lm_loss {metrics.get('lm_loss', 0) / batch_size} \t count = {count.item()} -> train/accuracy = {metrics.get('accuracy', 0) / count} train/exact_accuracy = {metrics.get('exact_accuracy', 0) / count}")
 
                 self.log("train/lm_loss", metrics.get("lm_loss", 0) / batch_size, on_step=True)
                 self.log("train/q_halt_loss", metrics.get("q_halt_loss", 0) / batch_size, on_step=True)
@@ -533,7 +504,8 @@ class TRMModule(LightningModule):
 
     def on_train_epoch_start(self):
         """Reset carry at the beginning of each training epoch."""
-        self.carry = None
+        # self.carry = None
+        pass
 
     def configure_optimizers(self):
         """Configure optimizer with different learning rates for different parameter groups."""

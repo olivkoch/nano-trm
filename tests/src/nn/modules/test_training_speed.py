@@ -1,9 +1,12 @@
 # Test without Lightning to confirm it's the framework
 
-from src.nn.models.trm_module import TRMModule
-from src.nn.data.xor_datamodule import XORDataModule
 import time
+
 import torch
+
+from src.nn.data.xor_datamodule import XORDataModule
+from src.nn.models.trm_module import TRMModule
+
 
 def test_raw_training():
     dm = XORDataModule(batch_size=8, num_workers=0)
@@ -21,35 +24,34 @@ def test_raw_training():
         batch_size=dm.batch_size,
         pad_value=dm.pad_value,
     )
-    model.to('mps')
+    model.to("mps")
     model.train()
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)    
-    
-    for i, batch in enumerate(dm.train_dataloader()):
 
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    for i, batch in enumerate(dm.train_dataloader()):
         if i >= 20:
             break
-            
+
         start = time.time()
-        
+
         # Move to device
-        batch = {k: v.to('mps') for k, v in batch.items()}
-        
+        batch = {k: v.to("mps") for k, v in batch.items()}
+
         # Your training logic
         if model.carry is None:
             model.carry = model.initial_carry(batch)
-        
+
         model.carry, loss, metrics, _ = model.compute_loss_and_metrics(model.carry, batch)
-        
+
         scaled_loss = loss / 8
         scaled_loss.backward()
-        
+
         optimizer.step()
         optimizer.zero_grad()
-        
+
         elapsed = time.time() - start
-        print(f"Step {i}: {elapsed*1000:.1f}ms")  # Should be ~15-225ms
+        print(f"Step {i}: {elapsed * 1000:.1f}ms")  # Should be ~15-225ms
 
 
 if __name__ == "__main__":

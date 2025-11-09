@@ -32,9 +32,9 @@ model_tuning:
   ffn_expansion: 2
   rope_theta: 10000
 
-# trainer:
+trainer:
   # accumulate_grad_batches: 1
-  # val_check_interval: .25  # Check 4x per epoch
+  val_check_interval: 1
   # log_every_n_steps: 10
   # accelerator: cpu
 

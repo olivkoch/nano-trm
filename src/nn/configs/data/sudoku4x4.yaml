@@ -4,8 +4,8 @@ batch_size: ${timekeeping.batch_size}
 num_workers: ${timekeeping.num_workers}
 
 num_train_puzzles: 2000
-num_val_puzzles: 400
-num_test_puzzles: 200
+num_val_puzzles: 800
+num_test_puzzles: 0
 max_grid_size: 6
 min_givens: 6
 max_givens: 10

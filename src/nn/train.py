@@ -49,6 +49,7 @@ def flatten_config(cfg, parent_key="", sep="."):
     _flatten(config_dict)
     return dict(items)
 
+
 def update_model_config(cfg: DictConfig, datamodule: LightningDataModule):
     # Add num_puzzles to model config
     cfg.model.num_puzzles = datamodule.num_puzzles
@@ -60,6 +61,7 @@ def update_model_config(cfg: DictConfig, datamodule: LightningDataModule):
     log.info(
         f"Setting model config from data module:  num_puzzles = {datamodule.num_puzzles} batch_size = {datamodule.batch_size} vocab_size = {datamodule.vocab_size}"
     )
+
 
 @task_wrapper
 def train(cfg: DictConfig) -> Optional[float]:

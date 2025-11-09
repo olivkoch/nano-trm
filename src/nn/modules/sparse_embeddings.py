@@ -1,10 +1,10 @@
-import math
 from typing import Union
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.optim.optimizer import Optimizer, ParamsT
+
 from src.nn.modules.utils import trunc_normal_init_
 
 # class CastedSparseEmbedding(nn.Module):
@@ -34,6 +34,7 @@ from src.nn.modules.utils import trunc_normal_init_
 #         embeddings = self.embedding(input_ids)
 #         return embeddings.to(self.cast_to)
 
+
 class CastedSparseEmbedding(nn.Module):
     def __init__(
         self,
@@ -46,6 +47,12 @@ class CastedSparseEmbedding(nn.Module):
         super().__init__()
         self.cast_to = cast_to
 
+        self.batch_size = batch_size
+        self.embedding_dim = embedding_dim
+
+        print(
+            f"Creating CastedSparseEmbedding with {num_embeddings=}, {embedding_dim=}, {batch_size=}, {init_std=}, {cast_to=}"
+        )
         # Real Weights
         # Truncated LeCun normal init
         self.weights = nn.Buffer(
@@ -165,4 +172,3 @@ def _sparse_emb_signsgd_dist(
 
     # Write updated slices back
     weights[grad_ids] = p
-

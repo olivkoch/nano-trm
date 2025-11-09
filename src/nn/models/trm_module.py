@@ -441,9 +441,6 @@ class TRMModule(LightningModule):
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Simplified validation using loss head."""
-
-        # log.info(f"*" * 50)
-        # log.info("Calling validation!")
         batch_size = batch["input"].shape[0]
 
         with torch.no_grad():

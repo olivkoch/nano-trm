@@ -3,13 +3,13 @@ import time
 import numpy as np
 import torch
 
-from src.nn.data.xor_datamodule import XORDataModule
+from src.nn.data.sudoku4x4_datamodule import Sudoku4x4DataModule
 
 
 # Test DataLoader speed
 def test_dataloader_speed():
     # Create your datamodule
-    dm = XORDataModule(
+    dm = Sudoku4x4DataModule(
         batch_size=8,
         num_workers=4,  # Test with different values
     )
@@ -43,7 +43,7 @@ if __name__ == "__main__":
     # Test with different worker counts
     for num_workers in [0, 1, 2, 4]:
         print(f"\n--- Testing with num_workers={num_workers} ---")
-        dm = XORDataModule(batch_size=8, num_workers=num_workers)
+        dm = Sudoku4x4DataModule(batch_size=8, num_workers=num_workers)
         dm.setup("fit")
 
         start = time.time()

@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.nn.utils.constants import IGNORE_LABEL_ID
+from src.nn.modules.utils import compute_lr
 
 try:
     from adam_atan2 import AdamATan2
@@ -77,6 +78,7 @@ class TRMModule(LightningModule):
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
         rope_theta: int = 10000,
+        lr_min_ratio: float = 1.0,
         vocab_size: int = 0,  # Should be set from datamodule
         num_puzzles: int = 0,  # Should be set from datamodule
         batch_size: int = 0,  # Should be set from datamodule
@@ -168,6 +170,37 @@ class TRMModule(LightningModule):
             self.puzzle_emb_len = 0
 
         self.last_step_time = None
+
+    def setup(self, stage: str):
+        """Called by Lightning when setting up the model."""
+        if stage == "fit":
+            # Calculate steps from dataset and epochs
+            if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule is not None:
+                train_loader = self.trainer.datamodule.train_dataloader()
+                steps_per_epoch = len(train_loader)
+            else:
+                # Fallback: estimate from limit_train_batches if datamodule not available
+                steps_per_epoch = self.trainer.num_training_batches
+            
+            # Compute total steps from epochs
+            if self.trainer.max_epochs > 0:
+                computed_total_steps = steps_per_epoch * self.trainer.max_epochs
+            else:
+                # If max_epochs not set, use a large number
+                computed_total_steps = float('inf')
+            
+            # Take minimum of max_steps and computed steps
+            if self.trainer.max_steps > 0:
+                self.total_steps = min(self.trainer.max_steps, computed_total_steps)
+            else:
+                self.total_steps = computed_total_steps
+            
+            log.info(f"Training configuration:")
+            log.info(f"  Steps per epoch: {steps_per_epoch}")
+            log.info(f"  Max epochs: {self.trainer.max_epochs}")
+            log.info(f"  Computed total steps: {computed_total_steps}")
+            log.info(f"  Max steps limit: {self.trainer.max_steps}")
+            log.info(f"  Actual total steps: {self.total_steps}")
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -402,16 +435,46 @@ class TRMModule(LightningModule):
         scaled_loss = loss / batch_size
         scaled_loss.backward()
 
+        lr_this_step = None
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
-        # Optimizer step
-        for opt in opts:
+        # Learning rate scheduling with warmup
+        current_step = self.global_step
+        total_steps = getattr(self, 'total_steps', self.hparams.max_steps)
+
+        # Base learning rates for each optimizer
+        base_lrs = [self.hparams.learning_rate]
+        if len(opts) > 1:  # If we have puzzle embedding optimizer
+            base_lrs.append(self.hparams.learning_rate_emb)
+        
+        # Compute learning rate for this step
+        for opt, base_lr in zip(opts, base_lrs):
+            if current_step < self.hparams.warmup_steps:
+                lr_this_step = compute_lr(
+                    base_lr=base_lr,
+                    lr_warmup_steps=self.hparams.warmup_steps,
+                    lr_min_ratio=self.hparams.lr_min_ratio,
+                    current_step=current_step,
+                    total_steps=total_steps,
+                )
+            else:
+                # Constant LR after warmup (you can add decay here if needed)
+                lr_this_step = base_lr
+            
+            # Update learning rate
             if hasattr(opt, "_optimizer"):
+                for param_group in opt._optimizer.param_groups:
+                    param_group['lr'] = lr_this_step
                 opt._optimizer.step()
                 opt._optimizer.zero_grad()
             else:
+                for param_group in opt.param_groups:
+                    param_group['lr'] = lr_this_step
                 opt.step()
                 opt.zero_grad()
+        
+        # Log learning rate (will log the last optimizer's LR)
+        self.log("train/lr", lr_this_step, on_step=True)
 
         # Log metrics
         if metrics.get("count", 0) > 0:
@@ -576,17 +639,3 @@ class TRMModule(LightningModule):
             optimizers.append(sparse_opt)
 
         return optimizers
-
-        # # Just linear warmup, no decay after
-        # def lr_lambda(step):
-        #     if step < self.hparams.warmup_steps:
-        #         return step / max(1, self.hparams.warmup_steps)
-        #     else:
-        #         return 1.0  # Constant LR after warmup
-
-        # scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-        # return {
-        #     "optimizer": optimizer,
-        #     "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
-        # }

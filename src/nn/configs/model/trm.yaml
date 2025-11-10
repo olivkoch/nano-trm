@@ -16,6 +16,7 @@ max_steps: ${model_tuning.max_steps}
 puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
 puzzle_emb_len: ${model_tuning.puzzle_emb_len}
 rope_theta: ${model_tuning.rope_theta}
+lr_min_ratio: ${model_tuning.lr_min_ratio}
 output_dir: None
 
 # Should be set from datamodule

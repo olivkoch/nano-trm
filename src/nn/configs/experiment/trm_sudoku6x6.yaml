@@ -2,7 +2,7 @@
 
 # Fairness-aware detection using multiple fairness losses
 defaults:
-  - override /data: sudoku4x4
+  - override /data: sudoku6x6
   - override /model: trm
   - override /callbacks: default
   - override /trainer: gpu
@@ -10,8 +10,8 @@ defaults:
 tags: ["arc", "trm"]
 
 timekeeping:
-  max_epochs: 300
-  batch_size: 512
+  max_epochs: 3000
+  batch_size: 5120
   num_workers: 0
 
 model_tuning:
@@ -32,7 +32,6 @@ model_tuning:
   ffn_expansion: 2
   rope_theta: 10000
   lr_min_ratio: 1.0
-
 
 trainer:
   # accumulate_grad_batches: 1

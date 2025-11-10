@@ -79,3 +79,22 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = 0, valid_mask=No
     ).squeeze(-1)
 
     return -torch.where(valid_mask, prediction_logprobs, 0)
+
+def compute_lr(base_lr: float, lr_warmup_steps: int, lr_min_ratio: float, current_step: int, total_steps: int) -> float:
+    return cosine_schedule_with_warmup_lr_lambda(
+        current_step=current_step,
+        base_lr=base_lr,
+        num_warmup_steps=round(lr_warmup_steps),
+        num_training_steps=total_steps,
+        min_ratio=lr_min_ratio
+    )
+
+def cosine_schedule_with_warmup_lr_lambda(
+    current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
+):
+    if current_step < num_warmup_steps:
+        return base_lr * float(current_step) / float(max(1, num_warmup_steps))
+
+    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+    return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
+

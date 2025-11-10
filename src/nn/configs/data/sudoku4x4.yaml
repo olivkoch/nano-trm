@@ -11,6 +11,6 @@ max_grid_size: 6
 min_givens: null
 max_givens: null
 seed: 42
-generate_on_fly: True
-data_dir: null
+generate_on_fly: False
+data_dir: ./data/sudoku_4x4_small
 pad_value: 0

@@ -10,7 +10,7 @@ defaults:
 tags: ["arc", "trm"]
 
 timekeeping:
-  max_epochs: 1500
+  max_epochs: 300
   batch_size: 512
   num_workers: 0
 

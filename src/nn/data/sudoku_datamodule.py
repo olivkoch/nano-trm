@@ -396,7 +396,7 @@ class SudokuDataModule(LightningDataModule):
         max_givens: int = None,
         grid_size: int = 4,
         max_grid_size: int = 6,
-        num_workers: int = 4,
+        num_workers: int = 0,
         seed: int = 42,
         generate_on_fly: bool = True,
         pad_value: int = 0,
@@ -497,6 +497,7 @@ class SudokuDataModule(LightningDataModule):
             collate_fn=collate_fn_sudoku,
             pin_memory=True,
             persistent_workers=True if self.num_workers > 0 else False,
+            multiprocessing_context='spawn' if self.num_workers > 0 else None,
             drop_last=True,
         )
 
@@ -509,6 +510,7 @@ class SudokuDataModule(LightningDataModule):
             collate_fn=collate_fn_sudoku,
             pin_memory=True,
             persistent_workers=True if self.num_workers > 0 else False,
+            multiprocessing_context='spawn' if self.num_workers > 0 else None,
             drop_last=True,
         )
 
@@ -521,6 +523,7 @@ class SudokuDataModule(LightningDataModule):
             collate_fn=collate_fn_sudoku,
             pin_memory=True,
             persistent_workers=True if self.num_workers > 0 else False,
+            multiprocessing_context='spawn' if self.num_workers > 0 else None,
             drop_last=True,
         )
 

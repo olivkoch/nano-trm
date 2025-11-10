@@ -167,6 +167,8 @@ class TRMModule(LightningModule):
             self.puzzle_emb = None
             self.puzzle_emb_len = 0
 
+        self.last_step_time = None
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
         embedding = self.input_embedding(input.to(torch.int32))
@@ -369,6 +371,12 @@ class TRMModule(LightningModule):
         Training step that implements supervision through multiple forward passes.
         Each sequence can run up to N_supervision (halt_max_steps) times.
         """
+        import time
+        t0 = time.time()
+
+        # if self.last_step_time is not None:
+        #     print(f"Time since last training step: {time.time() - self.last_step_time:.4f} s")
+
         batch_size = batch["input"].shape[0]
 
         # log.info(f"Batch data samples: input: {batch['input'][:25]} \n output: {batch['output'][:25]} \n puzzle_identifiers: {batch['puzzle_identifiers'][:25]}")
@@ -437,6 +445,11 @@ class TRMModule(LightningModule):
                 early_halt_rate = avg_halt_steps < self.hparams.N_supervision
                 self.log("train/early_halt_rate", early_halt_rate, on_step=True)
 
+        t1 = time.time()
+        # print(f"Training step time: {t1 - t0:.4f} s")
+
+        self.last_step_time = t1
+        
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):

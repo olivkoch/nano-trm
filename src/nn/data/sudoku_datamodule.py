@@ -6,6 +6,7 @@ Supports 4x4, 6x6, and 9x9 Sudoku puzzles
 import json
 import os
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -417,35 +418,89 @@ class SudokuDataModule(LightningDataModule):
             generate_on_fly: If True, generate data. If False, load from data_dir.
         """
         super().__init__()
-        self.save_hyperparameters()
-
+        
         self.data_dir = data_dir
         self.batch_size = batch_size
-        self.num_train_puzzles = num_train_puzzles
-        self.num_val_puzzles = num_val_puzzles
-        self.num_test_puzzles = num_test_puzzles
-        self.grid_size = grid_size
-        self.max_grid_size = max_grid_size
         self.num_workers = num_workers
         self.seed = seed
         self.generate_on_fly = generate_on_fly
         self.pad_value = pad_value
         
-        # Auto-scale min/max givens based on grid size if not provided
-        total_cells = grid_size * grid_size
-        if min_givens is None:
-            self.min_givens = int(total_cells * 0.35)  # ~35% filled
-        else:
-            self.min_givens = min_givens
+        # If loading from pre-generated data, try to load metadata
+        if not generate_on_fly and data_dir is not None:
+            metadata = self._load_metadata(data_dir)
             
-        if max_givens is None:
-            self.max_givens = int(total_cells * 0.60)  # ~60% filled
+            if metadata is not None:
+                # Override parameters with metadata from files
+                self.grid_size = metadata['grid_size']
+                self.max_grid_size = metadata['max_grid_size']
+                self.vocab_size = metadata['vocab_size']
+                self.seq_len = metadata['seq_len']
+                self.min_givens = metadata.get('min_givens', min_givens)
+                self.max_givens = metadata.get('max_givens', max_givens)
+                self.num_train_puzzles = metadata.get('num_train', num_train_puzzles)
+                self.num_val_puzzles = metadata.get('num_val', num_val_puzzles)
+                self.num_test_puzzles = metadata.get('num_test', num_test_puzzles)
+                
+                print(f"✓ Loaded metadata from {data_dir}/metadata.json")
+                print(f"  Grid size: {self.grid_size}x{self.grid_size}")
+                print(f"  Max grid size: {self.max_grid_size}x{self.max_grid_size}")
+                print(f"  Vocab size: {self.vocab_size}")
+                print(f"  Sequence length: {self.seq_len}")
+                print(f"  Train/Val/Test: {self.num_train_puzzles}/{self.num_val_puzzles}/{self.num_test_puzzles}")
+            else:
+                # Fallback to provided parameters
+                print(f"⚠ Could not load metadata from {data_dir}, using provided parameters")
+                self.grid_size = grid_size
+                self.max_grid_size = max_grid_size
+                self.num_train_puzzles = num_train_puzzles
+                self.num_val_puzzles = num_val_puzzles
+                self.num_test_puzzles = num_test_puzzles
+                self.min_givens = min_givens
+                self.max_givens = max_givens
+                self._compute_derived_metadata()
         else:
+            # Generate on-the-fly: use provided parameters
+            self.grid_size = grid_size
+            self.max_grid_size = max_grid_size
+            self.num_train_puzzles = num_train_puzzles
+            self.num_val_puzzles = num_val_puzzles
+            self.num_test_puzzles = num_test_puzzles
+            self.min_givens = min_givens
             self.max_givens = max_givens
-
+            self._compute_derived_metadata()
+        
         # Metadata matching reference
         self.num_puzzles = 1  # All Sudoku puzzles share ID 0
-        self.vocab_size = 3 + grid_size  # 0=PAD, 1=EOS, 2=empty, 3+...=values
+        
+        # Save hyperparameters after everything is set
+        self.save_hyperparameters()
+
+    def _load_metadata(self, data_dir: str) -> Optional[dict]:
+        """Load metadata from pre-generated data directory."""
+        metadata_path = Path(data_dir) / 'metadata.json'
+        
+        if not metadata_path.exists():
+            return None
+        
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            return metadata
+        except Exception as e:
+            print(f"Warning: Failed to load metadata from {metadata_path}: {e}")
+            return None
+    
+    def _compute_derived_metadata(self):
+        """Compute derived metadata from grid_size."""
+        total_cells = self.grid_size * self.grid_size
+        
+        if self.min_givens is None:
+            self.min_givens = int(total_cells * 0.35)
+        if self.max_givens is None:
+            self.max_givens = int(total_cells * 0.60)
+        
+        self.vocab_size = 3 + self.grid_size  # 0=PAD, 1=EOS, 2=empty, 3+...=values
         self.seq_len = self.max_grid_size * self.max_grid_size
 
     def setup(self, stage: Optional[str] = None):

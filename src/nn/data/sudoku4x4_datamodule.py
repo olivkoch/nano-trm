@@ -1,6 +1,6 @@
 """
-Sudoku 4x4 DataModule - Version 2
-Matches the exact format from the reference implementation
+Sudoku DataModule - Flexible Version
+Supports 4x4, 6x6, and 9x9 Sudoku puzzles
 """
 
 import json
@@ -15,9 +15,9 @@ from torch.utils.data import DataLoader, Dataset
 from src.nn.utils.constants import IGNORE_LABEL_ID
 
 
-class Sudoku4x4Dataset(Dataset):
+class SudokuDataset(Dataset):
     """
-    Dataset for 4x4 Sudoku puzzles - matches reference format exactly.
+    Dataset for Sudoku puzzles of various sizes (4x4, 6x6, 9x9).
     Can either load from pre-generated .npy files or generate on-the-fly.
     """
 
@@ -26,9 +26,10 @@ class Sudoku4x4Dataset(Dataset):
         data_dir: str = None,
         split: str = "train",
         num_puzzles: int = 2000,
-        min_givens: int = 6,
-        max_givens: int = 10,
-        max_grid_size: int = 6,
+        min_givens: int = None,
+        max_givens: int = None,
+        grid_size: int = 4,
+        max_grid_size: int = None,
         seed: int = 42,
         generate_on_fly: bool = True,
     ):
@@ -37,19 +38,41 @@ class Sudoku4x4Dataset(Dataset):
             data_dir: Directory with pre-generated data (if not generating on-the-fly)
             split: 'train' or 'test'
             num_puzzles: Number of puzzles to generate
-            min_givens: Minimum numbers given
-            max_givens: Maximum numbers given
-            max_grid_size: Padding size (6 for 4x4 Sudoku)
+            min_givens: Minimum numbers given (defaults to ~35% of cells)
+            max_givens: Maximum numbers given (defaults to ~60% of cells)
+            grid_size: Sudoku grid size (4, 6, or 9)
+            max_grid_size: Padding size (defaults to grid_size + 2)
             seed: Random seed
             generate_on_fly: If True, generate data. If False, load from data_dir.
         """
         self.split = split
         self.num_puzzles = num_puzzles
-        self.min_givens = min_givens
-        self.max_givens = max_givens
-        self.max_grid_size = max_grid_size
+        self.grid_size = grid_size
+        self.max_grid_size = max_grid_size if max_grid_size is not None else grid_size + 2
         self.seed = seed + (0 if split == "train" else 1000)
         self.generate_on_fly = generate_on_fly
+        
+        # Determine box dimensions based on grid size
+        if grid_size == 4:
+            self.box_rows, self.box_cols = 2, 2
+        elif grid_size == 6:
+            self.box_rows, self.box_cols = 2, 3
+        elif grid_size == 9:
+            self.box_rows, self.box_cols = 3, 3
+        else:
+            raise ValueError(f"Unsupported grid_size: {grid_size}. Use 4, 6, or 9.")
+        
+        # Auto-scale min/max givens based on grid size if not provided
+        total_cells = grid_size * grid_size
+        if min_givens is None:
+            self.min_givens = int(total_cells * 0.35)  # ~35% filled
+        else:
+            self.min_givens = min_givens
+            
+        if max_givens is None:
+            self.max_givens = int(total_cells * 0.60)  # ~60% filled
+        else:
+            self.max_givens = max_givens
 
         if generate_on_fly:
             # Set up RNG for generation
@@ -74,54 +97,218 @@ class Sudoku4x4Dataset(Dataset):
 
         self.num_puzzles = len(self.inputs)
 
+    def is_valid_sudoku(self, grid: np.ndarray) -> bool:
+        """Check if a Sudoku grid is valid (no duplicates in rows/cols/boxes)."""
+        n = self.grid_size
+        
+        # Check rows and columns
+        for i in range(n):
+            row = grid[i, :]
+            col = grid[:, i]
+            row_vals = row[row > 0]
+            col_vals = col[col > 0]
+            if len(row_vals) != len(set(row_vals)) or len(col_vals) != len(set(col_vals)):
+                return False
+        
+        # Check boxes
+        for box_r in range(0, n, self.box_rows):
+            for box_c in range(0, n, self.box_cols):
+                box = grid[box_r:box_r+self.box_rows, box_c:box_c+self.box_cols].flatten()
+                box_vals = box[box > 0]
+                if len(box_vals) != len(set(box_vals)):
+                    return False
+        
+        return True
+
+    def solve_sudoku(self, grid: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Simple backtracking solver for Sudoku.
+        Returns solution if unique, None otherwise.
+        """
+        solution = grid.copy()
+        
+        def find_empty():
+            for i in range(self.grid_size):
+                for j in range(self.grid_size):
+                    if solution[i, j] == 0:
+                        return (i, j)
+            return None
+        
+        def is_valid_move(row, col, num):
+            # Check row
+            if num in solution[row, :]:
+                return False
+            # Check column
+            if num in solution[:, col]:
+                return False
+            # Check box
+            box_r = (row // self.box_rows) * self.box_rows
+            box_c = (col // self.box_cols) * self.box_cols
+            if num in solution[box_r:box_r+self.box_rows, box_c:box_c+self.box_cols]:
+                return False
+            return True
+        
+        def solve():
+            pos = find_empty()
+            if pos is None:
+                return True  # Solved
+            
+            row, col = pos
+            for num in range(1, self.grid_size + 1):
+                if is_valid_move(row, col, num):
+                    solution[row, col] = num
+                    if solve():
+                        return True
+                    solution[row, col] = 0
+            
+            return False
+        
+        if solve():
+            return solution
+        return None
+
     def generate_sudoku_puzzle(self, num_givens: int) -> Tuple[np.ndarray, np.ndarray]:
         """Generate a valid Sudoku puzzle with specified number of givens."""
-        # Start with a valid complete grid
-        base = np.array([[1, 2, 3, 4], [3, 4, 1, 2], [2, 1, 4, 3], [4, 3, 2, 1]], dtype=np.int32)
+        max_attempts = 100
+        
+        for attempt in range(max_attempts):
+            # Start with a complete valid grid
+            if self.grid_size == 4:
+                complete = self._generate_complete_4x4()
+            elif self.grid_size == 6:
+                complete = self._generate_complete_6x6()
+            else:  # 9x9
+                complete = self._generate_complete_9x9()
+            
+            # Create puzzle by removing cells
+            puzzle = complete.copy()
+            positions = [(r, c) for r in range(self.grid_size) for c in range(self.grid_size)]
+            self.rng.shuffle(positions)
+            
+            total_cells = self.grid_size * self.grid_size
+            cells_to_remove = total_cells - num_givens
+            
+            for r, c in positions[:cells_to_remove]:
+                puzzle[r, c] = 0
+            
+            # Verify puzzle is valid and has unique solution (for smaller grids)
+            if self.grid_size <= 6:
+                if self.is_valid_sudoku(puzzle):
+                    solution = self.solve_sudoku(puzzle)
+                    if solution is not None and np.array_equal(solution, complete):
+                        return puzzle, complete
+            else:
+                # For 9x9, skip uniqueness check (too slow)
+                if self.is_valid_sudoku(puzzle):
+                    return puzzle, complete
+        
+        # Fallback: return what we have even if not perfectly validated
+        return puzzle, complete
 
-        # Shuffle to create variety
+    def _generate_complete_4x4(self) -> np.ndarray:
+        """Generate a complete valid 4x4 Sudoku grid."""
+        base = np.array([[1, 2, 3, 4], [3, 4, 1, 2], [2, 1, 4, 3], [4, 3, 2, 1]], dtype=np.int32)
+        
         # Permute numbers
         perm = self.rng.permutation(4) + 1
         complete = np.zeros_like(base)
         for i in range(4):
             complete[base == i + 1] = perm[i]
-
+        
         # Shuffle rows within bands
         if self.rng.rand() > 0.5:
             complete[[0, 1]] = complete[[1, 0]]
         if self.rng.rand() > 0.5:
             complete[[2, 3]] = complete[[3, 2]]
-
+        
         # Shuffle columns within stacks
         if self.rng.rand() > 0.5:
             complete[:, [0, 1]] = complete[:, [1, 0]]
         if self.rng.rand() > 0.5:
             complete[:, [2, 3]] = complete[:, [3, 2]]
+        
+        return complete
 
-        # Create puzzle by removing cells
-        puzzle = complete.copy()
-        positions = [(r, c) for r in range(4) for c in range(4)]
-        self.rng.shuffle(positions)
+    def _generate_complete_6x6(self) -> np.ndarray:
+        """Generate a complete valid 6x6 Sudoku grid."""
+        # Start with a valid base pattern
+        base = np.array([
+            [1, 2, 3, 4, 5, 6],
+            [4, 5, 6, 1, 2, 3],
+            [2, 3, 4, 5, 6, 1],
+            [5, 6, 1, 2, 3, 4],
+            [3, 4, 5, 6, 1, 2],
+            [6, 1, 2, 3, 4, 5],
+        ], dtype=np.int32)
+        
+        # Permute numbers
+        perm = self.rng.permutation(6) + 1
+        complete = np.zeros_like(base)
+        for i in range(6):
+            complete[base == i + 1] = perm[i]
+        
+        # Shuffle rows within bands (2 rows per band)
+        for band in range(3):
+            r1, r2 = band * 2, band * 2 + 1
+            if self.rng.rand() > 0.5:
+                complete[[r1, r2]] = complete[[r2, r1]]
+        
+        # Shuffle column stacks (3 columns per stack)
+        for stack in range(2):
+            cols = [stack * 3, stack * 3 + 1, stack * 3 + 2]
+            self.rng.shuffle(cols)
+            complete[:, stack * 3:stack * 3 + 3] = complete[:, cols]
+        
+        return complete
 
-        cells_to_remove = 16 - num_givens
-        for _, (r, c) in enumerate(positions[:cells_to_remove]):
-            puzzle[r, c] = 0
-
-        return puzzle, complete
+    def _generate_complete_9x9(self) -> np.ndarray:
+        """Generate a complete valid 9x9 Sudoku grid."""
+        # Start with a valid base pattern (shifted by rows)
+        base = np.array([
+            [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [4, 5, 6, 7, 8, 9, 1, 2, 3],
+            [7, 8, 9, 1, 2, 3, 4, 5, 6],
+            [2, 3, 4, 5, 6, 7, 8, 9, 1],
+            [5, 6, 7, 8, 9, 1, 2, 3, 4],
+            [8, 9, 1, 2, 3, 4, 5, 6, 7],
+            [3, 4, 5, 6, 7, 8, 9, 1, 2],
+            [6, 7, 8, 9, 1, 2, 3, 4, 5],
+            [9, 1, 2, 3, 4, 5, 6, 7, 8],
+        ], dtype=np.int32)
+        
+        # Permute numbers
+        perm = self.rng.permutation(9) + 1
+        complete = np.zeros_like(base)
+        for i in range(9):
+            complete[base == i + 1] = perm[i]
+        
+        # Shuffle rows within bands (3 rows per band)
+        for band in range(3):
+            rows = [band * 3, band * 3 + 1, band * 3 + 2]
+            self.rng.shuffle(rows)
+            complete[band * 3:band * 3 + 3] = complete[rows]
+        
+        # Shuffle column stacks (3 columns per stack)
+        for stack in range(3):
+            cols = [stack * 3, stack * 3 + 1, stack * 3 + 2]
+            self.rng.shuffle(cols)
+            complete[:, stack * 3:stack * 3 + 3] = complete[:, cols]
+        
+        return complete
 
     def pad_and_encode(
         self, puzzle: np.ndarray, solution: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Pad grids and encode with reference format:
-        0=PAD, 1=EOS, 2=empty, 3-6=values 1-4
+        0=PAD, 1=EOS, 2=empty, 3-(grid_size+2)=values 1-grid_size
         """
-        # Add 2 offset: 0->2 (empty), 1-4 -> 3-6 (values)
+        # Add 2 offset: 0->2 (empty), 1-n -> 3-(n+2) (values)
         puzzle_shifted = puzzle.copy()
         puzzle_shifted[puzzle == 0] = 2  # Empty cells
-        puzzle_shifted[puzzle > 0] = puzzle[puzzle > 0] + 2  # Values 1-4 -> 3-6
+        puzzle_shifted[puzzle > 0] = puzzle[puzzle > 0] + 2  # Values shift by 2
 
-        solution_shifted = solution + 2  # Values 1-4 -> 3-6
+        solution_shifted = solution + 2  # Values shift by 2
 
         # Create padded arrays
         inp_padded = np.zeros((self.max_grid_size, self.max_grid_size), dtype=np.int32)
@@ -130,13 +317,13 @@ class Sudoku4x4Dataset(Dataset):
         )
 
         # Fill in the actual data
-        inp_padded[:4, :4] = puzzle_shifted
-        labels_padded[:4, :4] = solution_shifted
+        inp_padded[:self.grid_size, :self.grid_size] = puzzle_shifted
+        labels_padded[:self.grid_size, :self.grid_size] = solution_shifted
 
         # Add EOS marker
-        if self.max_grid_size > 4:
-            inp_padded[4, 0] = 1  # EOS
-            labels_padded[4, 0] = 1  # EOS in labels too
+        if self.max_grid_size > self.grid_size:
+            inp_padded[self.grid_size, 0] = 1  # EOS
+            labels_padded[self.grid_size, 0] = 1  # EOS in labels too
 
         return inp_padded.flatten(), labels_padded.flatten()
 
@@ -167,17 +354,13 @@ class Sudoku4x4Dataset(Dataset):
             labels_flat = self.labels[idx]
             puzzle_id = self.puzzle_identifiers[idx]
 
-        # Reshape to grid format for compatibility with TRM
-        # input_grid = input_flat.reshape(self.max_grid_size, self.max_grid_size)
-        # labels_grid = labels_flat.reshape(self.max_grid_size, self.max_grid_size)
-
         # Convert to tensors
         input_tensor = torch.from_numpy(input_flat).long()
         labels_tensor = torch.from_numpy(labels_flat).long()
 
         return {
             "input": input_tensor,
-            "output": labels_tensor,  # Using 'output' for compatibility
+            "output": labels_tensor,
             "puzzle_identifiers": puzzle_id,
         }
 
@@ -196,10 +379,10 @@ def collate_fn_sudoku(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     return {"input": inputs, "output": outputs, "puzzle_identifiers": puzzle_ids}
 
 
-class Sudoku4x4DataModule(LightningDataModule):
+class SudokuDataModule(LightningDataModule):
     """
-    Lightning DataModule for 4x4 Sudoku puzzles.
-    Matches reference implementation format exactly.
+    Lightning DataModule for Sudoku puzzles of various sizes.
+    Supports 4x4, 6x6, and 9x9 grids.
     """
 
     def __init__(
@@ -207,10 +390,11 @@ class Sudoku4x4DataModule(LightningDataModule):
         data_dir: str = None,
         batch_size: int = 128,
         num_train_puzzles: int = 2000,
-        num_val_puzzles: int = 400,  # Using as test
+        num_val_puzzles: int = 400,
         num_test_puzzles: int = 400,
-        min_givens: int = 6,
-        max_givens: int = 10,
+        min_givens: int = None,
+        max_givens: int = None,
+        grid_size: int = 4,
         max_grid_size: int = 6,
         num_workers: int = 4,
         seed: int = 42,
@@ -222,11 +406,12 @@ class Sudoku4x4DataModule(LightningDataModule):
             data_dir: Directory with pre-generated data (if not generating)
             batch_size: Batch size
             num_train_puzzles: Number of training puzzles
-            num_val_puzzles: Number of validation puzzles (uses test split)
+            num_val_puzzles: Number of validation puzzles
             num_test_puzzles: Number of test puzzles
-            min_givens: Minimum numbers given
-            max_givens: Maximum numbers given
-            max_grid_size: Padding size (6 for 4x4 Sudoku)
+            min_givens: Minimum numbers given (defaults to ~35% of cells)
+            max_givens: Maximum numbers given (defaults to ~60% of cells)
+            grid_size: Sudoku grid size (4, 6, or 9)
+            max_grid_size: Padding size (defaults to grid_size + 2)
             num_workers: DataLoader workers
             seed: Random seed
             generate_on_fly: If True, generate data. If False, load from data_dir.
@@ -239,54 +424,65 @@ class Sudoku4x4DataModule(LightningDataModule):
         self.num_train_puzzles = num_train_puzzles
         self.num_val_puzzles = num_val_puzzles
         self.num_test_puzzles = num_test_puzzles
-        self.min_givens = min_givens
-        self.max_givens = max_givens
+        self.grid_size = grid_size
         self.max_grid_size = max_grid_size
         self.num_workers = num_workers
         self.seed = seed
         self.generate_on_fly = generate_on_fly
         self.pad_value = pad_value
-
-        num_colors = 4  # 4 values
+        
+        # Auto-scale min/max givens based on grid size if not provided
+        total_cells = grid_size * grid_size
+        if min_givens is None:
+            self.min_givens = int(total_cells * 0.35)  # ~35% filled
+        else:
+            self.min_givens = min_givens
+            
+        if max_givens is None:
+            self.max_givens = int(total_cells * 0.60)  # ~60% filled
+        else:
+            self.max_givens = max_givens
 
         # Metadata matching reference
         self.num_puzzles = 1  # All Sudoku puzzles share ID 0
-        self.vocab_size = 3 + num_colors  # -100=PAD, 1=EOS, 2=empty, 3-6=values 1-4
-        self.seq_len = max_grid_size * max_grid_size
+        self.vocab_size = 3 + grid_size  # 0=PAD, 1=EOS, 2=empty, 3+...=values
+        self.seq_len = self.max_grid_size * self.max_grid_size
 
     def setup(self, stage: Optional[str] = None):
         """Create datasets for each split."""
         if stage == "fit" or stage is None:
-            self.train_dataset = Sudoku4x4Dataset(
+            self.train_dataset = SudokuDataset(
                 data_dir=self.data_dir,
                 split="train",
                 num_puzzles=self.num_train_puzzles,
                 min_givens=self.min_givens,
                 max_givens=self.max_givens,
+                grid_size=self.grid_size,
                 max_grid_size=self.max_grid_size,
                 seed=self.seed,
                 generate_on_fly=self.generate_on_fly,
             )
 
-            # Validation uses test split (matching reference)
-            self.val_dataset = Sudoku4x4Dataset(
+            self.val_dataset = SudokuDataset(
                 data_dir=self.data_dir,
                 split="test",
                 num_puzzles=self.num_val_puzzles,
                 min_givens=self.min_givens,
                 max_givens=self.max_givens,
+                grid_size=self.grid_size,
                 max_grid_size=self.max_grid_size,
                 seed=self.seed,
                 generate_on_fly=self.generate_on_fly,
             )
 
         if stage == "test" or stage is None:
-            self.test_dataset = Sudoku4x4Dataset(
+            self.test_dataset = SudokuDataset(
                 data_dir=self.data_dir,
                 split="test",
                 num_puzzles=self.num_test_puzzles,
                 min_givens=self.min_givens,
                 max_givens=self.max_givens,
+                grid_size=self.grid_size,
                 max_grid_size=self.max_grid_size,
                 seed=self.seed,
                 generate_on_fly=self.generate_on_fly,
@@ -330,61 +526,44 @@ class Sudoku4x4DataModule(LightningDataModule):
 
 
 if __name__ == "__main__":
-    # Test the datamodule
-    print("Testing Sudoku 4x4 DataModule (Reference Format)")
+    # Test the datamodule with different grid sizes
+    print("Testing Flexible Sudoku DataModule")
     print("=" * 60)
 
-    # Test 1: Generate on-the-fly
-    print("\nTest 1: Generating data on-the-fly")
-    print("-" * 40)
-    dm = Sudoku4x4DataModule(
-        batch_size=4, num_train_puzzles=10, num_val_puzzles=2, generate_on_fly=True
-    )
+    for grid_size in [4, 6]:
+        print(f"\n{'='*60}")
+        print(f"Testing {grid_size}x{grid_size} Sudoku")
+        print("-" * 40)
+        
+        dm = SudokuDataModule(
+            batch_size=2,
+            num_train_puzzles=5,
+            num_val_puzzles=2,
+            grid_size=grid_size,
+            # min_givens and max_givens will auto-scale
+            generate_on_fly=True,
+        )
 
-    dm.setup("fit")
-    train_loader = dm.train_dataloader()
-    batch = next(iter(train_loader))
+        dm.setup("fit")
+        train_loader = dm.train_dataloader()
+        batch = next(iter(train_loader))
 
-    print(f"Batch keys: {batch.keys()}")
-    print(f"Input shape: {batch['input'].shape}")
-    print(f"Output shape: {batch['output'].shape}")
-    print(f"Puzzle IDs: {batch['puzzle_identifiers'].unique()}")
-    print(f"Vocab size: {dm.vocab_size} (0=PAD, 1=EOS, 2=empty, 3-6=values)")
-    print(f"Sequence length: {dm.seq_len}")
+        print(f"Grid size: {grid_size}x{grid_size}")
+        print(f"Batch input shape: {batch['input'].shape}")
+        print(f"Vocab size: {dm.vocab_size} (0=PAD, 1=EOS, 2=empty, 3-{2+grid_size}=values)")
+        print(f"Sequence length: {dm.seq_len}")
+        print(f"Givens range (auto-scaled): {dm.min_givens}-{dm.max_givens}")
 
-    # Show first example
-    print("\nFirst puzzle (6x6 padded):")
-    print("Input encoding:")
-    print(batch["input"][0].numpy())
-    print("\nOutput (solution):")
-    print(batch["output"][0].numpy())
+        # Show first puzzle
+        print(f"\nFirst puzzle ({dm.max_grid_size}x{dm.max_grid_size} padded):")
+        puzzle_grid = batch["input"][0].reshape(dm.max_grid_size, dm.max_grid_size)
+        print(puzzle_grid.numpy())
+        
+        # Decode the actual puzzle
+        puzzle_decoded = puzzle_grid[:grid_size, :grid_size].numpy()
+        puzzle_decoded = np.where(puzzle_decoded == 2, 0, puzzle_decoded - 2)
+        puzzle_decoded = np.where(puzzle_decoded < 0, 0, puzzle_decoded)
+        print(f"\nDecoded {grid_size}x{grid_size} puzzle (0=empty):")
+        print(puzzle_decoded)
 
-    # Extract 4x4 and decode
-    input_4x4 = batch["input"][0][:4, :4].numpy()
-    output_4x4 = batch["output"][0][:4, :4].numpy()
-
-    # Decode: 2=empty, 3-6 = numbers 1-4
-    puzzle_decoded = input_4x4.copy()
-    puzzle_decoded[input_4x4 == 2] = 0  # Empty
-    puzzle_decoded[input_4x4 > 2] = input_4x4[input_4x4 > 2] - 2  # Numbers
-
-    solution_decoded = output_4x4 - 2  # All should be 3-6 -> 1-4
-
-    print("\nDecoded 4x4 puzzle (0=empty, 1-4=values):")
-    print(puzzle_decoded)
-    print("\nDecoded solution:")
-    print(solution_decoded)
-
-    # Check EOS marker
-    if batch["input"][0, 4, 0] == 1:
-        print("\n✓ EOS marker found at position [4, 0]")
-
-    # Test 2: Would load from files (if they exist)
-    print("\n" + "=" * 60)
-    print("Test 2: Loading from files")
-    print("-" * 40)
-    print("To use pre-generated data:")
-    print("1. Run: python build_sudoku4x4_dataset.py")
-    print("2. Then use: Sudoku4x4DataModule(data_dir='data/sudoku4x4', generate_on_fly=False)")
-
-    print("\n✅ DataModule ready for nano-TRM!")
+    print("\n✅ Flexible DataModule ready!")

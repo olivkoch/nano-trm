@@ -170,6 +170,7 @@ class TRMModule(LightningModule):
             self.puzzle_emb_len = 0
 
         self.last_step_time = None
+        self.manual_step = 0
 
     def setup(self, stage: str):
         """Called by Lightning when setting up the model."""
@@ -439,7 +440,7 @@ class TRMModule(LightningModule):
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
         # Learning rate scheduling with warmup
-        current_step = self.global_step
+        current_step = self.manual_step
         total_steps = getattr(self, 'total_steps', self.hparams.max_steps)
 
         # Base learning rates for each optimizer
@@ -512,7 +513,8 @@ class TRMModule(LightningModule):
         # print(f"Training step time: {t1 - t0:.4f} s")
 
         self.last_step_time = t1
-        
+        self.manual_step += 1
+
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):

@@ -11,27 +11,27 @@ tags: ["arc", "trm"]
 
 timekeeping:
   max_epochs: 3000
-  batch_size: 5120
+  batch_size: 768
   num_workers: 0
 
 model_tuning:
   learning_rate: 1e-3
   learning_rate_emb: 1e-2
-  weight_decay: 0.0
+  warmup_steps: 200
+  weight_decay: 0.1
+  lr_min_ratio: 1.0
   num_heads: 2
   halt_exploration_prob: 0.0
   N_supervision: 4
   H_cycles: 2
   L_cycles: 2
   num_layers: 1
-  warmup_steps: 0
   max_steps: 0
   puzzle_emb_dim: 4
   puzzle_emb_len: 4
   hidden_size: 64
   ffn_expansion: 2
   rope_theta: 10000
-  lr_min_ratio: 1.0
 
 trainer:
   # accumulate_grad_batches: 1

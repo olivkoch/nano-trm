@@ -6,25 +6,19 @@ Reference [code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
 
 # Data
 
-We are working with ARC-AGI-2 exclusively for now.
+ARC-AGI: You need to download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
 
-You need to download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
+Other datasets are generated locally.
 
-# Setup
-
-Install `uv`: `sudo snap install astral-uv --classic`
+To generate a Sudoku dataset: `./bash/generate_sudoku_data.sh`
 
 # Training
 
-To run a training:
-
-`uv run python src/train/nn/train.py experiment=trm_arc`
+`uv run python src/train/nn/train.py experiment=trm_sudoku4x4` (takes a few mins on an A10)
 
 # Evaluation
 
-To run an evaluation:
-
-`uv run python src/train/nn/evaluate.py experiment=trm_arc`
+`uv run python src/train/nn/evaluate.py experiment=trm_sudoku4x4`
 
 # Visualization
 

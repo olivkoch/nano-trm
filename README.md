@@ -14,11 +14,11 @@ To generate a Sudoku dataset: `./bash/generate_sudoku_data.sh`
 
 # Training
 
-`uv run python src/train/nn/train.py experiment=trm_sudoku4x4` (takes a few mins on an A10)
+`uv run python src/nn/train.py experiment=trm_sudoku4x4` (takes a few mins on an A10)
 
 # Evaluation
 
-`uv run python src/train/nn/evaluate.py experiment=trm_sudoku4x4`
+`uv run python src/nn/evaluate.py experiment=trm_sudoku4x4`
 
 # Visualization
 

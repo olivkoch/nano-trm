@@ -1,15 +1,16 @@
 import time
 
+import click
 import numpy as np
 import torch
-import click
 
 from src.nn.data.sudoku_datamodule import SudokuDataModule
 
 
 # Test DataLoader speed
-def test_dataloader_speed(num_batches: int, device: torch.device, data_dir: str, batch_size: int) -> float:
-
+def test_dataloader_speed(
+    num_batches: int, device: torch.device, data_dir: str, batch_size: int
+) -> float:
     # Create your datamodule
     dm = SudokuDataModule(
         batch_size=batch_size,
@@ -41,11 +42,11 @@ def test_dataloader_speed(num_batches: int, device: torch.device, data_dir: str,
 
     return np.mean(times)
 
+
 @click.command()
 @click.option("--num-batches", type=int, default=100, help="Number of batches to time")
 @click.option("--data-dir", type=str, default=None, help="Data directory")
 @click.option("--batch-size", type=int, default=512, help="Batch size")
-
 def main(num_batches: int, data_dir: str, batch_size: int):
     # Test with different worker counts
     num_runs = 1
@@ -62,11 +63,14 @@ def main(num_batches: int, data_dir: str, batch_size: int):
     for num_workers in [0, 1, 2, 4]:
         ans = []
         for _ in range(num_runs):
-            elapsed_ms = test_dataloader_speed(num_batches=num_batches, device=device, data_dir=data_dir, batch_size=batch_size)
+            elapsed_ms = test_dataloader_speed(
+                num_batches=num_batches, device=device, data_dir=data_dir, batch_size=batch_size
+            )
             ans.append(elapsed_ms)
         print(
             f"num_workers={num_workers} => avg data loading time per batch: {np.mean(ans):.3f} ms (+- {np.std(ans):.3f} ms over {num_runs} runs)"
         )
+
 
 if __name__ == "__main__":
     main()

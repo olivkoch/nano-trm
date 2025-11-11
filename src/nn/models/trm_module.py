@@ -10,8 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.nn.utils.constants import IGNORE_LABEL_ID
 from src.nn.modules.utils import compute_lr
+from src.nn.utils.constants import IGNORE_LABEL_ID
 
 try:
     from adam_atan2 import AdamATan2
@@ -176,27 +176,27 @@ class TRMModule(LightningModule):
         """Called by Lightning when setting up the model."""
         if stage == "fit":
             # Calculate steps from dataset and epochs
-            if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule is not None:
+            if hasattr(self.trainer, "datamodule") and self.trainer.datamodule is not None:
                 train_loader = self.trainer.datamodule.train_dataloader()
                 steps_per_epoch = len(train_loader)
             else:
                 # Fallback: estimate from limit_train_batches if datamodule not available
                 steps_per_epoch = self.trainer.num_training_batches
-            
+
             # Compute total steps from epochs
             if self.trainer.max_epochs > 0:
                 computed_total_steps = steps_per_epoch * self.trainer.max_epochs
             else:
                 # If max_epochs not set, use a large number
-                computed_total_steps = float('inf')
-            
+                computed_total_steps = float("inf")
+
             # Take minimum of max_steps and computed steps
             if self.trainer.max_steps > 0:
                 self.total_steps = min(self.trainer.max_steps, computed_total_steps)
             else:
                 self.total_steps = computed_total_steps
-            
-            log.info(f"Training configuration:")
+
+            log.info("Training configuration:")
             log.info(f"  Steps per epoch: {steps_per_epoch}")
             log.info(f"  Max epochs: {self.trainer.max_epochs}")
             log.info(f"  Computed total steps: {computed_total_steps}")
@@ -406,6 +406,7 @@ class TRMModule(LightningModule):
         Each sequence can run up to N_supervision (halt_max_steps) times.
         """
         import time
+
         t0 = time.time()
 
         # if self.last_step_time is not None:
@@ -441,13 +442,13 @@ class TRMModule(LightningModule):
 
         # Learning rate scheduling with warmup
         current_step = self.manual_step
-        total_steps = getattr(self, 'total_steps', self.hparams.max_steps)
+        total_steps = getattr(self, "total_steps", self.hparams.max_steps)
 
         # Base learning rates for each optimizer
         base_lrs = [self.hparams.learning_rate]
         if len(opts) > 1:  # If we have puzzle embedding optimizer
             base_lrs.append(self.hparams.learning_rate_emb)
-        
+
         # Compute learning rate for this step
         for opt, base_lr in zip(opts, base_lrs):
             if current_step < self.hparams.warmup_steps:
@@ -461,19 +462,19 @@ class TRMModule(LightningModule):
             else:
                 # Constant LR after warmup (you can add decay here if needed)
                 lr_this_step = base_lr
-            
+
             # Update learning rate
             if hasattr(opt, "_optimizer"):
                 for param_group in opt._optimizer.param_groups:
-                    param_group['lr'] = lr_this_step
+                    param_group["lr"] = lr_this_step
                 opt._optimizer.step()
                 opt._optimizer.zero_grad()
             else:
                 for param_group in opt.param_groups:
-                    param_group['lr'] = lr_this_step
+                    param_group["lr"] = lr_this_step
                 opt.step()
                 opt.zero_grad()
-        
+
         # Log learning rate (will log the last optimizer's LR)
         self.log("train/lr", lr_this_step, on_step=True)
 

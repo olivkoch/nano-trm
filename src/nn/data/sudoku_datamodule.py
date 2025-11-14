@@ -18,7 +18,10 @@ import torch
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader, Dataset
 
+from src.nn.utils import RankedLogger
 from src.nn.utils.constants import IGNORE_LABEL_ID
+
+log = RankedLogger(__name__, rank_zero_only=True)
 
 
 def puzzle_hash(puzzle: np.ndarray) -> str:
@@ -152,6 +155,7 @@ class SudokuDataset(Dataset):
 
     def __getitem__(self, idx):
         """Get a single sample."""
+
         if self.mode == "generation":
             # Get puzzle from pool using split-specific index
             pool_idx = self.split_indices[idx]
@@ -457,6 +461,10 @@ class SudokuDataModule(LightningDataModule):
         self.seed = seed
         self.pad_value = pad_value
 
+        log.info(
+            f"Loading Sudoku DataModule with data_dir={data_dir} {os.path.exists(data_dir) if data_dir else ''}"
+        )
+
         # Determine mode
         self.mode = "loading" if data_dir is not None else "generation"
 
@@ -476,17 +484,17 @@ class SudokuDataModule(LightningDataModule):
                 self.num_val_puzzles = metadata.get("num_val", num_val_puzzles)
                 self.num_test_puzzles = metadata.get("num_test", num_test_puzzles)
 
-                print(f"✓ Loaded metadata from {data_dir}/metadata.json")
-                print(f"  Grid size: {self.grid_size}x{self.grid_size}")
-                print(f"  Max grid size: {self.max_grid_size}x{self.max_grid_size}")
-                print(f"  Vocab size: {self.vocab_size}")
-                print(f"  Sequence length: {self.seq_len}")
-                print(
+                log.info(f"✓ Loaded metadata from {data_dir}/metadata.json")
+                log.info(f"  Grid size: {self.grid_size}x{self.grid_size}")
+                log.info(f"  Max grid size: {self.max_grid_size}x{self.max_grid_size}")
+                log.info(f"  Vocab size: {self.vocab_size}")
+                log.info(f"  Sequence length: {self.seq_len}")
+                log.info(
                     f"  Train/Val/Test: {self.num_train_puzzles}/{self.num_val_puzzles}/{self.num_test_puzzles}"
                 )
             else:
                 # Fallback to provided parameters
-                print(f"⚠ Could not load metadata from {data_dir}, using provided parameters")
+                log.warning(f"⚠ Could not load metadata from {data_dir}, using provided parameters")
                 self.grid_size = grid_size
                 self.max_grid_size = max_grid_size if max_grid_size is not None else grid_size + 2
                 self.num_train_puzzles = num_train_puzzles

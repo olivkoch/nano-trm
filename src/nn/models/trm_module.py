@@ -68,6 +68,7 @@ class TRMModule(LightningModule):
         H_cycles: int = 3,
         L_cycles: int = 6,
         N_supervision: int = 16,
+        N_supervision_val: int = 16,
         ffn_expansion: int = 2,
         learning_rate: float = 1e-4,
         learning_rate_emb: float = 1e-2,
@@ -280,12 +281,12 @@ class TRMModule(LightningModule):
         z_H, z_L = carry.z_H, carry.z_L
         # H_cycles-1 without grad
         with torch.no_grad():
-            for _H_step in range(self.hparams.H_cycles - 1):
-                for _L_step in range(self.hparams.L_cycles):
+            for _ in range(self.hparams.H_cycles - 1):
+                for _ in range(self.hparams.L_cycles):
                     z_L = self.lenet(z_L, z_H + input_embeddings, **seq_info)
                 z_H = self.lenet(z_H, z_L, **seq_info)
         # 1 with grad
-        for _L_step in range(self.hparams.L_cycles):
+        for _ in range(self.hparams.L_cycles):
             z_L = self.lenet(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.lenet(z_H, z_L, **seq_info)
 
@@ -324,7 +325,11 @@ class TRMModule(LightningModule):
         with torch.no_grad():
             # Step
             new_steps = new_steps + 1
-            is_last_step = new_steps >= self.hparams.N_supervision
+            n_supervision_steps = (
+                self.hparams.N_supervision if self.training else self.hparams.N_supervision_val
+            )
+
+            is_last_step = new_steps >= n_supervision_steps
 
             halted = is_last_step
 
@@ -409,8 +414,11 @@ class TRMModule(LightningModule):
 
         t0 = time.time()
 
+        # monitor time since last step, this could be high if a validation occurred
         # if self.last_step_time is not None:
-        #     print(f"Time since last training step: {time.time() - self.last_step_time:.4f} s")
+        #     delta = time.time() - self.last_step_time
+        #     if delta > 0.2:
+        #         print(f"WARNING: Time since last training step is long: {delta:.4f} s")
 
         batch_size = batch["input"].shape[0]
 
@@ -591,12 +599,13 @@ class TRMModule(LightningModule):
 
     def on_validation_epoch_start(self):
         """Don't interfere with training carry during validation."""
-        # Note: We DON'T reset self.carry here because that's for training
+        pass
+
+    def on_validation_epoch_end(self):
+        """Don't interfere with training carry during validation."""
         pass
 
     def on_train_epoch_start(self):
-        """Reset carry at the beginning of each training epoch."""
-        # self.carry = None
         pass
 
     def configure_optimizers(self):

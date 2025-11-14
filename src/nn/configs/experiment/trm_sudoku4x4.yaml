@@ -10,7 +10,7 @@ defaults:
 tags: ["arc", "trm"]
 
 timekeeping:
-  max_epochs: 300
+  max_epochs: 100
   batch_size: 512
   num_workers: 0
 
@@ -21,6 +21,7 @@ model_tuning:
   num_heads: 2
   halt_exploration_prob: 0.0
   N_supervision: 4
+  N_supervision_val: 4
   H_cycles: 2
   L_cycles: 2
   num_layers: 1

@@ -10,19 +10,20 @@ defaults:
 tags: ["arc", "trm"]
 
 timekeeping:
-  max_epochs: 3000
+  max_epochs: 750
   batch_size: 768
   num_workers: 0
 
 model_tuning:
   learning_rate: 1e-3
   learning_rate_emb: 1e-2
-  warmup_steps: 200
+  warmup_steps: 2000
   weight_decay: 0.1
   lr_min_ratio: 1.0
   num_heads: 2
   halt_exploration_prob: 0.0
   N_supervision: 4
+  N_supervision_val: 12
   H_cycles: 2
   L_cycles: 2
   num_layers: 1
@@ -35,7 +36,8 @@ model_tuning:
 
 trainer:
   # accumulate_grad_batches: 1
-  val_check_interval: 1
+  # val_check_interval: 1000
+  check_val_every_n_epoch: 10
   # log_every_n_steps: 10
   # accelerator: cpu
 

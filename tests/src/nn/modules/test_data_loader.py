@@ -14,9 +14,8 @@ def test_dataloader_speed(
     # Create your datamodule
     dm = SudokuDataModule(
         batch_size=batch_size,
-        num_workers=4,  # Test with different values
+        num_workers=0,  # Test with different values
         data_dir=data_dir,
-        generate_on_fly=data_dir is None,
     )
     dm.setup("fit")
 
@@ -49,7 +48,7 @@ def test_dataloader_speed(
 @click.option("--batch-size", type=int, default=512, help="Batch size")
 def main(num_batches: int, data_dir: str, batch_size: int):
     # Test with different worker counts
-    num_runs = 1
+    num_runs = 10
 
     if torch.cuda.is_available():
         device = torch.device("cuda")

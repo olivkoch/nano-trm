@@ -1,0 +1,77 @@
+# @package _global_
+# Connect Four self-play training experiment
+defaults:
+  - override /data: connectfour
+  - override /model: trm_c4
+  - override /callbacks: default
+  - override /trainer: gpu
+
+tags: ["connectfour", "trm", "self-play"]
+
+task_name: "train_c4"
+
+# Experiment tracking
+seed: 42
+timekeeping:
+
+# Training configuration
+max_epochs: 100
+batch_size: 256
+num_workers: 4
+
+# Model tuning parameters (for TRM base)
+model_tuning:
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-3
+  warmup_steps: 1000
+  weight_decay: 0.01
+  lr_min_ratio: 0.1
+  num_heads: 4
+  halt_exploration_prob: 0.2
+  N_supervision: 6
+  N_supervision_val: 6
+  H_cycles: 2
+  L_cycles: 4
+  num_layers: 4
+  max_steps: 0
+  puzzle_emb_dim: 128
+  puzzle_emb_len: 4
+  hidden_size: 256
+  ffn_expansion: 2
+  rope_theta: 10000
+
+# Connect Four specific parameters
+c4_tuning:
+  # Self-play
+  games_per_iteration: 25
+  buffer_size: 50000
+  mcts_simulations: 50
+  mcts_c_puct: 1.5
+  mcts_temperature: 1.0
+  trm_iterations_per_eval: 3
+  
+  # Loss weights
+  policy_loss_weight: 1.0
+  value_loss_weight: 0.5
+  trm_loss_weight: 0.1
+  
+  # Evaluation
+  eval_games_vs_random: 20
+  eval_every_n_val_epochs: 1  # Run game evaluation every validation epoch
+
+trainer:
+  accumulate_grad_batches: 1
+  val_check_interval: 1000
+  check_val_every_n_epoch: null
+  log_every_n_steps: 50
+  gradient_clip_val: 1.0
+
+# Paths
+save_dir: /tmp/ml-experiments/connectfour
+append_wandb_name_to_save_dir: true
+
+# Logger
+logger:
+  wandb:
+    project: "trm-connectfour"
+    tags: ${tags}

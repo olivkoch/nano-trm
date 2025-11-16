@@ -1,6 +1,5 @@
 # @package _global_
 
-# Fairness-aware detection using multiple fairness losses
 defaults:
   - override /data: sudoku6x6
   - override /model: trm
@@ -21,9 +20,9 @@ model_tuning:
   weight_decay: 0.1
   lr_min_ratio: 1.0
   num_heads: 2
-  halt_exploration_prob: 0.0
-  N_supervision: 4
-  N_supervision_val: 12
+  halt_exploration_prob: 0.1
+  N_supervision: 6
+  N_supervision_val: 6
   H_cycles: 2
   L_cycles: 2
   num_layers: 1

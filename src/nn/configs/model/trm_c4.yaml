@@ -1,6 +1,4 @@
-# @package _global_
-
-_target_: src.nn.modules.trm_c4_module.TRMConnectFourModule
+_target_: src.nn.models.trm_c4_module.TRMConnectFourModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
 
 # TRM base architecture (uses model_tuning from experiment config)

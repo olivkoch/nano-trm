@@ -1,6 +1,4 @@
-# @package _global_
-
-_target_: src.data.connectfour_datamodule.ConnectFourDataModule
+_target_: src.nn.data.connectfour_datamodule.ConnectFourDataModule
 _recursive_: false
 
 batch_size: ${timekeeping.batch_size}

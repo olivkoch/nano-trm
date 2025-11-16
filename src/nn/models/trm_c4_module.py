@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from lightning import LightningModule
 from typing import Dict, List, Optional, Tuple
 
-from src.nn.modules.trm_module import TRMModule
+from src.nn.models.trm_module import TRMModule
 from src.nn.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -55,8 +55,8 @@ class TRMConnectFourModule(LightningModule):
         warmup_steps: int = 1000,
         max_steps: int = 100000,
         halt_exploration_prob: float = 0.2,
-        puzzle_emb_dim: int = 128,
-        puzzle_emb_len: int = 4,
+        puzzle_emb_dim: int = 0,  # DISABLE puzzle embeddings for Connect Four
+        puzzle_emb_len: int = 0,  # We don't need puzzle-specific embeddings for C4
         rope_theta: int = 10000,
         lr_min_ratio: float = 0.1,
         vocab_size: int = 4,
@@ -96,7 +96,8 @@ class TRMConnectFourModule(LightningModule):
         # CRITICAL: Manual optimization (same as base TRM)
         self.automatic_optimization = False
         
-        # Create base TRM
+        # Create base TRM with proper initialization
+        # Important: Set batch_size for sparse embeddings initialization
         self.base_trm = TRMModule(
             hidden_size=hidden_size,
             num_layers=num_layers,
@@ -119,7 +120,7 @@ class TRMConnectFourModule(LightningModule):
             lr_min_ratio=lr_min_ratio,
             vocab_size=vocab_size,
             num_puzzles=num_puzzles,
-            batch_size=batch_size,
+            batch_size=batch_size,  # Critical for sparse embeddings
             pad_value=pad_value,
             seq_len=seq_len,
             output_dir=output_dir
@@ -167,19 +168,31 @@ class TRMConnectFourModule(LightningModule):
         if state_tensor.dim() == 1:
             state_tensor = state_tensor.unsqueeze(0)
         
-        # Create batch for TRM
+        batch_size = state_tensor.shape[0]
+        
+        # Create batch for TRM with proper dimensions
         batch = {
             'input': state_tensor.to(self.device),
             'output': torch.zeros_like(state_tensor).to(self.device),
-            'puzzle_identifiers': torch.zeros(1, dtype=torch.long, device=self.device)
+            'puzzle_identifiers': torch.zeros(batch_size, dtype=torch.long, device=self.device)
         }
         
         # Initialize carry and run TRM
         carry = self.base_trm.initial_carry(batch)
         carry, trm_outputs = self.base_trm(carry, batch)
         
-        # Extract hidden state from first position
-        hidden_state = carry.inner_carry.z_H[:, 0]
+        # Extract hidden state from first token position
+        # When puzzle_emb_len = 0, we use the first position directly
+        if hasattr(self.base_trm, 'puzzle_emb_len') and self.base_trm.puzzle_emb_len > 0:
+            # Use the first position after puzzle embeddings
+            hidden_state = carry.inner_carry.z_H[:, self.base_trm.puzzle_emb_len]
+        else:
+            # No puzzle embeddings, use first position
+            hidden_state = carry.inner_carry.z_H[:, 0]
+        
+        # Ensure hidden_state has correct shape
+        if hidden_state.dim() == 1:
+            hidden_state = hidden_state.unsqueeze(0)
         
         # Get policy and value
         policy_logits = self.policy_head(hidden_state).squeeze(0)
@@ -194,12 +207,13 @@ class TRMConnectFourModule(LightningModule):
         policy = F.softmax(policy_logits, dim=-1)
         
         return policy, value.item()
+    
     def setup(self, stage: str):
         """Setup called by Lightning"""
         if stage == "fit":
             # Import here to avoid circular dependencies
-            from connectfour_env import ConnectFourEnv
-            from trm_mcts import TRM_MCTS
+            from src.nn.environments.connectfour_env import ConnectFourEnv
+            from src.nn.modules.trm_mcts import TRM_MCTS
             
             # Create game environment
             self.game_env = ConnectFourEnv(device=self.device)
@@ -481,7 +495,7 @@ class TRMConnectFourModule(LightningModule):
         if self.mcts is None:
             return
         
-        from connectfour_env import ConnectFourEnv
+        from src.nn.environments.connectfour_env import ConnectFourEnv
         
         wins = 0
         for game in range(self.hparams.eval_games_vs_random):

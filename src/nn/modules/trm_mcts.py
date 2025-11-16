@@ -9,7 +9,7 @@ from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass, field
 import numpy as np
 
-from connectfour_env import ConnectFourEnv, ConnectFourState
+from src.nn.environments.connectfour_env import ConnectFourEnv, ConnectFourState
 
 
 @dataclass
@@ -50,18 +50,18 @@ class MCTSNode:
 
 
 class TRM_MCTS:
-    """MCTS that uses TRM's recursive reasoning"""
+    """MCTS that uses TRM's recursive reasoning directly"""
     
     def __init__(
         self,
-        trm_wrapper,  # TRMConnectFourWrapper
+        trm_model,  # TRMConnectFourModule directly
         c_puct: float = 1.5,
         num_simulations: int = 100,
         num_trm_iterations: int = 3,  # How many TRM iterations per evaluation
         device: str = "cpu",
         temperature: float = 1.0
     ):
-        self.trm_wrapper = trm_wrapper
+        self.trm_model = trm_model
         self.c_puct = c_puct
         self.num_simulations = num_simulations
         self.num_trm_iterations = num_trm_iterations
@@ -72,12 +72,11 @@ class TRM_MCTS:
         """Run MCTS simulations"""
         root = MCTSNode(state=root_state)
         
-        # Get initial evaluation
+        # Get initial evaluation using TRM's get_policy_value method
         state_tensor = root_state.to_trm_input()
-        policy, value = self.trm_wrapper.get_policy_value(
+        policy, value = self.trm_model.get_policy_value(
             state_tensor,
-            root_state.legal_moves,
-            num_iterations=self.num_trm_iterations
+            root_state.legal_moves
         )
         
         # Initialize root children with priors
@@ -131,15 +130,9 @@ class TRM_MCTS:
             # Use TRM for evaluation
             state_tensor = node.state.to_trm_input()
             
-            # More iterations for critical positions
-            num_iters = self.num_trm_iterations
-            if node.state.move_count > 20:  # Late game
-                num_iters = self.num_trm_iterations * 2
-            
-            policy, value = self.trm_wrapper.get_policy_value(
+            policy, value = self.trm_model.get_policy_value(
                 state_tensor,
-                node.state.legal_moves,
-                num_iterations=num_iters
+                node.state.legal_moves
             )
             
             # Expand node

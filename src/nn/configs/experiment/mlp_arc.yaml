@@ -1,6 +1,5 @@
 # @package _global_
 
-# Fairness-aware detection using multiple fairness losses
 defaults:
   - override /data: arc
   - override /model: mlp

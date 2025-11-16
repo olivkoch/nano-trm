@@ -1,0 +1,57 @@
+# @package _global_
+
+_target_: src.nn.modules.trm_c4_module.TRMConnectFourModule
+_recursive_: false  # Prevent recursive instantiation of nested configs
+
+# TRM base architecture (uses model_tuning from experiment config)
+ffn_expansion: ${model_tuning.ffn_expansion}
+hidden_size: ${model_tuning.hidden_size}
+num_layers: ${model_tuning.num_layers}
+num_heads: ${model_tuning.num_heads}
+N_supervision: ${model_tuning.N_supervision}
+N_supervision_val: ${model_tuning.N_supervision_val}
+learning_rate: ${model_tuning.learning_rate}
+H_cycles: ${model_tuning.H_cycles}
+L_cycles: ${model_tuning.L_cycles}
+learning_rate_emb: ${model_tuning.learning_rate_emb}
+weight_decay: ${model_tuning.weight_decay}
+halt_exploration_prob: ${model_tuning.halt_exploration_prob}
+warmup_steps: ${model_tuning.warmup_steps}
+max_steps: ${model_tuning.max_steps}
+puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
+puzzle_emb_len: ${model_tuning.puzzle_emb_len}
+rope_theta: ${model_tuning.rope_theta}
+lr_min_ratio: ${model_tuning.lr_min_ratio}
+
+# Connect Four specific architecture
+num_actions: 7
+board_rows: 6
+board_cols: 7
+
+# Self-play configuration (uses c4_tuning from experiment config)
+buffer_size: ${c4_tuning.buffer_size}
+games_per_iteration: ${c4_tuning.games_per_iteration}
+mcts_simulations: ${c4_tuning.mcts_simulations}
+mcts_c_puct: ${c4_tuning.mcts_c_puct}
+mcts_temperature: ${c4_tuning.mcts_temperature}
+trm_iterations_per_eval: ${c4_tuning.trm_iterations_per_eval}
+
+# Loss weights
+policy_loss_weight: ${c4_tuning.policy_loss_weight}
+value_loss_weight: ${c4_tuning.value_loss_weight}
+trm_loss_weight: ${c4_tuning.trm_loss_weight}
+
+# Evaluation
+eval_games_vs_random: ${c4_tuning.eval_games_vs_random}
+eval_every_n_val_epochs: ${c4_tuning.eval_every_n_val_epochs}
+
+# Output directory
+output_dir: None
+
+# Should be set from datamodule
+num_puzzles: 0  
+batch_size: 0
+pad_value: 0
+max_grid_size: 0 
+vocab_size: 0
+seq_len: 0

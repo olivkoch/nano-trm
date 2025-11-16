@@ -170,7 +170,7 @@ def train(cfg: DictConfig) -> Optional[float]:
     return None
 
 
-@hydra.main(version_base="1.3", config_path="./configs", config_name="train_c4.yaml")
+@hydra.main(version_base="1.3", config_path="./configs", config_name="train.yaml")
 def main(cfg: DictConfig):
     """
     Main entry point for Connect Four training.

@@ -18,7 +18,7 @@ To generate a Sudoku dataset: `./bash/generate_sudoku_data.sh`
 
 # Evaluation
 
-`uv run python src/nn/evaluate.py experiment=trm_sudoku4x4`
+`uv run python src/nn/evaluate.py +checkpoint=/tmp/ml-experiments/lunar-pine-174/checkpoints/last.ckpt +data_dir=./data/sudoku_4x4_small`
 
 # Visualization
 

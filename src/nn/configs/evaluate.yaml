@@ -4,7 +4,7 @@ defaults:
   - paths: default
 
 checkpoint: null
-data_dir: "data"
+data_dir: null
 device: cpu
 per_task: false
 output_dir: null  # Defaults to checkpoint_dir/evaluation_results

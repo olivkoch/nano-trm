@@ -24,3 +24,7 @@ To generate a Sudoku dataset: `./bash/generate_sudoku_data.sh`
 
 To visualize the results of a model, use `notebooks/neural_viewer.ipynb`
 
+# Comments / contributions
+
+Follow me on [X](https://x.com/olivkoch)
+

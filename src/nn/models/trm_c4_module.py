@@ -150,7 +150,7 @@ class TRMConnectFourModule(LightningModule):
         
         # Self-play components (initialized in setup)
         self.replay_buffer = deque(maxlen=buffer_size)
-        self.game_env = None
+        self.vec_env = None  # Vectorized environment for all games
         self.mcts = None
         
         # Metrics
@@ -207,29 +207,49 @@ class TRMConnectFourModule(LightningModule):
         policy = F.softmax(policy_logits, dim=-1)
         
         return policy, value.item()
-    
     def setup(self, stage: str):
         """Setup called by Lightning"""
         if stage == "fit":
             # Import here to avoid circular dependencies
-            from src.nn.environments.connectfour_env import ConnectFourEnv
-            from src.nn.modules.trm_mcts import TRM_MCTS
+            from src.nn.modules.batch_mcts import BatchMCTS
+            from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
             
-            # Create game environment
-            self.game_env = ConnectFourEnv(device=self.device)
+            # Create vectorized environment (even for single games)
+            self.vec_env = VectorizedConnectFour(
+                n_envs=max(8, self.hparams.games_per_iteration),
+                device=self.device
+            )
             
-            # Setup MCTS to use this module directly
-            self.mcts = TRM_MCTS(
-                trm_model=self,  # Pass self instead of a wrapper
+            # Setup Batch MCTS
+            self.mcts = BatchMCTS(
+                trm_model=self,
                 c_puct=self.hparams.mcts_c_puct,
                 num_simulations=self.hparams.mcts_simulations,
-                num_trm_iterations=self.hparams.trm_iterations_per_eval,
+                batch_size=8,  # Evaluate 8 positions at once
                 device=self.device,
-                temperature=self.hparams.mcts_temperature
+                temperature=self.hparams.mcts_temperature,
+                use_compile=True  # Enable torch.compile
             )
             
             # Call base TRM setup
             self.base_trm.setup(stage)
+            
+            # Compile the get_policy_value method for faster inference
+            if hasattr(torch, 'compile'):
+                try:
+                    # Note: We compile the underlying implementation, not the method directly
+                    log.info("Compiling model with torch.compile for faster inference...")
+                    compile_mode = "reduce-overhead" if self.device.type == "cuda" else "default"
+                    
+                    # Compile the forward pass of base TRM
+                    self.base_trm.forward = torch.compile(
+                        self.base_trm.forward,
+                        mode=compile_mode,
+                        disable=self.device.type == "mps"  # Disable on MPS as it may not be supported
+                    )
+                    log.info("Model compilation successful")
+                except Exception as e:
+                    log.info(f"Could not compile model (will run uncompiled): {e}")
     
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Forward pass through TRM and game heads"""
@@ -253,20 +273,50 @@ class TRMConnectFourModule(LightningModule):
     
     def self_play_game(self, temperature: float = 1.0) -> List[GameSample]:
         """Play one self-play game"""
-        env = self.game_env
-        state = env.reset()
+        # Reset first slot of vectorized environment
+        self.vec_env.reset(env_ids=torch.tensor([0], device=self.device))
         game_history = []
         
-        while not state.is_terminal:
-            # Get MCTS policy
-            policy = self.mcts.get_action_probabilities(state)
+        # Adaptive MCTS simulations - fewer at the start of training
+        adaptive_sims = min(
+            self.hparams.mcts_simulations,
+            5 + self.total_games_played // 100  # Start with 5, increase gradually
+        )
+        
+        # Use the existing batch MCTS with adaptive simulations
+        from src.nn.modules.batch_mcts import BatchMCTS
+        mcts = BatchMCTS(
+            self,
+            c_puct=self.hparams.mcts_c_puct,
+            num_simulations=adaptive_sims,
+            batch_size=min(8, adaptive_sims),
+            device=self.device,
+            temperature=temperature,
+            use_compile=False  # Already compiled in setup
+        )
+        
+        while not self.vec_env.is_terminal[0]:
+            # Get current state for first environment only
+            from src.nn.environments.vectorized_c4_env import VectorizedC4State
+            state = VectorizedC4State(
+                boards=self.vec_env.boards[:1],
+                current_players=self.vec_env.current_players[:1],
+                move_counts=self.vec_env.move_counts[:1],
+                winners=self.vec_env.winners[:1],
+                is_terminal=self.vec_env.is_terminal[:1],
+                legal_moves=(self.vec_env.boards[:1, 0, :] == 0)  # Top row empty = legal
+            )
+            
+            # Get MCTS policy using the adaptive mcts
+            policy = mcts.get_action_probabilities(state)
             
             # Store position
+            state_tensor = state.to_trm_input()[0]  # Get first env's tensor
             game_history.append({
-                'state': state.to_trm_input(),
+                'state': state_tensor,
                 'policy': policy,
-                'player': state.current_player,
-                'move_count': state.move_count
+                'player': state.current_players[0].item(),
+                'move_count': state.move_counts[0].item()
             })
             
             # Select and make move
@@ -275,12 +325,16 @@ class TRMConnectFourModule(LightningModule):
             else:
                 action = torch.argmax(policy).item()
             
-            state = env.make_move(action)
+            # Step only first environment
+            actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)
+            actions[0] = action
+            self.vec_env.step(actions)
         
         # Determine outcome
-        if state.winner == 1:
+        winner = self.vec_env.winners[0].item()
+        if winner == 1:
             outcomes = {1: 1.0, 2: -1.0}
-        elif state.winner == 2:
+        elif winner == 2:
             outcomes = {1: -1.0, 2: 1.0}
         else:
             outcomes = {1: 0.0, 2: 0.0}
@@ -304,15 +358,219 @@ class TRMConnectFourModule(LightningModule):
         
         log.info(f"Collecting {self.hparams.games_per_iteration} self-play games...")
         
-        for _ in range(self.hparams.games_per_iteration):
-            # Vary temperature for diversity
-            temp = self.hparams.mcts_temperature if self.total_games_played % 4 != 0 else 0.5
+        # Use vectorized or sequential based on number of games
+        if self.hparams.games_per_iteration >= 8:
+            # Vectorized self-play for many games
+            self.vectorized_self_play()
+        else:
+            # Sequential for few games
+            use_fast_policy = self.trainer.current_epoch < 2
             
-            samples = self.self_play_game(temperature=temp)
-            self.replay_buffer.extend(samples)
-            self.total_games_played += 1
+            for game_idx in range(self.hparams.games_per_iteration):
+                temp = self.hparams.mcts_temperature if self.total_games_played % 4 != 0 else 0.5
+                
+                if use_fast_policy and game_idx > self.hparams.games_per_iteration // 2:
+                    samples = self.fast_self_play_game(temperature=temp)
+                else:
+                    samples = self.self_play_game(temperature=temp)
+                
+                self.replay_buffer.extend(samples)
+                self.total_games_played += 1
         
         log.info(f"Buffer size: {len(self.replay_buffer)} positions")
+    
+    def vectorized_self_play(self):
+        """Generate multiple games in parallel using vectorized environment"""
+
+        log.info("Using vectorized self-play for multiple games...")
+        
+        n_parallel = min(8, self.hparams.games_per_iteration)
+        n_batches = (self.hparams.games_per_iteration + n_parallel - 1) // n_parallel
+        
+        for batch_idx in range(n_batches):
+            n_games = min(n_parallel, self.hparams.games_per_iteration - batch_idx * n_parallel)
+            
+            # Reset environments for this batch (only first n_games if needed)
+            if n_games < self.vec_env.n_envs:
+                # Only use first n_games environments
+                states = self.vec_env.get_state()
+                # Mark unused environments as terminal so we ignore them
+                self.vec_env.is_terminal[n_games:] = True
+                states = self.vec_env.get_state()
+            else:
+                states = self.vec_env.reset()
+            
+            # Storage for game histories
+            game_histories = [[] for _ in range(n_games)]
+            
+            # Play games until all are terminal (only first n_games)
+            while not states.is_terminal[:n_games].all():
+                active = ~states.is_terminal[:n_games]
+                
+                if not active.any():
+                    break
+                
+                # Get policies for all active games in parallel
+                active_indices = active.nonzero(as_tuple=True)[0]
+                
+                if len(active_indices) > 0:
+                    # Prepare states for active games
+                    active_states = states.boards[active_indices]
+                    state_tensors = (active_states.flatten(1) + 1).long()  # Convert to tokens
+                    legal_moves = states.legal_moves[active_indices]
+                    
+                    # Batch evaluate with MCTS or direct policy
+                    if self.trainer.current_epoch < 2 and batch_idx % 2 == 0:
+                        # Fast: Use direct policy for early training
+                        # Note: get_policy_value_batch is the batch version from BatchMCTS
+                        if hasattr(self.mcts, 'get_policy_value_batch'):
+                            policies, values = self.mcts.get_policy_value_batch(state_tensors, legal_moves)
+                        else:
+                            # Fallback to individual evaluation
+                            policies = []
+                            for i in range(len(state_tensors)):
+                                policy, _ = self.get_policy_value(state_tensors[i], legal_moves[i])
+                                policies.append(policy)
+                            policies = torch.stack(policies)
+                        
+                        # Select actions
+                        if self.hparams.mcts_temperature > 0:
+                            actions_active = torch.multinomial(policies, 1).squeeze(-1)
+                        else:
+                            actions_active = torch.argmax(policies, dim=-1)
+                    else:
+                        # Full MCTS for better policies
+                        policies = []
+                        actions_active = []
+                        
+                        # Process each active game (could be further optimized)
+                        for i, env_id in enumerate(active_indices):
+                            # Create single state for MCTS using vectorized format
+                            from src.nn.environments.vectorized_c4_env import VectorizedC4State
+                            single_state = VectorizedC4State(
+                                boards=states.boards[env_id:env_id+1],
+                                current_players=states.current_players[env_id:env_id+1],
+                                move_counts=states.move_counts[env_id:env_id+1],
+                                winners=states.winners[env_id:env_id+1],
+                                is_terminal=states.is_terminal[env_id:env_id+1],
+                                legal_moves=states.legal_moves[env_id:env_id+1]
+                            )
+                            
+                            # Get MCTS policy
+                            policy = self.mcts.get_action_probabilities(single_state)
+                            policies.append(policy)
+                            
+                            # Select action
+                            if self.hparams.mcts_temperature > 0:
+                                action = torch.multinomial(policy, 1).item()
+                            else:
+                                action = torch.argmax(policy).item()
+                            actions_active.append(action)
+                        
+                        policies = torch.stack(policies) if policies else torch.zeros((0, 7))
+                        actions_active = torch.tensor(actions_active, device=self.device)
+                    
+                    # Store positions (only for games we're tracking)
+                    for i, env_id in enumerate(active_indices):
+                        if env_id < n_games:  # Safety check
+                            game_histories[env_id].append({
+                                'state': state_tensors[i],
+                                'policy': policies[i],
+                                'player': states.current_players[env_id].item(),
+                                'move_count': states.move_counts[env_id].item()
+                            })
+                
+                # Create full action tensor for all environments
+                actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)
+                if len(active_indices) > 0:
+                    actions[active_indices] = actions_active
+                
+                # Step all environments
+                states = self.vec_env.step(actions)
+            
+            # Process completed games and add to replay buffer
+            for env_id in range(n_games):
+                if len(game_histories[env_id]) == 0:
+                    continue
+                
+                # Determine outcome
+                winner = states.winners[env_id].item()
+                if winner == 1:
+                    outcomes = {1: 1.0, 2: -1.0}
+                elif winner == 2:
+                    outcomes = {1: -1.0, 2: 1.0}
+                else:
+                    outcomes = {1: 0.0, 2: 0.0}
+                
+                # Create samples
+                samples = []
+                for position in game_histories[env_id]:
+                    value = outcomes[position['player']]
+                    samples.append(GameSample(
+                        state=position['state'],
+                        policy_target=position['policy'],
+                        value_target=value,
+                        move_count=position['move_count']
+                    ))
+                
+                self.replay_buffer.extend(samples)
+                self.total_games_played += 1
+
+        log.info(f"Buffer size after vectorized self-play: {len(self.replay_buffer)} positions")
+    
+    def fast_self_play_game(self, temperature: float = 1.0) -> List[GameSample]:
+        """Fast self-play using just the policy network without MCTS"""
+        # Reset first slot of vectorized environment
+        self.vec_env.reset(env_ids=torch.tensor([0], device=self.device))
+        game_history = []
+        
+        while not self.vec_env.is_terminal[0]:
+            # Get current state tensor
+            state_tensor = (self.vec_env.boards[0].flatten() + 1).long()
+            legal_moves = legal_moves = self.vec_env.boards[0, 0, :] == 0  # Top row empty = legal
+            
+            # Get policy directly from network (no MCTS)
+            policy, value = self.get_policy_value(state_tensor, legal_moves)
+            
+            # Store position
+            game_history.append({
+                'state': state_tensor,
+                'policy': policy,
+                'player': self.vec_env.current_players[0].item(),
+                'move_count': self.vec_env.move_counts[0].item()
+            })
+            
+            # Select move
+            if temperature > 0:
+                action = torch.multinomial(policy, 1).item()
+            else:
+                action = torch.argmax(policy).item()
+            
+            # Step only first environment
+            actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)
+            actions[0] = action
+            self.vec_env.step(actions)
+        
+        # Convert to samples (same as regular self_play_game)
+        winner = self.vec_env.winners[0].item()
+        if winner == 1:
+            outcomes = {1: 1.0, 2: -1.0}
+        elif winner == 2:
+            outcomes = {1: -1.0, 2: 1.0}
+        else:
+            outcomes = {1: 0.0, 2: 0.0}
+        
+        samples = []
+        for position in game_history:
+            value = outcomes[position['player']]
+            samples.append(GameSample(
+                state=position['state'],
+                policy_target=position['policy'],
+                value_target=value,
+                move_count=position['move_count']
+            ))
+        
+        return samples
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Training step with manual optimization for Connect Four"""
@@ -495,25 +753,42 @@ class TRMConnectFourModule(LightningModule):
         if self.mcts is None:
             return
         
-        from src.nn.environments.connectfour_env import ConnectFourEnv
-        
         wins = 0
         for game in range(self.hparams.eval_games_vs_random):
-            env = ConnectFourEnv(device=self.device)
-            state = env.reset()
+            # Reset first slot of vectorized environment
+            self.vec_env.reset(env_ids=torch.tensor([0], device=self.device))
             
             model_player = 1 if game % 2 == 0 else 2
             
-            while not state.is_terminal:
-                if state.current_player == model_player:
+            while not self.vec_env.is_terminal[0]:
+                current_player = self.vec_env.current_players[0].item()
+                
+                if current_player == model_player:
+                    # Create state for MCTS
+                    from src.nn.environments.vectorized_c4_env import VectorizedC4State
+                    state = VectorizedC4State(
+                        boards=self.vec_env.boards[:1],
+                        current_players=self.vec_env.current_players[:1],
+                        move_counts=self.vec_env.move_counts[:1],
+                        winners=self.vec_env.winners[:1],
+                        is_terminal=self.vec_env.is_terminal[:1],
+                        legal_moves=(self.vec_env.boards[:1, 0, :] == 0)  # Top row empty = legal
+                    )
                     action = self.mcts.select_action(state, deterministic=True)
                 else:
-                    legal_actions = state.legal_moves.nonzero(as_tuple=True)[0]
+                    # Random player
+                    legal_moves = self.vec_env.boards[0, 0, :] == 0  # Top row empty = legal
+                    legal_actions = legal_moves.nonzero(as_tuple=True)[0]
                     action = legal_actions[torch.randint(len(legal_actions), (1,))].item()
                 
-                state = env.make_move(action)
+                # Make move
+                actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)
+                actions[0] = action
+                self.vec_env.step(actions)
             
-            if state.winner == model_player:
+            # Check winner
+            winner = self.vec_env.winners[0].item()
+            if winner == model_player:
                 wins += 1
         
         win_rate = wins / self.hparams.eval_games_vs_random

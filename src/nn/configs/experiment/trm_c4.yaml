@@ -1,5 +1,5 @@
 # @package _global_
-
+# Connect Four self-play training experiment
 defaults:
   - override /data: connectfour
   - override /model: trm_c4
@@ -12,8 +12,9 @@ task_name: "train_c4"
 
 # Experiment tracking
 seed: 42
+
+# Training configuration
 timekeeping:
-  # Training configuration
   max_epochs: 100
   batch_size: 256
   num_workers: 4
@@ -33,8 +34,8 @@ model_tuning:
   L_cycles: 4
   num_layers: 4
   max_steps: 0
-  puzzle_emb_dim: 0
-  puzzle_emb_len: 0
+  puzzle_emb_dim: 0  # Disabled for C4 - not needed for self-play
+  puzzle_emb_len: 0  # Disabled for C4 - positions are unique
   hidden_size: 256
   ffn_expansion: 2
   rope_theta: 10000
@@ -42,12 +43,12 @@ model_tuning:
 # Connect Four specific parameters
 c4_tuning:
   # Self-play
-  games_per_iteration: 25
+  games_per_iteration: 5
   buffer_size: 50000
-  mcts_simulations: 50
+  mcts_simulations: 10  # Reduced from 50 for faster self-play
   mcts_c_puct: 1.5
   mcts_temperature: 1.0
-  trm_iterations_per_eval: 3
+  trm_iterations_per_eval: 1  # Reduced from 3 - one forward pass is enough
   
   # Loss weights
   policy_loss_weight: 1.0

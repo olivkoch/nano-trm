@@ -9,14 +9,16 @@ defaults:
 tags: ["arc", "trm"]
 
 timekeeping:
-  max_epochs: 100
+  max_epochs: 10
   batch_size: 512
   num_workers: 0
 
 model_tuning:
-  learning_rate: 1e-3
-  learning_rate_emb: 1e-2
-  weight_decay: 0.0
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-3
+  weight_decay: 0.1
+  warmup_steps: 10
+  lr_min_ratio: 1.0
   num_heads: 2
   halt_exploration_prob: 0.0
   N_supervision: 4
@@ -24,21 +26,16 @@ model_tuning:
   H_cycles: 2
   L_cycles: 2
   num_layers: 1
-  warmup_steps: 0
   max_steps: 0
   puzzle_emb_dim: 4
   puzzle_emb_len: 4
   hidden_size: 64
   ffn_expansion: 2
   rope_theta: 10000
-  lr_min_ratio: 1.0
 
 
 trainer:
-  # accumulate_grad_batches: 1
-  val_check_interval: 1
-  # log_every_n_steps: 10
-  # accelerator: cpu
+  check_val_every_n_epoch: 10
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

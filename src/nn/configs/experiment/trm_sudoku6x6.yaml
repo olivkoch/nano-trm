@@ -34,11 +34,7 @@ model_tuning:
   rope_theta: 10000
 
 trainer:
-  # accumulate_grad_batches: 1
-  # val_check_interval: 1000
   check_val_every_n_epoch: 10
-  # log_every_n_steps: 10
-  # accelerator: cpu
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

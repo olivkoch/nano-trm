@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Import your modules (adjust paths as needed)
-from src.nn.data.arc_datamodule import ARCTaskDataset, TRMTransform, collate_fn
+from src.nn.data.arc_datamodule import ARCTaskDataset, TRMTransform, collate_fn_with_puzzles
 from src.nn.models.mlp_module import ConvMLPModule
 from src.nn.models.trm_module import TRMModule
 
@@ -73,7 +73,7 @@ class ARCEvaluator:
             hparams = checkpoint["hyper_parameters"]
 
             # Determine which model class to use based on hyperparameters
-            if "n_latent_recursions" in hparams:
+            if "N_supervision" in hparams:
                 # TRM model
                 model = TRMModule.load_from_checkpoint(
                     self.checkpoint_path, map_location=self.device
@@ -127,7 +127,7 @@ class ARCEvaluator:
             shuffle=False,
             num_workers=0,  # Use 0 for evaluation to avoid issues
             pin_memory=True if self.device.type == "cuda" else False,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn_with_puzzles,
         )
 
         return dataloader

@@ -1,5 +1,5 @@
 defaults:
-  # - model_checkpoint
+  - model_checkpoint
   # - model_summary
   # - rich_progress_bar
   # - learning_rate_monitor

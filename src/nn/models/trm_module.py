@@ -518,6 +518,9 @@ class TRMModule(LightningModule):
                 early_halt_rate = avg_halt_steps < self.hparams.N_supervision
                 self.log("train/early_halt_rate", early_halt_rate, on_step=True)
 
+        # Assert LM loss is not NaN
+        assert not torch.isnan(metrics.get("lm_loss")), f"LM loss is NaN at step {self.manual_step}"
+
         t1 = time.time()
         # print(f"Training step time: {t1 - t0:.4f} s")
 

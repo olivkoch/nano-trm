@@ -7,7 +7,7 @@ import hydra
 import torch
 from omegaconf import DictConfig
 
-from src.nn.evaluator import ARCEvaluator
+from src.nn.sudoku_evaluator import SudokuEvaluator
 from src.nn.utils import (
     RankedLogger,
     extras,
@@ -36,7 +36,7 @@ def evaluate(cfg: DictConfig) -> Optional[float]:
     """
 
     # Initialize evaluator
-    evaluator = ARCEvaluator(
+    evaluator = SudokuEvaluator(
         checkpoint_path=cfg.checkpoint,
         data_dir=cfg.data_dir,
         batch_size=cfg.batch_size,

@@ -15,24 +15,24 @@ seed: 42
 
 # Training configuration
 timekeeping:
-  max_epochs: 100
+  max_epochs: 1000
   batch_size: 256
   num_workers: 4
 
 # Model tuning parameters (for TRM base)
 model_tuning:
-  learning_rate: 1e-4
-  learning_rate_emb: 1e-3
+  learning_rate: 1e-3
+  learning_rate_emb: 1e-2
   warmup_steps: 1000
-  weight_decay: 0.01
+  weight_decay: 0.1
   lr_min_ratio: 0.1
   num_heads: 4
   halt_exploration_prob: 0.2
-  N_supervision: 6
-  N_supervision_val: 6
+  N_supervision: 4
+  N_supervision_val: 4
   H_cycles: 2
-  L_cycles: 4
-  num_layers: 4
+  L_cycles: 2
+  num_layers: 1
   max_steps: 0
   puzzle_emb_dim: 0  # Disabled for C4 - not needed for self-play
   puzzle_emb_len: 0  # Disabled for C4 - positions are unique

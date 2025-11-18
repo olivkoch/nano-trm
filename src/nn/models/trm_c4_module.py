@@ -84,7 +84,7 @@ class TRMConnectFourModule(LightningModule):
         trm_loss_weight: float = 0.1,
         
         # Evaluation
-        eval_games_vs_random: int = 20,
+        eval_games_vs_baseline: int = 20,
         eval_every_n_val_epochs: int = 1,  # NEW: How often to run game evaluation during validation
         
         output_dir: str = None,
@@ -209,28 +209,31 @@ class TRMConnectFourModule(LightningModule):
         return policy, value.item()
     def setup(self, stage: str):
         """Setup called by Lightning"""
+        # Import here to avoid circular dependencies
+        from src.nn.modules.batch_mcts import BatchMCTS
+        from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
+        
+        # Create vectorized environment (even for single games)
+        self.vec_env = VectorizedConnectFour(
+            n_envs=max(8, self.hparams.games_per_iteration),
+            device=self.device
+        )
+        
+        # Setup Batch MCTS (used for vectorized play and evaluation)
+        # Note: Individual games in self_play_game create their own MCTS
+        # with adaptive parameters
+        self.mcts = BatchMCTS(
+            trm_model=self,
+            c_puct=self.hparams.mcts_c_puct,
+            num_simulations=self.hparams.mcts_simulations,
+            batch_size=8,  # Evaluate 8 positions at once
+            device=self.device,
+            temperature=self.hparams.mcts_temperature,
+            use_compile=True  # Enable torch.compile
+        )
+
         if stage == "fit":
-            # Import here to avoid circular dependencies
-            from src.nn.modules.batch_mcts import BatchMCTS
-            from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
-            
-            # Create vectorized environment (even for single games)
-            self.vec_env = VectorizedConnectFour(
-                n_envs=max(8, self.hparams.games_per_iteration),
-                device=self.device
-            )
-            
-            # Setup Batch MCTS
-            self.mcts = BatchMCTS(
-                trm_model=self,
-                c_puct=self.hparams.mcts_c_puct,
-                num_simulations=self.hparams.mcts_simulations,
-                batch_size=8,  # Evaluate 8 positions at once
-                device=self.device,
-                temperature=self.hparams.mcts_temperature,
-                use_compile=True  # Enable torch.compile
-            )
-            
+           
             # Call base TRM setup
             self.base_trm.setup(stage)
             
@@ -271,8 +274,9 @@ class TRMConnectFourModule(LightningModule):
             'carry': carry
         }
     
-    def self_play_game(self, temperature: float = 1.0) -> List[GameSample]:
+    def self_play_game(self, temperature: float = 1.0, verbose: bool = False) -> List[GameSample]:
         """Play one self-play game"""
+        print(f"Running self-play game with temperature={temperature}")
         # Reset first slot of vectorized environment
         self.vec_env.reset(env_ids=torch.tensor([0], device=self.device))
         game_history = []
@@ -283,21 +287,26 @@ class TRMConnectFourModule(LightningModule):
             5 + self.total_games_played // 100  # Start with 5, increase gradually
         )
         
-        # Use the existing batch MCTS with adaptive simulations
+        # Create a game-specific MCTS instance with adaptive parameters
+        # Note: We don't reuse self.mcts because:
+        # 1. Each game may need different temperature
+        # 2. Adaptive simulations change per game
+        # 3. Allows parallel game generation in future
         from src.nn.modules.batch_mcts import BatchMCTS
-        mcts = BatchMCTS(
+        game_mcts = BatchMCTS(
             self,
             c_puct=self.hparams.mcts_c_puct,
             num_simulations=adaptive_sims,
             batch_size=min(8, adaptive_sims),
             device=self.device,
-            temperature=temperature,
+            temperature=temperature,  # Game-specific temperature
             use_compile=False  # Already compiled in setup
         )
         
         while not self.vec_env.is_terminal[0]:
             # Get current state for first environment only
             from src.nn.environments.vectorized_c4_env import VectorizedC4State
+
             state = VectorizedC4State(
                 boards=self.vec_env.boards[:1],
                 current_players=self.vec_env.current_players[:1],
@@ -308,10 +317,10 @@ class TRMConnectFourModule(LightningModule):
             )
             
             # Get MCTS policy using the adaptive mcts
-            policy = mcts.get_action_probabilities(state)
+            policy = game_mcts.get_action_probabilities(state).to(self.device)
             
             # Store position
-            state_tensor = state.to_trm_input()[0]  # Get first env's tensor
+            state_tensor = state.to_trm_input()[0]  # Keep on device (MPS)
             game_history.append({
                 'state': state_tensor,
                 'policy': policy,
@@ -329,6 +338,9 @@ class TRMConnectFourModule(LightningModule):
             actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)
             actions[0] = action
             self.vec_env.step(actions)
+
+            if verbose:
+                print(self.vec_env.render(env_id=0))
         
         # Determine outcome
         winner = self.vec_env.winners[0].item()
@@ -339,7 +351,7 @@ class TRMConnectFourModule(LightningModule):
         else:
             outcomes = {1: 0.0, 2: 0.0}
         
-        # Convert to training samples
+        # Convert to training samples - keep on device
         samples = []
         for position in game_history:
             samples.append(GameSample(
@@ -381,8 +393,7 @@ class TRMConnectFourModule(LightningModule):
     
     def vectorized_self_play(self):
         """Generate multiple games in parallel using vectorized environment"""
-
-        log.info("Using vectorized self-play for multiple games...")
+        from src.nn.modules.batch_mcts import BatchMCTS
         
         n_parallel = min(8, self.hparams.games_per_iteration)
         n_batches = (self.hparams.games_per_iteration + n_parallel - 1) // n_parallel
@@ -416,7 +427,7 @@ class TRMConnectFourModule(LightningModule):
                 if len(active_indices) > 0:
                     # Prepare states for active games
                     active_states = states.boards[active_indices]
-                    state_tensors = (active_states.flatten(1) + 1).long()  # Convert to tokens
+                    state_tensors = (active_states.flatten(1) + 1).long()  # Keep on device
                     legal_moves = states.legal_moves[active_indices]
                     
                     # Batch evaluate with MCTS or direct policy
@@ -425,12 +436,13 @@ class TRMConnectFourModule(LightningModule):
                         # Note: get_policy_value_batch is the batch version from BatchMCTS
                         if hasattr(self.mcts, 'get_policy_value_batch'):
                             policies, values = self.mcts.get_policy_value_batch(state_tensors, legal_moves)
+                            # Keep policies on device
                         else:
                             # Fallback to individual evaluation
                             policies = []
                             for i in range(len(state_tensors)):
                                 policy, _ = self.get_policy_value(state_tensors[i], legal_moves[i])
-                                policies.append(policy)
+                                policies.append(policy)  # Keep on device
                             policies = torch.stack(policies)
                         
                         # Select actions
@@ -457,8 +469,8 @@ class TRMConnectFourModule(LightningModule):
                             )
                             
                             # Get MCTS policy
-                            policy = self.mcts.get_action_probabilities(single_state)
-                            policies.append(policy)
+                            policy = self.mcts.get_action_probabilities(single_state).to(self.device)
+                            policies.append(policy)  # Keep on device
                             
                             # Select action
                             if self.hparams.mcts_temperature > 0:
@@ -467,7 +479,7 @@ class TRMConnectFourModule(LightningModule):
                                 action = torch.argmax(policy).item()
                             actions_active.append(action)
                         
-                        policies = torch.stack(policies) if policies else torch.zeros((0, 7))
+                        policies = torch.stack(policies) if policies else torch.zeros((0, 7), device=self.device)
                         actions_active = torch.tensor(actions_active, device=self.device)
                     
                     # Store positions (only for games we're tracking)
@@ -515,8 +527,6 @@ class TRMConnectFourModule(LightningModule):
                 
                 self.replay_buffer.extend(samples)
                 self.total_games_played += 1
-
-        log.info(f"Buffer size after vectorized self-play: {len(self.replay_buffer)} positions")
     
     def fast_self_play_game(self, temperature: float = 1.0) -> List[GameSample]:
         """Fast self-play using just the policy network without MCTS"""
@@ -525,17 +535,18 @@ class TRMConnectFourModule(LightningModule):
         game_history = []
         
         while not self.vec_env.is_terminal[0]:
-            # Get current state tensor
+            # Get current state tensor (keep on device)
             state_tensor = (self.vec_env.boards[0].flatten() + 1).long()
-            legal_moves = legal_moves = self.vec_env.boards[0, 0, :] == 0  # Top row empty = legal
+            legal_moves = (self.vec_env.boards[0, 0, :] == 0)  # Keep on device
             
             # Get policy directly from network (no MCTS)
             policy, value = self.get_policy_value(state_tensor, legal_moves)
+            # Keep policy on device
             
-            # Store position
+            # Store position (both state and policy are on device)
             game_history.append({
-                'state': state_tensor,
-                'policy': policy,
+                'state': state_tensor,  # On device
+                'policy': policy,  # On device
                 'player': self.vec_env.current_players[0].item(),
                 'move_count': self.vec_env.move_counts[0].item()
             })
@@ -584,102 +595,101 @@ class TRMConnectFourModule(LightningModule):
         if len(self.replay_buffer) >= self.hparams.batch_size:
             import random
             samples = random.sample(self.replay_buffer, self.hparams.batch_size)
-            
-            # Convert to batch
-            states = torch.stack([s.state for s in samples]).to(self.device)
-            policy_targets = torch.stack([s.policy_target for s in samples]).to(self.device)
-            value_targets = torch.tensor([s.value_target for s in samples], 
-                                        dtype=torch.float32, device=self.device)
-            
-            # Create TRM batch
-            game_batch = {
-                'input': states,
-                'output': torch.zeros_like(states),  # Dummy
-                'puzzle_identifiers': torch.arange(self.hparams.batch_size, device=self.device)
-            }
-            
-            # Forward pass
-            outputs = self.forward(game_batch)
-            
-            # Compute game losses
-            policy_loss = F.kl_div(
-                F.log_softmax(outputs['policy_logits'], dim=-1),
-                policy_targets,
-                reduction='batchmean'
-            )
-            
-            value_loss = F.mse_loss(outputs['value'], value_targets)
-            
-            # Combine with TRM loss
-            carry = outputs['carry']
-            _, trm_loss, metrics, _ = self.base_trm.compute_loss_and_metrics(carry, game_batch)
-            trm_loss = trm_loss / self.hparams.batch_size
-            
-            # Total loss
-            total_loss = (
-                self.hparams.policy_loss_weight * policy_loss +
-                self.hparams.value_loss_weight * value_loss +
-                self.hparams.trm_loss_weight * trm_loss
-            )
-            
-            # Manual backward and optimization
-            total_loss.backward()
-            
-            # Clip gradients
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-            
-            # Learning rate scheduling (same as base TRM)
-            current_step = self.global_step
-            total_steps = self.trainer.max_steps if self.trainer.max_steps else 100000
-            
-            # Base learning rates
-            base_lrs = [self.hparams.learning_rate]
-            if len(opts) > 1:  # If we have sparse embedding optimizer
-                base_lrs.append(self.hparams.learning_rate_emb)
-            
-            # Apply learning rate schedule
-            from src.nn.modules.utils import compute_lr
-            for opt, base_lr in zip(opts, base_lrs):
-                if current_step < self.hparams.warmup_steps:
-                    lr_this_step = compute_lr(
-                        base_lr=base_lr,
-                        lr_warmup_steps=self.hparams.warmup_steps,
-                        lr_min_ratio=self.hparams.lr_min_ratio,
-                        current_step=current_step,
-                        total_steps=total_steps
-                    )
-                else:
-                    lr_this_step = base_lr
-                
-                # Update learning rate and step optimizer
-                if hasattr(opt, '_optimizer'):  # Sparse embedding optimizer
-                    for param_group in opt._optimizer.param_groups:
-                        param_group['lr'] = lr_this_step
-                    opt._optimizer.step()
-                    opt._optimizer.zero_grad()
-                else:  # Regular optimizer
-                    for param_group in opt.param_groups:
-                        param_group['lr'] = lr_this_step
-                    opt.step()
-                    opt.zero_grad()
-            
-            # Log metrics
-            self.log('train/lr', lr_this_step, on_step=True)
-            self.log('train/policy_loss', policy_loss, prog_bar=True)
-            self.log('train/value_loss', value_loss, prog_bar=True)
-            self.log('train/trm_loss', trm_loss)
-            self.log('train/total_loss', total_loss)
-            self.log('train/buffer_size', float(len(self.replay_buffer)))
-            self.log('train/total_games', float(self.total_games_played))
-            
         else:
-            # Fallback: if no self-play data, just do a forward pass for warmup
-            # Don't use base TRM's training_step as it would conflict
-            outputs = self.forward(batch)
-            total_loss = torch.tensor(0.0, device=self.device)
-            self.log('train/warmup', 1.0)
+            # Not enough samples yet, skip this training step
+            return {'loss': torch.tensor(0.0, device=self.device)}
+                
+        # Convert to batch - tensors should already be on device
+        states = torch.stack([s.state for s in samples])
+
+        policy_targets = torch.stack([s.policy_target for s in samples])
+        value_targets = torch.tensor([s.value_target for s in samples], 
+                                    dtype=torch.float32, device=self.device)
         
-        return total_loss
+        # Create TRM batch
+        game_batch = {
+            'input': states,
+            'output': torch.zeros_like(states),  # Dummy
+            'puzzle_identifiers': torch.arange(self.hparams.batch_size, device=self.device)
+        }
+        
+        # Forward pass
+        outputs = self.forward(game_batch)
+        
+        # Compute game losses
+        policy_loss = F.kl_div(
+            F.log_softmax(outputs['policy_logits'], dim=-1),
+            policy_targets,
+            reduction='batchmean'
+        )
+        
+        value_loss = F.mse_loss(outputs['value'], value_targets)
+        
+        # Combine with TRM loss
+        carry = outputs['carry']
+        _, trm_loss, metrics, _ = self.base_trm.compute_loss_and_metrics(carry, game_batch)
+        trm_loss = trm_loss / self.hparams.batch_size
+        
+        # Total loss
+        total_loss = (
+            self.hparams.policy_loss_weight * policy_loss +
+            self.hparams.value_loss_weight * value_loss +
+            self.hparams.trm_loss_weight * trm_loss
+        )
+        
+        # log.info(f"Training Step {self.global_step}: {policy_loss.item()=} {value_loss.item()=} {trm_loss.item()=} {total_loss.item()=}")
+
+        # Manual backward and optimization
+        total_loss.backward()
+        
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        
+        # Learning rate scheduling (same as base TRM)
+        current_step = self.global_step
+        total_steps = self.trainer.max_steps if self.trainer.max_steps else 100000
+        
+        # Base learning rates
+        base_lrs = [self.hparams.learning_rate]
+        if len(opts) > 1:  # If we have sparse embedding optimizer
+            base_lrs.append(self.hparams.learning_rate_emb)
+        
+        # Apply learning rate schedule
+        from src.nn.modules.utils import compute_lr
+        for opt, base_lr in zip(opts, base_lrs):
+            if current_step < self.hparams.warmup_steps:
+                lr_this_step = compute_lr(
+                    base_lr=base_lr,
+                    lr_warmup_steps=self.hparams.warmup_steps,
+                    lr_min_ratio=self.hparams.lr_min_ratio,
+                    current_step=current_step,
+                    total_steps=total_steps
+                )
+            else:
+                lr_this_step = base_lr
+            
+            # Update learning rate and step optimizer
+            if hasattr(opt, '_optimizer'):  # Sparse embedding optimizer
+                for param_group in opt._optimizer.param_groups:
+                    param_group['lr'] = lr_this_step
+                opt._optimizer.step()
+                opt._optimizer.zero_grad()
+            else:  # Regular optimizer
+                for param_group in opt.param_groups:
+                    param_group['lr'] = lr_this_step
+                opt.step()
+                opt.zero_grad()
+        
+        # Log metrics
+        self.log('train/lr', lr_this_step, on_step=True)
+        self.log('train/policy_loss', policy_loss, prog_bar=True)
+        self.log('train/value_loss', value_loss, prog_bar=True)
+        self.log('train/trm_loss', trm_loss)
+        self.log('train/total_loss', total_loss)
+        self.log('train/buffer_size', float(len(self.replay_buffer)))
+        self.log('train/total_games', float(self.total_games_played))
+        
+        return {'loss': total_loss}
     
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Validation step - evaluate model performance on self-play buffer"""
@@ -743,18 +753,112 @@ class TRMConnectFourModule(LightningModule):
         
         # Only run expensive game evaluation every N validation epochs
         if self.validation_epoch_count % self.hparams.eval_every_n_val_epochs == 0:
-            self.evaluate_vs_random()
+            self.evaluate_vs_minimax()
         else:
             # Log that we skipped evaluation this validation epoch
             self.log('val/eval_skipped', 1.0)
     
-    def evaluate_vs_random(self):
-        """Evaluate against random player"""
+    def evaluate_vs_minimax(self, minimax_depth: int = 4):
+        """
+        Evaluate model against minimax player.
+        
+        Args:
+            self: The Lightning module with vec_env and mcts
+            minimax_depth: Search depth for minimax (default 4)
+        
+        This function can be added as a method to your Lightning module,
+        just like evaluate_vs_random.
+        """
         if self.mcts is None:
             return
         
+        # Create minimax player
+        from src.nn.modules.minimax import SimpleMinimaxPlayer
+        minimax_player = SimpleMinimaxPlayer(depth=minimax_depth)
+        
         wins = 0
-        for game in range(self.hparams.eval_games_vs_random):
+        total_nodes = 0
+        
+        for game in range(self.hparams.eval_games_vs_baseline):  # Use same config
+            # Reset first environment
+            self.vec_env.reset(env_ids=torch.tensor([0], device=self.device))
+            
+            # Alternate who goes first
+            model_player = 1 if game % 2 == 0 else 2
+            
+            move_count = 0
+            
+            while not self.vec_env.is_terminal[0]:
+                current_player = self.vec_env.current_players[0].item()
+                
+                if current_player == model_player:
+                    # Model's turn using MCTS
+                    from src.nn.environments.vectorized_c4_env import VectorizedC4State
+                    state = VectorizedC4State(
+                        boards=self.vec_env.boards[:1],
+                        current_players=self.vec_env.current_players[:1],
+                        move_counts=self.vec_env.move_counts[:1],
+                        winners=self.vec_env.winners[:1],
+                        is_terminal=self.vec_env.is_terminal[:1],
+                        legal_moves=(self.vec_env.boards[:1, 0, :] == 0)
+                    )
+                    
+                    action = self.mcts.select_action(state, deterministic=True)
+                    
+                else:
+                    # Minimax player's turn
+                    # Create board representation for minimax
+                    board = minimax_player.create_board_from_env(self.vec_env, env_idx=0)
+                    
+                    # Get minimax move
+                    action = minimax_player.get_best_move(board, current_player)
+                    total_nodes += minimax_player.nodes_evaluated
+                    
+                    # Fallback to random if something goes wrong
+                    if action == -1:
+                        legal_moves = self.vec_env.boards[0, 0, :] == 0
+                        legal_actions = legal_moves.nonzero(as_tuple=True)[0]
+                        if len(legal_actions) > 0:
+                            action = legal_actions[torch.randint(len(legal_actions), (1,))].item()
+                
+                # Make the move
+                actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)
+                actions[0] = action
+                self.vec_env.step(actions)
+                
+                move_count += 1
+                if move_count > 42:  # Safety check
+                    break
+            
+            # Check winner
+            winner = self.vec_env.winners[0].item()
+            if winner == model_player:
+                wins += 1
+        
+        # Calculate and log results
+        win_rate = wins / self.hparams.eval_games_vs_baseline
+        avg_nodes = total_nodes / self.hparams.eval_games_vs_baseline
+        
+        # Log metrics
+        self.log(f'eval/win_rate_vs_minimax_d{minimax_depth}', win_rate, prog_bar=True)
+        self.log(f'eval/minimax_avg_nodes', avg_nodes)
+        
+        # Track best performance
+        if not hasattr(self, 'best_minimax_win_rate'):
+            self.best_minimax_win_rate = 0.0
+        
+        if win_rate > self.best_minimax_win_rate:
+            self.best_minimax_win_rate = win_rate
+            import logging
+            log = logging.getLogger(__name__)
+            log.info(f"New best win rate vs minimax (depth={minimax_depth}): {win_rate:.1%}")
+        
+        return win_rate
+        
+    def evaluate_vs_random(self):
+        """Evaluate model against random player"""
+        wins = 0
+        for game in range(self.hparams.eval_games_vs_baseline):
             # Reset first slot of vectorized environment
             self.vec_env.reset(env_ids=torch.tensor([0], device=self.device))
             
@@ -791,7 +895,7 @@ class TRMConnectFourModule(LightningModule):
             if winner == model_player:
                 wins += 1
         
-        win_rate = wins / self.hparams.eval_games_vs_random
+        win_rate = wins / self.hparams.eval_games_vs_baseline
         self.log('eval/win_rate_vs_random', win_rate, prog_bar=True)
         
         if win_rate > self.best_win_rate:
@@ -848,3 +952,11 @@ class TRMConnectFourModule(LightningModule):
             optimizers.append(sparse_opt)
         
         return optimizers
+    
+if __name__ == "__main__":
+    # Simple test to instantiate the model
+    model = TRMConnectFourModule(eval_games_vs_baseline=1)
+    log.info("Model instantiated successfully")
+    model.setup(stage="test")
+    print(f"running a game")
+    model.self_play_game(verbose=True)

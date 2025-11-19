@@ -84,6 +84,7 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = 0, valid_mask=No
 def compute_lr(
     base_lr: float, lr_warmup_steps: int, lr_min_ratio: float, current_step: int, total_steps: int
 ) -> float:
+    print(f"Computing LR at step {current_step} / {total_steps} with warmup {lr_warmup_steps} and total steps {total_steps}")
     return cosine_schedule_with_warmup_lr_lambda(
         current_step=current_step,
         base_lr=base_lr,

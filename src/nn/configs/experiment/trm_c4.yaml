@@ -1,7 +1,7 @@
 # @package _global_
 # Connect Four self-play training experiment
 defaults:
-  - override /data: connectfour
+  - override /data: dummy
   - override /model: trm_c4
   - override /callbacks: default
   - override /trainer: gpu
@@ -21,48 +21,45 @@ timekeeping:
 
 # Model tuning parameters (for TRM base)
 model_tuning:
-  learning_rate: 1e-3
-  learning_rate_emb: 1e-2
-  warmup_steps: 1000
-  weight_decay: 0.1
-  lr_min_ratio: 0.1
-  num_heads: 4
-  halt_exploration_prob: 0.2
-  N_supervision: 4
-  N_supervision_val: 4
-  H_cycles: 2
-  L_cycles: 2
-  num_layers: 1
-  max_steps: 0
-  puzzle_emb_dim: 0  # Disabled for C4 - not needed for self-play
-  puzzle_emb_len: 0  # Disabled for C4 - positions are unique
+  # TRM architecture
   hidden_size: 256
+  num_layers: 4
+  num_heads: 4
+  H_cycles: 2
+  L_cycles: 4
+  N_supervision: 6
+  N_supervision_val: 6
   ffn_expansion: 2
-  rope_theta: 10000
 
-# Connect Four specific parameters
+  # Optimization
+  learning_rate: 3e-4
+  learning_rate_emb: 1e-3
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 100000
+  lr_min_ratio: 0.1
+
 c4_tuning:
-  # Self-play
-  games_per_iteration: 5
+    # Self-play
+  games_per_epoch: 32
   buffer_size: 50000
-  mcts_simulations: 10  # Reduced from 50 for faster self-play
+  batch_size: 128
+  
+  # MCTS
+  mcts_simulations: 50
   mcts_c_puct: 1.5
   mcts_temperature: 1.0
-  trm_iterations_per_eval: 1  # Reduced from 3 - one forward pass is enough
   
   # Loss weights
   policy_loss_weight: 1.0
-  value_loss_weight: 0.5
-  trm_loss_weight: 0.1
+  value_loss_weight: 1.0
   
   # Evaluation
-  eval_games_vs_random: 20
-  eval_every_n_val_epochs: 1  # Run game evaluation every validation epoch
+  eval_games_vs_minimax: 20
 
 trainer:
   accumulate_grad_batches: 1
-  val_check_interval: 1000
-  check_val_every_n_epoch: null
+  check_val_every_n_epoch: 1
   log_every_n_steps: 50
 
 # Paths

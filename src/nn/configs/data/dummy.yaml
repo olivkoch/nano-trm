@@ -1,0 +1,5 @@
+_target_: src.nn.data.dummy_datamodule.DummyDataModule
+_recursive_: false
+
+batch_size: ${timekeeping.batch_size}
+num_workers: ${timekeeping.num_workers}

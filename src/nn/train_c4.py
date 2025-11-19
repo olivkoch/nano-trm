@@ -53,24 +53,6 @@ def flatten_config(cfg, parent_key="", sep="."):
     _flatten(config_dict)
     return dict(items)
 
-
-def update_model_config(cfg: DictConfig, datamodule: LightningDataModule):
-    """Update model config with datamodule properties"""
-    # Add datamodule properties to model config
-    cfg.model.num_puzzles = datamodule.num_puzzles
-    cfg.model.batch_size = datamodule.batch_size
-    cfg.model.pad_value = datamodule.pad_value
-    cfg.model.max_grid_size = datamodule.max_grid_size
-    cfg.model.vocab_size = datamodule.vocab_size
-    cfg.model.seq_len = datamodule.seq_len
-    
-    log.info(f"Model config updated from datamodule:")
-    log.info(f"  num_puzzles: {datamodule.num_puzzles}")
-    log.info(f"  batch_size: {datamodule.batch_size}")
-    log.info(f"  vocab_size: {datamodule.vocab_size}")
-    log.info(f"  seq_len: {datamodule.seq_len}")
-
-
 @task_wrapper
 def train(cfg: DictConfig) -> Optional[float]:
     """Train Connect Four TRM with self-play"""
@@ -87,9 +69,6 @@ def train(cfg: DictConfig) -> Optional[float]:
     
     # Setup datamodule to get properties
     datamodule.setup(stage="fit")
-    
-    # Update model config with datamodule properties
-    update_model_config(cfg, datamodule)
     
     # Instantiate model
     log.info(f"Instantiating model <{cfg.model._target_}>")
@@ -135,7 +114,6 @@ def train(cfg: DictConfig) -> Optional[float]:
     log.info(f"Training configuration:")
     log.info(f"  Max epochs: {cfg.trainer.max_epochs}")
     log.info(f"  Batch size: {cfg.data.batch_size}")
-    log.info(f"  Games per iteration: {cfg.model.games_per_iteration}")
     log.info(f"  MCTS simulations: {cfg.model.mcts_simulations}")
     log.info(f"  Buffer size: {cfg.model.buffer_size}")
     log.info(f"  Val check interval: {cfg.trainer.get('val_check_interval', '1.0')}")

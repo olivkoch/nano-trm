@@ -418,7 +418,7 @@ class TRMConnectFourModule(LightningModule):
         """Validation step"""
         if batch['boards'].sum() == 0:
             return
-        
+
         with torch.no_grad():
             boards = batch['boards'].to(self.device)
             policy_targets = batch['policies'].to(self.device)
@@ -433,7 +433,7 @@ class TRMConnectFourModule(LightningModule):
             
             self.log('val/policy_accuracy', policy_acc, prog_bar=True)
             self.log('val/value_mae', value_mae, prog_bar=True)
-    
+
     def val_dataloader(self):
         """Validation dataloader"""
         from torch.utils.data import DataLoader, Dataset
@@ -477,66 +477,90 @@ class TRMConnectFourModule(LightningModule):
     
     def on_validation_epoch_end(self):
         """Evaluate against minimax baseline"""
-        self.evaluate_vs_minimax()
+        self.evaluate_vs_minimax_fast()
     
-    def evaluate_vs_minimax(self):
-        """Evaluate model against minimax opponent"""
+    def evaluate_vs_minimax_fast(self):
+        """Fast evaluation using only neural network (no MCTS)"""
         from src.nn.modules.minimax import ConnectFourMinimax
         
-        depth = self.hparams.minimax_depth
-        minimax = ConnectFourMinimax(depth=depth)
+        log.info(f"Fast eval vs Minimax (depth={self.hparams.minimax_depth}) and temperature={self.hparams.minimax_temperature} over {self.hparams.eval_games_vs_minimax} games...")
         
-        wins, draws = 0, 0
+        minimax = ConnectFourMinimax(depth=self.hparams.minimax_depth)
         n_games = self.hparams.eval_games_vs_minimax
+        n_parallel = 16  # Can handle more parallel games without MCTS
+        n_batches = (n_games + n_parallel - 1) // n_parallel
         
-        for game_idx in range(n_games):
-            env = VectorizedConnectFour(n_envs=1, device=self.device)
-            state = env.reset()
+        wins = 0
+        draws = 0
+        
+        for batch_idx in range(n_batches):
+            games_in_batch = min(n_parallel, n_games - batch_idx * n_parallel)
+            vec_env = VectorizedConnectFour(n_envs=games_in_batch, device=self.device)
+            states = vec_env.reset()
             
-            # Alternate first player
-            model_player = 1 if game_idx % 2 == 0 else 2
+            model_players = [1 if (batch_idx * n_parallel + i) % 2 == 0 else 2 
+                            for i in range(games_in_batch)]
             
-            while not state.is_terminal[0]:
-                current_player = state.current_players[0].item()
+            while not states.is_terminal.all():
+                actions = torch.zeros(games_in_batch, dtype=torch.long, device=self.device)
                 
-                if current_player == model_player:
-                    # Model with MCTS
-                    with torch.no_grad():
-                        policy = self.mcts.get_action_probs(
-                            state.boards[0],
-                            state.legal_moves[0],
-                            temperature=0.1
+                # Collect all active positions
+                active_model_positions = []
+                active_model_indices = []
+                
+                for i in range(games_in_batch):
+                    if states.is_terminal[i]:
+                        continue
+                        
+                    current_player = states.current_players[i].item()
+                    
+                    if current_player == model_players[i]:
+                        active_model_positions.append(states.boards[i].flatten())
+                        active_model_indices.append(i)
+                    else:
+                        # Minimax move
+                        board_np = states.boards[i].cpu().numpy()
+                        actions[i] = minimax.get_best_move(
+                            board_np, current_player, 
+                            temperature=self.hparams.minimax_temperature
                         )
-                    action = policy.argmax().item()
-                else:
-                    # Minimax
-                    board_np = state.boards[0].cpu().numpy()
-                    action = minimax.get_best_move(
-                        board_np, 
-                        current_player, 
-                        temperature=self.hparams.minimax_temperature
-                    )
                 
-                actions = torch.tensor([action], device=self.device)
-                state = env.step(actions)
+                # Batch evaluate all model positions
+                if active_model_positions:
+                    with torch.no_grad():
+                        boards_tensor = torch.stack(active_model_positions)
+                        policies, _ = self.forward(boards_tensor)
+                        
+                        for j, idx in enumerate(active_model_indices):
+                            # Apply legal moves mask
+                            legal = states.legal_moves[idx]
+                            masked_policy = policies[j] * legal.float()
+                            if masked_policy.sum() > 0:
+                                actions[idx] = masked_policy.argmax().item()
+                            else:
+                                # Fallback to random legal move
+                                legal_actions = legal.nonzero(as_tuple=True)[0]
+                                actions[idx] = legal_actions[torch.randint(len(legal_actions), (1,))].item()
+                
+                states = vec_env.step(actions)
             
-            # Check outcome
-            winner = state.winners[0].item()
-            if winner == model_player:
-                wins += 1
-            elif winner == 0:
-                draws += 1
+            # Count results
+            for i in range(games_in_batch):
+                winner = states.winners[i].item()
+                if winner == model_players[i]:
+                    wins += 1
+                elif winner == 0:
+                    draws += 1
         
-        # Log results
+        # Log fast eval results
         win_rate = wins / n_games
         draw_rate = draws / n_games
         loss_rate = 1 - win_rate - draw_rate
         
-        self.log('eval/win_rate_vs_minimax', win_rate, prog_bar=True)
-        self.log('eval/draw_rate_vs_minimax', draw_rate)
-        self.log('eval/loss_rate_vs_minimax', loss_rate)
+        self.log('eval/fast_win_rate_vs_minimax', win_rate, prog_bar=True)
+        self.log('eval/fast_draw_rate_vs_minimax', draw_rate)
         
-        log.info(f"vs Minimax(d={depth}): W={win_rate:.1%}, D={draw_rate:.1%}, L={loss_rate:.1%}")
+        log.info(f"Fast eval vs Minimax: W={win_rate:.1%}, D={draw_rate:.1%}, L={loss_rate:.1%}")
     
     def configure_optimizers(self):
         """Simple optimizer configuration without puzzle embeddings"""

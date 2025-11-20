@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader, Dataset
 
 class DummyDataset(Dataset):
     """Dummy dataset for self-play training."""
-    def __init__(self, length=1000000):
+    def __init__(self, length=100):
         self.length = length
     
     def __len__(self):

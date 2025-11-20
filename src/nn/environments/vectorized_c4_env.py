@@ -58,7 +58,6 @@ class VectorizedConnectFour:
     def _setup_win_kernels(self):
         """Pre-compute convolution kernels for win checking"""
         # Horizontal kernel (1x4)
-        print(self.device)
         self.kernel_h = torch.ones(1, 1, 1, 4, device=self.device)
         
         # Vertical kernel (4x1)

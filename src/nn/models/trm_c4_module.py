@@ -43,7 +43,6 @@ class TRMConnectFourModule(LightningModule):
         learning_rate: float = 2e-3,
         weight_decay: float = 1e-4,
         warmup_steps: int = 1000,
-        max_steps: int = 100000,
         lr_min_ratio: float = 0.1,
         
         # Loss weights
@@ -51,9 +50,9 @@ class TRMConnectFourModule(LightningModule):
         value_weight: float = 1.0,
         halt_weight: float = 0.5,
         
-        # Self-play
-        games_per_epoch: int = 100,
-        buffer_size: int = 100000,
+        # DataLoader settings
+        num_workers: int = 0,
+        max_epochs: int = 10,
         batch_size: int = 256,
         steps_per_epoch: int = 100,
         
@@ -85,10 +84,12 @@ class TRMConnectFourModule(LightningModule):
         del temp_env
         
         # Board configuration
-        vocab_size = 4  # 0: padding, 1: empty, 2: player1, 3: player2
+        self.vocab_size = 3  # 0: padding, 1: empty, 2: player1
         seq_len = self.board_rows * self.board_cols  # 42
         action_space_size = self.board_cols  # 7
         
+        max_steps = max_epochs * steps_per_epoch
+
         # Create SelfPlayTRMModule
         self.model = SelfPlayTRMModule(
             hidden_size=hidden_size,
@@ -108,7 +109,7 @@ class TRMConnectFourModule(LightningModule):
             halt_exploration_prob=0.1,
             rope_theta=10000,
             lr_min_ratio=lr_min_ratio,
-            vocab_size=vocab_size,
+            vocab_size=self.vocab_size,
             seq_len=seq_len,
             policy_weight=policy_weight,
             value_weight=value_weight,
@@ -117,7 +118,11 @@ class TRMConnectFourModule(LightningModule):
         )
         
         # Replay buffer
-        self.replay_buffer = deque(maxlen=buffer_size)
+        self.n_games = self.hparams.steps_per_epoch * self.hparams.batch_size
+
+        assert self.n_games % 8 == 0, "steps_per_epoch x batch_size must be multiple of 8 for parallel collection"
+
+        self.replay_buffer = deque(maxlen=self.n_games)
         
         # Components (initialized in setup)
         self.vec_env = None
@@ -144,6 +149,9 @@ class TRMConnectFourModule(LightningModule):
         
         batch_size = boards.size(0)
         
+        assert boards.min() >= 0 and boards.max() < self.vocab_size, \
+            f"Board tokens out of range: [{boards.min()}, {boards.max()}], expected [0, {self.vocab_size-1}]"
+
         # Create valid actions mask (columns that aren't full)
         # Reshape to check top row
         boards_reshaped = boards.view(batch_size, self.board_rows, self.board_cols)
@@ -177,23 +185,9 @@ class TRMConnectFourModule(LightningModule):
             self.model.setup(stage)
             
             # Calculate total steps
-            if hasattr(self.trainer, "datamodule") and self.trainer.datamodule is not None:
-                train_loader = self.trainer.datamodule.train_dataloader()
-                steps_per_epoch = len(train_loader)
-            else:
-                steps_per_epoch = self.hparams.steps_per_epoch
-            
-            if self.trainer.max_epochs > 0:
-                computed_total_steps = steps_per_epoch * self.trainer.max_epochs
-            else:
-                computed_total_steps = float("inf")
-            
-            if self.trainer.max_steps > 0:
-                self.total_steps = min(self.trainer.max_steps, computed_total_steps)
-            else:
-                self.total_steps = computed_total_steps
-            
-            self.model.total_steps = self.total_steps
+            steps_per_epoch = self.hparams.steps_per_epoch
+            self.total_steps = steps_per_epoch * self.hparams.max_epochs
+            self.model.total_steps = self.total_steps 
             
             # Create environment
             self.vec_env = VectorizedConnectFour(
@@ -211,14 +205,14 @@ class TRMConnectFourModule(LightningModule):
                 device=self.device
             )
     
-    def collect_self_play_games(self):
+    def collect_self_play_games(self, n_games: int):
         """Collect self-play games using MCTS"""
         if self.mcts is None:
             return
         
         log.info("Collecting self-play games using MCTS...")
         n_parallel = 8
-        n_batches = max(1, self.hparams.games_per_epoch // n_parallel)
+        n_batches = max(1, n_games // n_parallel)
         n_positions_added = 0
         
         for batch_idx in range(n_batches):
@@ -347,14 +341,15 @@ class TRMConnectFourModule(LightningModule):
         # Update with learning rate schedule
         current_step = self.manual_step
         for opt in opts:
-            lr = compute_lr(
-                base_lr=self.hparams.learning_rate,
-                lr_warmup_steps=self.hparams.warmup_steps,
-                lr_min_ratio=self.hparams.lr_min_ratio,
-                current_step=current_step,
-                total_steps=self.total_steps,
-            )
+            # lr = compute_lr(
+            #     base_lr=self.hparams.learning_rate,
+            #     lr_warmup_steps=self.hparams.warmup_steps,
+            #     lr_min_ratio=self.hparams.lr_min_ratio,
+            #     current_step=current_step,
+            #     total_steps=self.total_steps,
+            # )
             
+            lr = self.hparams.learning_rate
             for param_group in opt.param_groups:
                 param_group['lr'] = lr
             
@@ -390,11 +385,6 @@ class TRMConnectFourModule(LightningModule):
                 return self.steps_per_epoch
             
             def __getitem__(self, idx):
-                # Ensure minimum buffer size
-                min_buffer = self.module.hparams.batch_size * 2
-                while len(self.module.replay_buffer) < min_buffer:
-                    self.module.collect_self_play_games_minimax(temp_player1 = 0.1, temp_player2 = 0.8)
-                
                 # Sample batch
                 samples = random.sample(
                     self.module.replay_buffer, 
@@ -447,33 +437,23 @@ class TRMConnectFourModule(LightningModule):
                 return self.num_batches
             
             def __getitem__(self, idx):
-                if len(self.module.replay_buffer) >= 32:
-                    samples = random.sample(self.module.replay_buffer, 32)
-                    
-                    boards = torch.stack([s['board'] for s in samples])
-                    policies = torch.stack([s['policy'] for s in samples])
-                    values = torch.tensor([s['value'] for s in samples])
-                    
-                    return {'boards': boards, 'policies': policies, 'values': values}
-                else:
-                    # Return dummy data if buffer is empty
-                    return {
-                        'boards': torch.ones(32, 42) * C4_EMPTY_CELL,
-                        'policies': torch.ones(32, 7) / 7,
-                        'values': torch.zeros(32)
-                    }
+                assert(len(self.module.replay_buffer) >= 32)
+                samples = random.sample(self.module.replay_buffer, 32)
+                
+                boards = torch.stack([s['board'] for s in samples])
+                policies = torch.stack([s['policy'] for s in samples])
+                values = torch.tensor([s['value'] for s in samples])
+                
+                return {'boards': boards, 'policies': policies, 'values': values}
         
         dataset = ValidationDataset(self)
         return DataLoader(dataset, batch_size=None, shuffle=False, num_workers=0)
     
     def on_train_epoch_start(self):
         """Refresh training data at epoch start"""
-        if self.mcts is not None:
-            min_buffer_size = self.hparams.batch_size * 10
-            
-            # Periodic buffer refresh for distribution shift
-            if self.trainer.current_epoch > 0 and self.trainer.current_epoch % 5 == 0:
-                self.replay_buffer.clear()
+        if self.mcts is not None:            
+            self.replay_buffer.clear()
+            self.collect_self_play_games_minimax(n_games=self.n_games, depth=2, temp_player1=0.2, temp_player2=0.8)
     
     def on_validation_epoch_end(self):
         """Evaluate against minimax baseline"""
@@ -937,7 +917,7 @@ class TRMConnectFourModule(LightningModule):
         
         print(f"Game debug written to {output_file}")
 
-    def collect_self_play_games_minimax(self, depth: int = 2, temp_player1: float = 0.0, temp_player2: float = 0.5):
+    def collect_self_play_games_minimax(self, n_games: int, depth: int = 2, temp_player1: float = 0.0, temp_player2: float = 0.5):
         """
         Collect self-play games using Minimax players with different temperatures.
         Lower temperature = stronger/more deterministic play
@@ -950,14 +930,14 @@ class TRMConnectFourModule(LightningModule):
         """
         from src.nn.modules.minimax import ConnectFourMinimax
         
-        log.info(f"Collecting self-play games using Minimax (depth={depth}, P1_temp={temp_player1}, P2_temp={temp_player2})...")
+        log.info(f"Collecting self-play {n_games} games using Minimax (depth={depth}, P1_temp={temp_player1}, P2_temp={temp_player2})...")
         
         # Create minimax player
         minimax = ConnectFourMinimax(depth=depth)
         
         # Run multiple games in parallel
         n_parallel = 8
-        n_batches = max(1, self.hparams.games_per_epoch // n_parallel)
+        n_batches = max(1, n_games // n_parallel)
         n_positions_added = 0
         
         for batch_idx in range(n_batches):

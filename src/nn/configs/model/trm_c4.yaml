@@ -23,18 +23,14 @@ lr_min_ratio: ${model_tuning.lr_min_ratio}
 games_per_epoch: ${c4_tuning.games_per_epoch}
 buffer_size: ${c4_tuning.buffer_size}
 batch_size: ${c4_tuning.batch_size}
-  
+steps_per_epoch: ${c4_tuning.steps_per_epoch}
+
 # MCTS
 mcts_simulations: ${c4_tuning.mcts_simulations}
 mcts_c_puct: ${c4_tuning.mcts_c_puct}
 mcts_temperature: ${c4_tuning.mcts_temperature}
-
-# Loss weights
-policy_loss_weight: ${c4_tuning.policy_loss_weight}
-value_loss_weight: ${c4_tuning.value_loss_weight}
-
-# Evaluation
-eval_games_vs_minimax: ${c4_tuning.eval_games_vs_minimax}
+mcts_dirichlet_alpha: ${c4_tuning.mcts_dirichlet_alpha}
+mcts_exploration_fraction: ${c4_tuning.mcts_exploration_fraction}
 
 # Output directory
 output_dir: None

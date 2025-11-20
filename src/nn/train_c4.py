@@ -62,14 +62,7 @@ def train(cfg: DictConfig) -> Optional[float]:
         lightning.seed_everything(cfg.seed, workers=True)
     
     output_dir = Path(cfg["paths"]["output_dir"])
-    
-    # Instantiate datamodule
-    log.info(f"Instantiating datamodule <{cfg.data._target_}>")
-    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
-    
-    # Setup datamodule to get properties
-    datamodule.setup(stage="fit")
-    
+        
     # Instantiate model
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model, output_dir=output_dir)
@@ -93,7 +86,6 @@ def train(cfg: DictConfig) -> Optional[float]:
     # Create object dict for hyperparameter logging
     object_dict = {
         "cfg": cfg,
-        "datamodule": datamodule,
         "model": model,
         "callbacks": callbacks,
         "logger": loggers,
@@ -113,7 +105,6 @@ def train(cfg: DictConfig) -> Optional[float]:
     log.info("="*50)
     log.info(f"Training configuration:")
     log.info(f"  Max epochs: {cfg.trainer.max_epochs}")
-    log.info(f"  Batch size: {cfg.data.batch_size}")
     log.info(f"  MCTS simulations: {cfg.model.mcts_simulations}")
     log.info(f"  Buffer size: {cfg.model.buffer_size}")
     log.info(f"  Val check interval: {cfg.trainer.get('val_check_interval', '1.0')}")
@@ -122,7 +113,6 @@ def train(cfg: DictConfig) -> Optional[float]:
     log.info("Starting training!")
     trainer.fit(
         model=model, 
-        datamodule=datamodule, 
         ckpt_path=cfg.get("ckpt_path")
     )
     

@@ -32,5 +32,9 @@ mcts_temperature: ${c4_tuning.mcts_temperature}
 mcts_dirichlet_alpha: ${c4_tuning.mcts_dirichlet_alpha}
 mcts_exploration_fraction: ${c4_tuning.mcts_exploration_fraction}
 
+# Baseline
+eval_games_vs_minimax: ${c4_tuning.eval_games_vs_minimax}
+minimax_temperature: ${c4_tuning.minimax_temperature}
+
 # Output directory
 output_dir: None

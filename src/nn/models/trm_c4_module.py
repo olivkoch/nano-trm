@@ -1,6 +1,5 @@
 """
-TRM Connect Four Module - Clean Implementation with Proper Optimizer Setup
-Pure self-play training following base TRM patterns
+TRM Connect Four Module - Using SelfPlayTRMModule for AlphaZero-style training
 """
 
 import torch
@@ -9,22 +8,23 @@ from lightning import LightningModule
 from collections import deque
 from typing import Tuple
 import random
-import time
 import numpy as np
-from src.nn.models.trm_module import TRMModule
-from src.nn.environments.vectorized_c4_env import VectorizedConnectFour, VectorizedC4State
+
+from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
 from src.nn.modules.batch_mcts import BatchMCTS
 from src.nn.modules.utils import compute_lr
 from src.nn.utils.constants import C4_EMPTY_CELL, C4_PLAYER1_CELL, C4_PLAYER2_CELL
 from src.nn.utils import RankedLogger
 
+# Import our new SelfPlayTRMModule
+from src.nn.models.selfplay_trm_module import SelfPlayTRMModule
+
 log = RankedLogger(__name__, rank_zero_only=True)
+
 
 class TRMConnectFourModule(LightningModule):
     """
-    TRM for Connect Four - using native TRM outputs with MCTS
-    - Actions: First 7 logits from lm_head (one per column)
-    - Value: 8th logit from lm_head as game outcome prediction
+    TRM for Connect Four using SelfPlayTRMModule architecture
     """
     
     def __init__(
@@ -41,11 +41,15 @@ class TRMConnectFourModule(LightningModule):
         
         # Optimization
         learning_rate: float = 2e-3,
-        learning_rate_emb: float = 1e-3,
         weight_decay: float = 1e-4,
         warmup_steps: int = 1000,
         max_steps: int = 100000,
         lr_min_ratio: float = 0.1,
+        
+        # Loss weights
+        policy_weight: float = 1.0,
+        value_weight: float = 1.0,
+        halt_weight: float = 0.5,
         
         # Self-play
         games_per_epoch: int = 100,
@@ -63,6 +67,7 @@ class TRMConnectFourModule(LightningModule):
         # Evaluation
         eval_games_vs_minimax: int = 20,
         minimax_temperature: float = 0.5,
+        minimax_depth: int = 2,
         
         output_dir: str = None,
         **kwargs
@@ -75,50 +80,46 @@ class TRMConnectFourModule(LightningModule):
         
         # Get board dimensions
         temp_env = VectorizedConnectFour(n_envs=1)
-        board_rows = temp_env.rows
-        board_cols = temp_env.cols
+        self.board_rows = temp_env.rows
+        self.board_cols = temp_env.cols
         del temp_env
         
-        # We use vocab_size=8: 
-        # 0=padding, 1=empty, 2=player1, 3=player2
-        # 4-7=unused (but we'll use position 7 for value prediction)
-        vocab_size = 8  # Enough for board tokens + action/value outputs
-        seq_len = board_rows * board_cols  # 42
+        # Board configuration
+        vocab_size = 4  # 0: padding, 1: empty, 2: player1, 3: player2
+        seq_len = self.board_rows * self.board_cols  # 42
+        action_space_size = self.board_cols  # 7
         
-        # Create base TRM
-        self.trm = TRMModule(
+        # Create SelfPlayTRMModule
+        self.model = SelfPlayTRMModule(
             hidden_size=hidden_size,
             num_layers=num_layers,
             num_heads=num_heads,
-            max_grid_size=board_cols,
+            max_grid_size=seq_len,
+            action_space_size=action_space_size,
             H_cycles=H_cycles,
             L_cycles=L_cycles,
             N_supervision=N_supervision,
             N_supervision_val=N_supervision_val,
             ffn_expansion=ffn_expansion,
             learning_rate=learning_rate,
-            learning_rate_emb=learning_rate_emb,
             weight_decay=weight_decay,
             warmup_steps=warmup_steps,
             max_steps=max_steps,
+            halt_exploration_prob=0.1,
+            rope_theta=10000,
             lr_min_ratio=lr_min_ratio,
             vocab_size=vocab_size,
-            num_puzzles=1,
-            batch_size=batch_size,
             seq_len=seq_len,
-            puzzle_emb_dim=0,
-            puzzle_emb_len=0,
+            policy_weight=policy_weight,
+            value_weight=value_weight,
+            halt_weight=halt_weight,
             output_dir=output_dir,
         )
-        
-        # Store dimensions
-        self.board_rows = board_rows
-        self.board_cols = board_cols
         
         # Replay buffer
         self.replay_buffer = deque(maxlen=buffer_size)
         
-        # Components
+        # Components (initialized in setup)
         self.vec_env = None
         self.mcts = None
         
@@ -129,57 +130,51 @@ class TRMConnectFourModule(LightningModule):
     
     def forward(self, boards: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass: boards -> (policy, value)
-        Uses TRM's lm_head directly:
-        - First 7 outputs = action probabilities
-        - 8th output = value
+        Forward pass through SelfPlayTRM
         
         Args:
-            boards: (batch_size, 42) flattened board tensors
+            boards: (batch_size, 42) flattened board tensors with tokens
             
         Returns:
             policy: (batch_size, 7) move probabilities
-            value: (batch_size,) position evaluations
+            value: (batch_size,) position evaluations in [-1, 1]
         """
         if boards.dim() == 1:
             boards = boards.unsqueeze(0)
-            
+        
         batch_size = boards.size(0)
         
-        # Create TRM batch
+        # Create valid actions mask (columns that aren't full)
+        # Reshape to check top row
+        boards_reshaped = boards.view(batch_size, self.board_rows, self.board_cols)
+        valid_actions = boards_reshaped[:, 0, :] == C4_EMPTY_CELL  # Top row empty = valid
+        
+        # Create batch for SelfPlayTRM
         batch = {
-            'input': boards.long(),
-            'output': torch.zeros_like(boards),
-            'puzzle_identifiers': torch.zeros(batch_size, dtype=torch.long, device=self.device)
+            'board_state': boards.long(),
+            'valid_actions': valid_actions,
+            # Dummy targets for forward pass
+            'mcts_policy': torch.zeros(batch_size, self.board_cols, device=boards.device),
+            'game_outcome': torch.zeros(batch_size, device=boards.device)
         }
         
-        # Forward through TRM
-        carry = self.trm.initial_carry(batch)
-        carry, outputs = self.trm(carry, batch)
+        # Initialize carry
+        carry = self.model.initial_carry(batch)
         
-        # Get logits from lm_head: (batch_size, seq_len, vocab_size)
-        logits = outputs['logits']
+        # Forward pass
+        carry, outputs = self.model.forward(carry, batch)
         
-        # Use the first position's output for policy and value
-        # Shape: (batch_size, vocab_size=8)
-        first_pos_logits = logits[:, 0, :]
-        
-        # Policy: First 7 values (columns 0-6)
-        policy_logits = first_pos_logits[:, :7]
-        policy = F.softmax(policy_logits, dim=-1)
-        
-        # Value: Use the 8th logit as a value estimate
-        # Apply tanh to bound it to [-1, 1]
-        value_logit = first_pos_logits[:, 7]
-        value = torch.tanh(value_logit)
+        # Extract policy and value
+        policy = outputs['policy']
+        value = outputs['value']
         
         return policy, value
     
     def setup(self, stage: str):
         """Initialize components"""
         if stage == "fit":
-            # Setup TRM
-            self.trm.setup(stage)
+            # Setup the internal model
+            self.model.setup(stage)
             
             # Calculate total steps
             if hasattr(self.trainer, "datamodule") and self.trainer.datamodule is not None:
@@ -198,15 +193,17 @@ class TRMConnectFourModule(LightningModule):
             else:
                 self.total_steps = computed_total_steps
             
+            self.model.total_steps = self.total_steps
+            
             # Create environment
             self.vec_env = VectorizedConnectFour(
                 n_envs=1,
                 device=self.device
             )
             
-            # Create MCTS
+            # Create MCTS with this module as the model
             self.mcts = BatchMCTS(
-                model=self,
+                model=self,  # Pass self, which implements forward()
                 c_puct=self.hparams.mcts_c_puct,
                 num_simulations=self.hparams.mcts_simulations,
                 dirichlet_alpha=self.hparams.mcts_dirichlet_alpha,
@@ -214,119 +211,22 @@ class TRMConnectFourModule(LightningModule):
                 device=self.device
             )
     
-    def collect_self_play_games_minimax(self, depth: int = 2, temp_player1: float = 0.0, temp_player2: float = 0.5):
-        """Collect self-play games using Minimax players with different temperatures
-        
-        Args:
-            depth: Minimax search depth
-            temp_player1: Temperature for player 1 (lower = stronger)
-            temp_player2: Temperature for player 2 (higher = weaker)
-        """
-        from src.nn.modules.minimax import ConnectFourMinimax
-        
-        log.info(f"Collecting self-play games using Minimax (depth={depth}, P1_temp={temp_player1}, P2_temp={temp_player2})...")
-        
-        # Run multiple games in parallel
-        n_parallel = 8
-        n_batches = max(1, self.hparams.games_per_epoch // n_parallel)
-        n_positions_added = 0
-        
-        # Create minimax player
-        minimax = ConnectFourMinimax(depth=depth)
-        
-        for batch_idx in range(n_batches):
-            # Use a single vectorized environment
-            vec_env = VectorizedConnectFour(n_envs=n_parallel, device=self.device)
-            states = vec_env.reset()
-            trajectories = [[] for _ in range(n_parallel)]
-            
-            # Play all games until completion
-            while not states.is_terminal.all():
-                # Process each active game
-                active_indices = []
-                for i in range(n_parallel):
-                    if not states.is_terminal[i]:
-                        active_indices.append(i)
-                
-                if not active_indices:
-                    break
-                
-                # Get minimax move for each active game
-                actions = torch.zeros(n_parallel, dtype=torch.long, device=self.device)
-                
-                for i in active_indices:
-                    # Get board and current player
-                    board_np = states.boards[i].cpu().numpy()
-                    current_player = states.current_players[i].item()
-                    
-                    # Use different temperatures for different players
-                    temp = temp_player1 if current_player == 1 else temp_player2
-                    
-                    # Get minimax move with appropriate temperature
-                    action = minimax.get_best_move(board_np, current_player, temperature=temp)
-                    actions[i] = action
-                    
-                    # Create policy target (one-hot for the chosen action)
-                    policy = torch.zeros(7, device=self.device)
-                    policy[action] = 1.0
-                    
-                    # Store position
-                    trajectories[i].append({
-                        'board': states.boards[i].flatten(),
-                        'policy': policy,
-                        'player': current_player
-                    })
-                
-                # Step environment
-                states = vec_env.step(actions)
-            
-            # Process completed games and assign values
-            for i in range(n_parallel):
-                if len(trajectories[i]) < 2:
-                    continue
-                
-                winner = states.winners[i].item()
-                
-                for position in trajectories[i]:
-                    if winner == 0:
-                        value = 0.0
-                    elif winner == position['player']:
-                        value = 1.0
-                    else:
-                        value = -1.0
-                    
-                    self.replay_buffer.append({
-                        'board': position['board'],
-                        'policy': policy,
-                        'value': value
-                    })
-                    n_positions_added += 1
-            
-            self.games_played += n_parallel
-    
-        log.info(f"Collected {n_positions_added} positions using Minimax (depth={depth}), replay buffer size: {len(self.replay_buffer)}")
-    
     def collect_self_play_games(self):
-        """Collect self-play games using MCTS - fully vectorized version"""
+        """Collect self-play games using MCTS"""
         if self.mcts is None:
             return
         
-        log.info("Collecting self-play games using batched MCTS...")
-        # Run multiple games in parallel
+        log.info("Collecting self-play games using MCTS...")
         n_parallel = 8
         n_batches = max(1, self.hparams.games_per_epoch // n_parallel)
         n_positions_added = 0
-
+        
         for batch_idx in range(n_batches):
-
-            # Use a single vectorized environment
             vec_env = VectorizedConnectFour(n_envs=n_parallel, device=self.device)
             states = vec_env.reset()
             trajectories = [[] for _ in range(n_parallel)]
             
-            # Play all games until completion
             while not states.is_terminal.all():
-                # Prepare boards and legal moves for active games
                 boards = []
                 legal_moves_list = []
                 active_indices = []
@@ -340,41 +240,34 @@ class TRMConnectFourModule(LightningModule):
                 if not boards:
                     break
                 
-                # Determine temperature based on average move count
+                # Temperature scheduling
                 avg_moves = sum(len(t) for t in trajectories) / n_parallel
                 temperature = self.hparams.mcts_temperature if avg_moves < 30 else 0.1
                 
-                # Get MCTS policies for all active games in batch
+                # Get MCTS policies
                 active_policies = self.mcts.get_action_probs_batch_parallel(
                     boards, 
                     legal_moves_list,
                     temperature=temperature
                 )
                 
-                # Map back to full policy tensor
-                policies = torch.zeros(n_parallel, 7, device=self.device)
+                # Store positions and select actions
+                actions = torch.zeros(n_parallel, dtype=torch.long, device=self.device)
                 for idx, i in enumerate(active_indices):
-                    policies[i] = active_policies[idx]
-                    
-                    # Store position
                     trajectories[i].append({
                         'board': states.boards[i].flatten(),
                         'policy': active_policies[idx],
                         'player': states.current_players[i].item()
                     })
-                
-                # Select actions for all active games
-                actions = torch.zeros(n_parallel, dtype=torch.long, device=self.device)
-                for idx, i in enumerate(active_indices):
+                    
                     if temperature > 0.1:
                         actions[i] = torch.multinomial(active_policies[idx], 1).item()
                     else:
                         actions[i] = active_policies[idx].argmax().item()
                 
-                # Step environment
                 states = vec_env.step(actions)
             
-            # Process completed games
+            # Assign values based on game outcomes
             for i in range(n_parallel):
                 if len(trajectories[i]) < 2:
                     continue
@@ -398,41 +291,47 @@ class TRMConnectFourModule(LightningModule):
             
             self.games_played += n_parallel
         
-        log.info(f"Collected {n_positions_added} positions using batched MCTS, replay buffer size: {len(self.replay_buffer)}")
+        log.info(f"Collected {n_positions_added} positions, buffer size: {len(self.replay_buffer)}")
     
     def training_step(self, batch, batch_idx):
-        """Training step using TRM's native outputs"""
-        # Skip if no data
+        """Training step using SelfPlayTRM"""
         if batch['boards'].sum() == 0:
             return {'loss': torch.tensor(0.0, device=self.device)}
         
-        if batch_idx % 100 == 0:
-            self.debug_training_data(num_samples=15, output_file="debug_training_data.txt")
-            self.debug_game_collection()
-
+        # Prepare batch for SelfPlayTRM
         boards = batch['boards'].to(self.device)
         target_policies = batch['policies'].to(self.device)
         target_values = batch['values'].to(self.device)
         
-        # Forward pass through TRM
-        pred_policies, pred_values = self.forward(boards)
+        if batch_idx % 100 == 0:
+            self.debug_training_data(num_samples=15, output_file="debug_training_data.txt")
+            self.debug_game_collection()
+            
+        # Get valid actions mask
+        boards_reshaped = boards.view(-1, self.board_rows, self.board_cols)
+        valid_actions = boards_reshaped[:, 0, :] == C4_EMPTY_CELL
         
-        # Cross-entropy loss for policy
-        policy_loss = -torch.mean(torch.sum(target_policies * torch.log(pred_policies + 1e-8), dim=1))
+        # Create proper batch format for SelfPlayTRM
+        trm_batch = {
+            'board_state': boards,
+            'mcts_policy': target_policies,
+            'game_outcome': target_values,
+            'valid_actions': valid_actions
+        }
         
-        # MSE loss for value
-        value_loss = F.mse_loss(pred_values, target_values)
+        # Initialize or reuse carry
+        if not hasattr(self.model, 'carry') or self.model.carry is None:
+            self.model.carry = self.model.initial_carry(trm_batch)
         
-        # L2 regularization on TRM weights
-        l2_reg = 0
-        for name, param in self.trm.named_parameters():
-            # Skip biases and layer norm parameters
-            if 'bias' not in name and 'norm' not in name:
-                l2_reg += torch.sum(param ** 2)
+        # Compute loss using SelfPlayTRM's method
+        carry, total_loss, metrics, all_halted = self.model.compute_loss_and_metrics(
+            self.model.carry, trm_batch
+        )
+        self.model.carry = carry
         
-
-        # Total loss (no extra L2 since TRM already has weight decay)
-        total_loss = policy_loss + value_loss + 1e-4 * l2_reg
+        # Scale loss
+        batch_size = boards.size(0)
+        scaled_loss = total_loss / batch_size
         
         # Manual optimization
         opts = self.optimizers()
@@ -440,7 +339,7 @@ class TRMConnectFourModule(LightningModule):
             opts = [opts]
         
         # Backward
-        total_loss.backward()
+        scaled_loss.backward()
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
@@ -448,50 +347,42 @@ class TRMConnectFourModule(LightningModule):
         # Update with learning rate schedule
         current_step = self.manual_step
         for opt in opts:
-            if hasattr(opt, '_optimizer'):
-                base_lr = self.hparams.learning_rate_emb
-            else:
-                base_lr = self.hparams.learning_rate
-            
             lr = compute_lr(
-                base_lr=base_lr,
+                base_lr=self.hparams.learning_rate,
                 lr_warmup_steps=self.hparams.warmup_steps,
                 lr_min_ratio=self.hparams.lr_min_ratio,
                 current_step=current_step,
                 total_steps=self.total_steps,
             )
             
-            lr = base_lr
-
-            # Update learning rate
-            if hasattr(opt, '_optimizer'):
-                for param_group in opt._optimizer.param_groups:
-                    param_group['lr'] = lr
-                opt._optimizer.step()
-                opt._optimizer.zero_grad()
-            else:
-                for param_group in opt.param_groups:
-                    param_group['lr'] = lr
-                opt.step()
-                opt.zero_grad()
+            for param_group in opt.param_groups:
+                param_group['lr'] = lr
+            
+            opt.step()
+            opt.zero_grad()
         
         self.manual_step += 1
         
         # Logging
-        self.log('train/loss', total_loss, prog_bar=True)
-        self.log('train/policy_loss', policy_loss, prog_bar=True)
-        self.log('train/value_loss', value_loss, prog_bar=True)
-        self.log('train/lr', lr, prog_bar=True)
-        self.log('train/games_played', float(self.games_played))
+        if metrics.get('count', 0) > 0:
+            count = metrics['count']
+            self.log('train/loss', total_loss / batch_size, prog_bar=True)
+            self.log('train/policy_loss', metrics['policy_loss'] / batch_size)
+            self.log('train/value_loss', metrics['value_loss'] / batch_size)
+            self.log('train/policy_accuracy', metrics['policy_accuracy'] / count)
+            self.log('train/value_mae', metrics['value_mae'] / count, prog_bar=True)
+            self.log('train/halt_steps', metrics['steps'] / count)
+            self.log('train/lr', lr)
+            self.log('train/games_played', float(self.games_played))
         
-        return {'loss': total_loss}
+        return {'loss': scaled_loss}
     
     def train_dataloader(self):
-        """Create a dataloader that manages self-play data"""
+        """Create dataloader for self-play training"""
         from torch.utils.data import DataLoader, Dataset
         
         class SelfPlayDataset(Dataset):
-            def __init__(self, module, steps_per_epoch=100):
+            def __init__(self, module, steps_per_epoch):
                 self.module = module
                 self.steps_per_epoch = steps_per_epoch
                 
@@ -499,22 +390,20 @@ class TRMConnectFourModule(LightningModule):
                 return self.steps_per_epoch
             
             def __getitem__(self, idx):
-                assert self.module.mcts is not None, "MCTS not initialized!"
-
-                # Ensure enough data
-                # min_buffer_size = self.module.hparams.batch_size * 2
-                # while len(self.module.replay_buffer) < min_buffer_size:                    
-                #     self.module.collect_self_play_games()
-                #     print(f"Buffer size: {len(self.module.replay_buffer)}, {min_buffer_size} needed")
+                # Ensure minimum buffer size
+                min_buffer = self.module.hparams.batch_size * 2
+                while len(self.module.replay_buffer) < min_buffer:
+                    self.module.collect_self_play_games()
                 
-                assert len(self.module.replay_buffer) >= self.module.hparams.batch_size, "Not enough data in replay buffer!"
-
                 # Sample batch
-                samples = random.sample(self.module.replay_buffer, self.module.hparams.batch_size)
+                samples = random.sample(
+                    self.module.replay_buffer, 
+                    self.module.hparams.batch_size
+                )
                 
                 boards = torch.stack([s['board'] for s in samples])
                 policies = torch.stack([s['policy'] for s in samples])
-                values = torch.tensor([s['value'] for s in samples], device=self.module.device)
+                values = torch.tensor([s['value'] for s in samples])
                 
                 return {
                     'boards': boards,
@@ -522,14 +411,28 @@ class TRMConnectFourModule(LightningModule):
                     'values': values
                 }
         
-        dataset = SelfPlayDataset(self, steps_per_epoch=self.hparams.steps_per_epoch)
+        dataset = SelfPlayDataset(self, self.hparams.steps_per_epoch)
+        return DataLoader(dataset, batch_size=None, num_workers=0, shuffle=False)
+    
+    def validation_step(self, batch, batch_idx):
+        """Validation step"""
+        if batch['boards'].sum() == 0:
+            return
         
-        return DataLoader(
-            dataset,
-            batch_size=None,
-            num_workers=0,
-            shuffle=False,
-        )
+        with torch.no_grad():
+            boards = batch['boards'].to(self.device)
+            policy_targets = batch['policies'].to(self.device)
+            value_targets = batch['values'].to(self.device)
+            
+            # Get predictions
+            pred_policies, pred_values = self.forward(boards)
+            
+            # Metrics
+            policy_acc = (pred_policies.argmax(-1) == policy_targets.argmax(-1)).float().mean()
+            value_mae = torch.abs(pred_values - value_targets).mean()
+            
+            self.log('val/policy_accuracy', policy_acc, prog_bar=True)
+            self.log('val/value_mae', value_mae, prog_bar=True)
     
     def val_dataloader(self):
         """Validation dataloader"""
@@ -549,62 +452,123 @@ class TRMConnectFourModule(LightningModule):
                     
                     boards = torch.stack([s['board'] for s in samples])
                     policies = torch.stack([s['policy'] for s in samples])
-                    values = torch.tensor([s['value'] for s in samples], device=self.module.device)
+                    values = torch.tensor([s['value'] for s in samples])
                     
-                    return {
-                        'boards': boards,
-                        'policies': policies,
-                        'values': values
-                    }
+                    return {'boards': boards, 'policies': policies, 'values': values}
                 else:
+                    # Return dummy data if buffer is empty
                     return {
-                        'boards': torch.zeros(32, 42, device=self.module.device),
-                        'policies': torch.ones(32, 7, device=self.module.device) / 7,
-                        'values': torch.zeros(32, device=self.module.device)
+                        'boards': torch.ones(32, 42) * C4_EMPTY_CELL,
+                        'policies': torch.ones(32, 7) / 7,
+                        'values': torch.zeros(32)
                     }
         
-        dataset = ValidationDataset(self, num_batches=10)
+        dataset = ValidationDataset(self)
         return DataLoader(dataset, batch_size=None, shuffle=False, num_workers=0)
     
-    def validation_step(self, batch, batch_idx):
-        """Validation step"""
-        if batch['boards'].sum() == 0:
-            return
-        
-        with torch.no_grad():
-            boards = batch['boards']
-            policy_targets = batch['policies']
-            value_targets = batch['values']
-            
-            pred_policies, pred_values = self.forward(boards)
-            
-            policy_acc = (pred_policies.argmax(-1) == policy_targets.argmax(-1)).float().mean()
-            value_acc = ((pred_values > 0) == (value_targets > 0)).float().mean()
-            
-            batch_size = boards.size(0)
-            self.log('val/policy_accuracy', policy_acc, prog_bar=True, batch_size=batch_size)
-            self.log('val/value_accuracy', value_acc, batch_size=batch_size)
-    
     def on_train_epoch_start(self):
-        """Collect initial games at the start of each epoch if buffer is low"""
+        """Refresh training data at epoch start"""
         if self.mcts is not None:
-            # Ensure minimum buffer size
             min_buffer_size = self.hparams.batch_size * 10
             
-            # Clear old data periodically to keep fresh training distribution
-            if self.trainer.current_epoch > 0 and self.trainer.current_epoch % 2 == 0:
+            # Periodic buffer refresh for distribution shift
+            if self.trainer.current_epoch > 0 and self.trainer.current_epoch % 5 == 0:
                 old_size = len(self.replay_buffer)
-                self.replay_buffer.clear()
-                log.info(f"Cleared replay buffer (was {old_size} samples) to refresh training distribution")
-
-            if len(self.replay_buffer) < min_buffer_size:
-                log.info(f"Epoch {self.trainer.current_epoch}: Buffer low ({len(self.replay_buffer)}), collecting games...")
-                while len(self.replay_buffer) < min_buffer_size:
-                    self.collect_self_play_games_minimax(temp_player1=0.1, temp_player2=0.9) # minimax for training data
-                    print(f"Buffer size: {len(self.replay_buffer)} / {min_buffer_size}")
-                log.info(f"Buffer size: {len(self.replay_buffer)}")
+                # Keep only recent half
+                if old_size > min_buffer_size * 2:
+                    recent_games = list(self.replay_buffer)[-old_size//2:]
+                    self.replay_buffer.clear()
+                    self.replay_buffer.extend(recent_games)
+                    log.info(f"Refreshed buffer: kept {len(self.replay_buffer)}/{old_size} recent samples")
+            
+            # Ensure minimum buffer size
+            while len(self.replay_buffer) < min_buffer_size:
+                self.collect_self_play_games()
     
-    def debug_training_data(self, num_samples=10, output_file="debug_training_data.txt"):
+    def on_validation_epoch_end(self):
+        """Evaluate against minimax baseline"""
+        self.evaluate_vs_minimax()
+    
+    def evaluate_vs_minimax(self):
+        """Evaluate model against minimax opponent"""
+        from src.nn.modules.minimax import ConnectFourMinimax
+        
+        depth = self.hparams.minimax_depth
+        minimax = ConnectFourMinimax(depth=depth)
+        
+        wins, draws = 0, 0
+        n_games = self.hparams.eval_games_vs_minimax
+        
+        for game_idx in range(n_games):
+            env = VectorizedConnectFour(n_envs=1, device=self.device)
+            state = env.reset()
+            
+            # Alternate first player
+            model_player = 1 if game_idx % 2 == 0 else 2
+            
+            while not state.is_terminal[0]:
+                current_player = state.current_players[0].item()
+                
+                if current_player == model_player:
+                    # Model with MCTS
+                    with torch.no_grad():
+                        policy = self.mcts.get_action_probs(
+                            state.boards[0],
+                            state.legal_moves[0],
+                            temperature=0.1
+                        )
+                    action = policy.argmax().item()
+                else:
+                    # Minimax
+                    board_np = state.boards[0].cpu().numpy()
+                    action = minimax.get_best_move(
+                        board_np, 
+                        current_player, 
+                        temperature=self.hparams.minimax_temperature
+                    )
+                
+                actions = torch.tensor([action], device=self.device)
+                state = env.step(actions)
+            
+            # Check outcome
+            winner = state.winners[0].item()
+            if winner == model_player:
+                wins += 1
+            elif winner == 0:
+                draws += 1
+        
+        # Log results
+        win_rate = wins / n_games
+        draw_rate = draws / n_games
+        loss_rate = 1 - win_rate - draw_rate
+        
+        self.log('eval/win_rate_vs_minimax', win_rate, prog_bar=True)
+        self.log('eval/draw_rate_vs_minimax', draw_rate)
+        self.log('eval/loss_rate_vs_minimax', loss_rate)
+        
+        log.info(f"vs Minimax(d={depth}): W={win_rate:.1%}, D={draw_rate:.1%}, L={loss_rate:.1%}")
+    
+    def configure_optimizers(self):
+        """Simple optimizer configuration without puzzle embeddings"""
+        try:
+            from adam_atan2 import AdamATan2
+            optimizer = AdamATan2(
+                self.parameters(),
+                lr=self.hparams.learning_rate,
+                weight_decay=self.hparams.weight_decay,
+                betas=(0.9, 0.95)
+            )
+        except ImportError:
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=self.hparams.learning_rate,
+                weight_decay=self.hparams.weight_decay,
+                betas=(0.9, 0.95)
+            )
+        
+        return optimizer
+    
+    def debug_training_data(self, num_samples=15, output_file="debug_training_data.txt"):
         """Debug function to inspect training data quality"""
         import numpy as np
         from datetime import datetime
@@ -614,7 +578,6 @@ class TRMConnectFourModule(LightningModule):
             return
         
         # Sample some data
-        import random
         samples = random.sample(self.replay_buffer, min(num_samples, len(self.replay_buffer)))
         
         with open(output_file, 'w') as f:
@@ -634,12 +597,12 @@ class TRMConnectFourModule(LightningModule):
             f.write(f"  Std value: {np.std(all_values):.3f}\n")
             f.write("\n")
             
-            # Display some samples
+            # Display samples
             for i, sample in enumerate(samples):
                 f.write(f"SAMPLE {i+1}:\n")
                 f.write("-" * 40 + "\n")
                 
-                # Reshape state to board
+                # Reshape board
                 state = sample['board'].cpu().numpy()
                 board = state.reshape(6, 7)
                 
@@ -663,7 +626,7 @@ class TRMConnectFourModule(LightningModule):
                 
                 # Display policy
                 policy = sample['policy'].cpu().numpy()
-                f.write("\nPolicy (move probabilities):\n")
+                f.write("\nPolicy (MCTS probabilities):\n")
                 f.write("  Col: ")
                 for c in range(7):
                     f.write(f"{c:6d} ")
@@ -672,10 +635,19 @@ class TRMConnectFourModule(LightningModule):
                 for c in range(7):
                     f.write(f"{policy[c]:6.3f} ")
                 f.write("\n")
+                
+                # Check valid moves
+                valid_cols = []
+                for col in range(7):
+                    if board[0, col] == C4_EMPTY_CELL:
+                        valid_cols.append(col)
+                f.write(f"  Valid columns: {valid_cols}\n")
+                
+                # Policy analysis
                 f.write(f"  Entropy: {-np.sum(policy * np.log(policy + 1e-8)):.3f}\n")
                 f.write(f"  Max prob column: {np.argmax(policy)}\n")
                 
-                # Display value
+                # Value
                 value = sample['value']
                 f.write(f"\nValue: {value:.3f}")
                 if value > 0.5:
@@ -686,22 +658,50 @@ class TRMConnectFourModule(LightningModule):
                     f.write(" (DRAW)")
                 f.write("\n")
                 
-                # Check if board state makes sense
+                # Sanity checks
                 f.write("\nSanity Checks:\n")
                 
-                # Check piece count difference
+                # Check piece counts
                 if abs(p1_count - p2_count) > 1:
                     f.write(f"  ⚠️ WARNING: Piece count difference > 1 (X={p1_count}, O={p2_count})\n")
                 else:
                     f.write(f"  ✓ Piece counts look reasonable\n")
                 
-                # Check if policy focuses on valid moves
+                # Check if policy assigns probability to invalid moves
+                invalid_policy_mass = 0
                 for col in range(7):
                     if board[0, col] != C4_EMPTY_CELL and policy[col] > 0.01:
                         f.write(f"  ⚠️ WARNING: Column {col} is full but has {policy[col]:.3f} probability\n")
+                        invalid_policy_mass += policy[col]
                 
-                # Check for obvious wins that might be missed
-                # (You could add more sophisticated win detection here)
+                if invalid_policy_mass < 0.01:
+                    f.write(f"  ✓ Policy respects valid moves\n")
+                
+                # Check for winning positions
+                def check_win(board, player):
+                    # Horizontal
+                    for row in range(6):
+                        for col in range(4):
+                            if all(board[row, col+i] == player for i in range(4)):
+                                return True
+                    # Vertical
+                    for row in range(3):
+                        for col in range(7):
+                            if all(board[row+i, col] == player for i in range(4)):
+                                return True
+                    # Diagonal
+                    for row in range(3):
+                        for col in range(4):
+                            if all(board[row+i, col+i] == player for i in range(4)):
+                                return True
+                            if all(board[row+i, col+3-i] == player for i in range(4)):
+                                return True
+                    return False
+                
+                if check_win(board, C4_PLAYER1_CELL):
+                    f.write("  ℹ️ Board shows X win\n")
+                elif check_win(board, C4_PLAYER2_CELL):
+                    f.write("  ℹ️ Board shows O win\n")
                 
                 f.write("\n" + "=" * 80 + "\n\n")
             
@@ -709,7 +709,7 @@ class TRMConnectFourModule(LightningModule):
             f.write("SUMMARY STATISTICS:\n")
             f.write("-" * 40 + "\n")
             
-            # Game length distribution (inferred from piece counts)
+            # Game length distribution
             piece_counts = []
             for s in self.replay_buffer:
                 board = s['board'].cpu().numpy().reshape(6, 7)
@@ -732,31 +732,44 @@ class TRMConnectFourModule(LightningModule):
             f.write(f"  Std: {np.std(entropies):.3f}\n")
             f.write(f"  Min: {np.min(entropies):.3f}\n")
             f.write(f"  Max: {np.max(entropies):.3f}\n")
+            
+            # Check policy concentration
+            max_probs = []
+            for s in self.replay_buffer:
+                p = s['policy'].cpu().numpy()
+                max_probs.append(np.max(p))
+            
+            f.write(f"\nPolicy concentration (max probability):\n")
+            f.write(f"  Mean: {np.mean(max_probs):.3f}\n")
+            f.write(f"  Std: {np.std(max_probs):.3f}\n")
+            f.write(f"  Min: {np.min(max_probs):.3f}\n")
+            f.write(f"  Max: {np.max(max_probs):.3f}\n")
         
         print(f"Debug data written to {output_file}")
 
     def debug_game_collection(self, output_file="debug_game.txt"):
-        """Debug a single game collection to see what's happening"""
+        """Debug a single game collection to see MCTS in action"""
         if self.vec_env is None or self.mcts is None:
-            print("Environment not initialized")
+            print("Environment or MCTS not initialized")
             return
         
         with open(output_file, 'w') as f:
-            f.write("DEBUGGING SINGLE GAME COLLECTION\n")
+            f.write("DEBUGGING SINGLE GAME WITH MCTS\n")
             f.write("=" * 80 + "\n\n")
             
-            # Reset one environment
-            states = self.vec_env.reset()
+            # Play one game
+            env = VectorizedConnectFour(n_envs=1, device=self.device)
+            state = env.reset()
             game_trajectory = []
             
             move_num = 0
-            while not states.is_terminal[0]:
+            while not state.is_terminal[0]:
                 move_num += 1
                 f.write(f"MOVE {move_num}:\n")
                 f.write("-" * 40 + "\n")
                 
                 # Display board
-                board = states.boards[0].cpu().numpy()
+                board = state.boards[0].cpu().numpy()
                 f.write("Board:\n")
                 symbols = {C4_EMPTY_CELL: '.', C4_PLAYER1_CELL: 'X', C4_PLAYER2_CELL: 'O'}
                 for row in range(6):
@@ -764,203 +777,148 @@ class TRMConnectFourModule(LightningModule):
                         f.write(symbols.get(board[row, col], '?') + " ")
                     f.write("\n")
                 
-                f.write(f"Current player: {states.current_players[0].item()}\n")
-                f.write(f"Legal moves: {states.legal_moves[0].cpu().numpy()}\n")
+                f.write(f"Current player: {state.current_players[0].item()}\n")
+                f.write(f"Legal moves: {[i for i in range(7) if state.legal_moves[0][i].item()]}\n")
                 
-                # Get policy from MCTS - updated to use new interface
+                # Get MCTS policy
+                temperature = 1.0 if move_num < 30 else 0.1
+                
                 with torch.no_grad():
-                    # Use the new MCTS interface with board and legal_moves separately
-                    board_tensor = states.boards[0]
-                    legal_moves = states.legal_moves[0]
+                    # Get raw network output
+                    nn_policy, nn_value = self.forward(state.boards[0].flatten())
+                    f.write(f"Neural network raw output:\n")
+                    f.write(f"  NN Policy: {nn_policy.cpu().numpy()}\n")
+                    f.write(f"  NN Value: {nn_value.item():.3f}\n")
                     
-                    # Determine temperature based on move number
-                    temperature = 1.0 if move_num < 30 else 0.1
-                    
-                    # Get MCTS policy
-                    policy = self.mcts.get_action_probs(
-                        board_tensor,
-                        legal_moves,
+                    # Get MCTS-improved policy
+                    mcts_policy = self.mcts.get_action_probs(
+                        state.boards[0],
+                        state.legal_moves[0],
                         temperature=temperature
                     )
                 
-                f.write(f"MCTS policy (temp={temperature:.1f}): {policy.cpu().numpy()}\n")
-                f.write(f"  Max probability move: column {policy.argmax().item()} ({policy.max().item():.3f})\n")
-                f.write(f"  Policy entropy: {-(policy * torch.log(policy + 1e-8)).sum().item():.3f}\n")
+                f.write(f"MCTS policy (temp={temperature:.1f}): {mcts_policy.cpu().numpy()}\n")
+                f.write(f"  Max probability move: column {mcts_policy.argmax().item()} ({mcts_policy.max().item():.3f})\n")
+                f.write(f"  Policy entropy: {-(mcts_policy * torch.log(mcts_policy + 1e-8)).sum().item():.3f}\n")
+                
+                # Compare NN vs MCTS
+                nn_choice = nn_policy.argmax().item()
+                mcts_choice = mcts_policy.argmax().item()
+                if nn_choice != mcts_choice:
+                    f.write(f"  📊 MCTS changed decision: NN chose {nn_choice}, MCTS chose {mcts_choice}\n")
                 
                 # Select action
                 if temperature > 0.1:
-                    action = torch.multinomial(policy, 1).item()
+                    action = torch.multinomial(mcts_policy, 1).item()
                     f.write(f"Selected action (sampled): {action}\n\n")
                 else:
-                    action = policy.argmax().item()
+                    action = mcts_policy.argmax().item()
                     f.write(f"Selected action (greedy): {action}\n\n")
                 
                 # Store for trajectory
                 game_trajectory.append({
                     'board': board.copy(),
-                    'policy': policy.cpu().numpy(),
-                    'player': states.current_players[0].item(),
+                    'nn_policy': nn_policy.cpu().numpy(),
+                    'mcts_policy': mcts_policy.cpu().numpy(),
+                    'nn_value': nn_value.item(),
+                    'player': state.current_players[0].item(),
                     'action': action,
                     'move_num': move_num
                 })
                 
                 # Make move
-                actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)
-                actions[0] = action
-                states = self.vec_env.step(actions)
+                actions = torch.tensor([action], device=self.device)
+                state = env.step(actions)
             
             # Final board
             f.write("FINAL BOARD:\n")
             f.write("-" * 40 + "\n")
-            board = states.boards[0].cpu().numpy()
+            board = state.boards[0].cpu().numpy()
             for row in range(6):
                 for col in range(7):
                     f.write(symbols.get(board[row, col], '?') + " ")
                 f.write("\n")
             
-            winner = states.winners[0].item()
-            f.write(f"\nWinner: {winner}\n")
+            winner = state.winners[0].item()
+            f.write(f"\nWinner: ")
+            if winner == 1:
+                f.write("X (Player 1)\n")
+            elif winner == 2:
+                f.write("O (Player 2)\n")
+            else:
+                f.write("Draw\n")
             f.write(f"Total moves: {move_num}\n")
             
-            # Show what values would be assigned
-            f.write("\nVALUES ASSIGNED TO TRAJECTORY:\n")
+            # Trajectory analysis
+            f.write("\nTRAJECTORY ANALYSIS:\n")
             f.write("-" * 40 + "\n")
+            
             for i, step in enumerate(game_trajectory):
                 if winner == 0:
                     value = 0.0
-                    outcome_str = "DRAW"
+                    outcome = "DRAW"
                 elif winner == step['player']:
                     value = 1.0
-                    outcome_str = "WIN"
+                    outcome = "WIN"
                 else:
                     value = -1.0
-                    outcome_str = "LOSS"
+                    outcome = "LOSS"
                 
-                f.write(f"Move {step['move_num']:2d}: Player {step['player']} played col {step['action']} -> Value {value:+.1f} ({outcome_str})\n")
+                f.write(f"Move {step['move_num']:2d}: P{step['player']} played {step['action']} ")
+                f.write(f"-> True value {value:+.1f} ({outcome}), ")
+                f.write(f"NN predicted {step['nn_value']:+.3f}\n")
+                
+                # Check if NN value prediction was accurate
+                if abs(step['nn_value'] - value) < 0.3:
+                    f.write(f"  ✓ Good value prediction\n")
+                else:
+                    f.write(f"  ⚠️ Value prediction error: {abs(step['nn_value'] - value):.3f}\n")
             
-            # Summary stats
+            # Summary
             f.write("\n" + "=" * 80 + "\n")
             f.write("SUMMARY:\n")
             f.write(f"  Game length: {len(game_trajectory)} moves\n")
-            f.write(f"  Winner: Player {winner if winner > 0 else 'None (draw)'}\n")
+            f.write(f"  Winner: ")
+            if winner == 1:
+                f.write("X\n")
+            elif winner == 2:
+                f.write("O\n")
+            else:
+                f.write("Draw\n")
             
-            # Analyze policy entropy over game
-            entropies = [-(step['policy'] * np.log(step['policy'] + 1e-8)).sum() for step in game_trajectory]
-            f.write(f"  Average policy entropy: {np.mean(entropies):.3f}\n")
-            f.write(f"  Policy entropy range: {np.min(entropies):.3f} - {np.max(entropies):.3f}\n")
+            # Analyze improvements by MCTS
+            nn_entropies = []
+            mcts_entropies = []
+            policy_changes = 0
+            
+            for step in game_trajectory:
+                nn_ent = -(step['nn_policy'] * np.log(step['nn_policy'] + 1e-8)).sum()
+                mcts_ent = -(step['mcts_policy'] * np.log(step['mcts_policy'] + 1e-8)).sum()
+                nn_entropies.append(nn_ent)
+                mcts_entropies.append(mcts_ent)
+                
+                if np.argmax(step['nn_policy']) != np.argmax(step['mcts_policy']):
+                    policy_changes += 1
+            
+            f.write(f"\nMCTS Impact:\n")
+            f.write(f"  Moves where MCTS changed decision: {policy_changes}/{len(game_trajectory)} ({100*policy_changes/len(game_trajectory):.1f}%)\n")
+            f.write(f"  Avg NN policy entropy: {np.mean(nn_entropies):.3f}\n")
+            f.write(f"  Avg MCTS policy entropy: {np.mean(mcts_entropies):.3f}\n")
+            
+            # Value prediction accuracy
+            value_errors = []
+            for step in game_trajectory:
+                if winner == 0:
+                    true_value = 0.0
+                elif winner == step['player']:
+                    true_value = 1.0
+                else:
+                    true_value = -1.0
+                value_errors.append(abs(step['nn_value'] - true_value))
+            
+            f.write(f"\nValue Prediction Accuracy:\n")
+            f.write(f"  Mean absolute error: {np.mean(value_errors):.3f}\n")
+            f.write(f"  Max error: {np.max(value_errors):.3f}\n")
+            f.write(f"  Correct predictions (error < 0.3): {sum(1 for e in value_errors if e < 0.3)}/{len(value_errors)}\n")
         
         print(f"Game debug written to {output_file}")
-    
-    def on_validation_epoch_end(self):
-        """Periodic evaluation against minimax"""
-        self.evaluate_vs_minimax()
-    
-    def evaluate_vs_minimax(self, depth: int = 2):
-        """Evaluate against minimax baseline"""
-        from src.nn.modules.minimax import ConnectFourMinimax
-        
-        minimax = ConnectFourMinimax(depth=depth)
-        wins = 0
-        draws = 0
-        
-        for game in range(self.hparams.eval_games_vs_minimax):
-            # Reset environment
-            self.vec_env.reset()
-            
-            # Alternate who plays first
-            model_player = 1 if game % 2 == 0 else 2
-            
-            while not self.vec_env.is_terminal[0]:
-                current_player = self.vec_env.current_players[0].item()
-                
-                if current_player == model_player:
-                    # Model's turn using MCTS
-                    board = self.vec_env.boards[0]
-                    legal_moves = self.vec_env.boards[0, 0, :] == C4_EMPTY_CELL
-                    
-                    # Use lower temperature for evaluation (more deterministic)
-                    with torch.no_grad():
-                        policy = self.mcts.get_action_probs(
-                            board,
-                            legal_moves,
-                            temperature=0.1  # Nearly deterministic
-                        )
-                    
-                    # Select best action
-                    action = policy.argmax().item()
-                else:
-                    # Minimax's turn
-                    board_np = self.vec_env.boards[0].cpu().numpy()
-                    action = minimax.get_best_move(board_np, current_player, temperature=self.hparams.minimax_temperature)
-                
-                # Execute action
-                actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)
-                actions[0] = action
-                self.vec_env.step(actions)
-            
-            # Check result
-            winner = self.vec_env.winners[0].item()
-            if winner == model_player:
-                wins += 1
-            elif winner == 0:
-                draws += 1
-        
-        # Calculate statistics
-        total_games = self.hparams.eval_games_vs_minimax
-        win_rate = wins / total_games
-        draw_rate = draws / total_games
-        loss_rate = 1 - win_rate - draw_rate
-        
-        # Log results
-        self.log('eval/win_rate_vs_minimax', win_rate, prog_bar=True)
-        self.log('eval/draw_rate_vs_minimax', draw_rate)
-        self.log('eval/loss_rate_vs_minimax', loss_rate)
-        
-        log.info(f"vs Minimax (depth={depth}): Win={win_rate:.1%}, Draw={draw_rate:.1%}, Loss={loss_rate:.1%}")
-    
-    def configure_optimizers(self):
-        """Configure optimizers - maintaining base TRM's special sparse embedding optimizer"""
-        optimizers = []
-        
-        # Main optimizer for all regular parameters (including our new heads)
-        all_regular_params = []
-        
-        # Get base TRM parameters EXCEPT sparse embeddings
-        for name, param in self.trm.named_parameters():
-            if 'puzzle_emb' not in name:  # Exclude sparse embeddings
-                all_regular_params.append(param)
-        
-        # Main optimizer
-        try:
-            from adam_atan2 import AdamATan2
-            main_opt = AdamATan2(
-                all_regular_params,
-                lr=self.hparams.learning_rate,
-                weight_decay=self.hparams.weight_decay,
-                betas=(0.9, 0.95)
-            )
-        except ImportError:
-            main_opt = torch.optim.AdamW(
-                all_regular_params,
-                lr=self.hparams.learning_rate,
-                weight_decay=self.hparams.weight_decay,
-                betas=(0.9, 0.95)
-            )
-        optimizers.append(main_opt)
-        
-        # Sparse embedding optimizer (if puzzle embeddings exist)
-        if hasattr(self.trm, 'puzzle_emb') and self.trm.puzzle_emb is not None:
-            from src.nn.modules.sparse_embeddings import CastedSparseEmbeddingSignSGD_Distributed
-            
-            # Force sparse embedding to be leaf tensor (same as base TRM)
-            self.trm.puzzle_emb.local_weights = self.trm.puzzle_emb.local_weights.detach().requires_grad_(True)
-            
-            sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
-                self.trm.puzzle_emb.buffers(),
-                lr=self.hparams.learning_rate_emb,
-                weight_decay=self.hparams.weight_decay,
-                world_size=1
-            )
-            optimizers.append(sparse_opt)
-        
-        return optimizers

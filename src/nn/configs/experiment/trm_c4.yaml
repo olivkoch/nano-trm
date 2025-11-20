@@ -20,40 +20,46 @@ timekeeping:
 
 # Model tuning parameters (for TRM base)
 model_tuning:
-  hidden_size: 256
-  num_layers: 4
-  num_heads: 4
+# TRM architecture
+  hidden_size:  256
+  num_layers:  4
+  num_heads:  4
   H_cycles: 2
   L_cycles: 4
   N_supervision: 6
   N_supervision_val: 6
   ffn_expansion: 2
-
+  
   # Optimization
-  learning_rate: 1e-4
-  learning_rate_emb: 1e-3
+  learning_rate: 2e-3
   weight_decay: 1e-4
   warmup_steps: 1000
-  max_steps: 1000
+  max_steps: 100000
   lr_min_ratio: 0.1
-
+  
 c4_tuning:
+  # Loss weights
+  policy_weight: 1.0
+  value_weight: 1.0
+  halt_weight: 0.5
+  
   # Self-play
-  games_per_epoch: 32
-  buffer_size: 10000
-  batch_size: 32
+  games_per_epoch: 100
+  buffer_size: 100000
+  batch_size: 256
   steps_per_epoch: 100
-
+  
   # MCTS
-  mcts_simulations: 3
+  mcts_simulations: 800
   mcts_c_puct: 1.0
   mcts_temperature: 1.0
   mcts_dirichlet_alpha: 0.3
   mcts_exploration_fraction: 0.25
-
+  
   # Evaluation
   eval_games_vs_minimax: 20
-  minimax_temperature: 1.0
+  minimax_temperature: 0.5
+  minimax_depth: 2
 
 trainer:
   accumulate_grad_batches: 1

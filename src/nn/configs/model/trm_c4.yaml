@@ -15,18 +15,18 @@ ffn_expansion: ${model_tuning.ffn_expansion}
 learning_rate: ${model_tuning.learning_rate}
 weight_decay: ${model_tuning.weight_decay}
 warmup_steps: ${model_tuning.warmup_steps}
-max_steps: ${model_tuning.max_steps}
 lr_min_ratio: ${model_tuning.lr_min_ratio}
+
+# DataLoader settings
+num_workers: ${timekeeping.num_workers}
+max_epochs: ${timekeeping.max_epochs}
+batch_size: ${timekeeping.batch_size}
+steps_per_epoch: ${timekeeping.steps_per_epoch}
 
 # Loss weights
 policy_weight: ${c4_tuning.policy_weight}
 value_weight: ${c4_tuning.value_weight}
 halt_weight: ${c4_tuning.halt_weight}
-# Self-play
-games_per_epoch: ${c4_tuning.games_per_epoch}
-buffer_size: ${c4_tuning.buffer_size}
-batch_size: ${c4_tuning.batch_size}
-steps_per_epoch: ${c4_tuning.steps_per_epoch}
 
 # MCTS
 mcts_simulations: ${c4_tuning.mcts_simulations}

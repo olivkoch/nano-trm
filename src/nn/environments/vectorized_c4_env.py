@@ -46,9 +46,9 @@ class VectorizedConnectFour:
         self.win_length = 4
         
         # Use constants from src.nn.utils.constants
-        self.EMPTY = C4_EMPTY_CELL      # 1
-        self.PLAYER1 = C4_PLAYER1_CELL  # 2
-        self.PLAYER2 = C4_PLAYER2_CELL  # 3
+        self.EMPTY = C4_EMPTY_CELL      
+        self.PLAYER1 = C4_PLAYER1_CELL  
+        self.PLAYER2 = C4_PLAYER2_CELL  
         
         # Pre-compute win checking kernels on device
         self._setup_win_kernels()

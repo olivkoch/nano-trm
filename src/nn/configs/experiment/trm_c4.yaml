@@ -14,9 +14,10 @@ seed: 42
 
 # Training configuration
 timekeeping:
-  max_epochs: 1000
-  batch_size: 256
+  max_epochs: 100
+  batch_size: 128
   num_workers: 0
+  steps_per_epoch: 10
 
 # Model tuning parameters (for TRM base)
 model_tuning:
@@ -31,10 +32,9 @@ model_tuning:
   ffn_expansion: 2
   
   # Optimization
-  learning_rate: 1e-2
+  learning_rate: 1e-3
   weight_decay: 1e-4
   warmup_steps: 0
-  max_steps: 100000
   lr_min_ratio: 0.1
   
 c4_tuning:
@@ -42,12 +42,6 @@ c4_tuning:
   policy_weight: 1.0
   value_weight: 1.0
   halt_weight: 0.5
-  
-  # Self-play
-  games_per_epoch: 100
-  buffer_size: 100000
-  batch_size: 256
-  steps_per_epoch: 100
   
   # MCTS
   mcts_simulations: 20

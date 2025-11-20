@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.nn.modules.utils import compute_lr
-from src.nn.utils.constants import IGNORE_LABEL_ID
 
 try:
     from adam_atan2 import AdamATan2
@@ -72,7 +71,7 @@ class SelfPlayTRMModule(LightningModule):
         halt_exploration_prob: float = 0.1,
         rope_theta: int = 10000,
         lr_min_ratio: float = 1.0,
-        vocab_size: int = 4,  # 0: empty, 1: player1, 2: player2, 3: padding
+        vocab_size: int = 3,  
         seq_len: int = 42,  # Board size
         policy_weight: float = 1.0,
         value_weight: float = 1.0,
@@ -221,9 +220,9 @@ class SelfPlayTRMModule(LightningModule):
             z_L = self.lenet(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.lenet(z_H, z_L, **seq_info)
 
-        # DUAL OUTPUTS for self-play
-        # Use mean pooling over sequence dimension for global representation
-        global_repr = z_H.mean(dim=1)  # [batch_size, hidden_size]
+        # Use first position as global representation (like Sudoku TRM)
+        # This is the "CLS token" position that aggregates board information
+        global_repr = z_H[:, 0, :]  # [batch_size, hidden_size]
         
         # Policy output (distribution over actions)
         policy_logits = self.policy_head(global_repr)  # [batch_size, action_space_size]
@@ -319,9 +318,23 @@ class SelfPlayTRMModule(LightningModule):
             value_mae = torch.abs(outputs["value"] - target_value)
             value_mse = (outputs["value"] - target_value) ** 2
             
+            # TODO: Alternatives to halting criteria
+
+            # Policy entropy: Low when the model is sure about the best move
+            #     policy_entropy = -(outputs["policy"] * torch.log(outputs["policy"] + 1e-8)).sum(dim=-1)
+            # normalized_entropy = policy_entropy / torch.log(torch.tensor(self.hparams.action_space_size))
+            # policy_confidence = 1.0 - normalized_entropy  # High when entropy is low
+
+            # Agreement with ground truth (if available and trusted)
+            # value_agreement = (value_mae < 0.2).float()  # Within 0.2 of MCTS value
+            overall_confidence = torch.abs(outputs["value"])
+            should_halt = overall_confidence > 0.7
+            is_terminal = torch.abs(target_value) > 0.9
+            should_halt = should_halt | is_terminal
+
             # Position complexity metric (is position "solved"?)
             # A position is "solved" if the value is close to -1 or 1
-            position_solved = torch.abs(target_value) > 0.9
+            # position_solved = torch.abs(target_value) > 0.9
             
             # Metrics for halted sequences
             valid_metrics = new_carry.halted
@@ -331,8 +344,9 @@ class SelfPlayTRMModule(LightningModule):
                 "policy_accuracy": torch.where(valid_metrics, policy_accuracy, 0).sum(),
                 "value_mae": torch.where(valid_metrics, value_mae, 0).sum(),
                 "value_mse": torch.where(valid_metrics, value_mse, 0).sum(),
+                "overall_confidence": torch.where(valid_metrics, overall_confidence, 0).sum(),
                 "q_halt_accuracy": (
-                    valid_metrics & ((outputs["q_halt_logits"] >= 0) == position_solved)
+                    valid_metrics & ((outputs["q_halt_logits"] >= 0) == should_halt)
                 ).sum(),
                 "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
@@ -347,7 +361,7 @@ class SelfPlayTRMModule(LightningModule):
         # Halting loss: BCE with position complexity
         q_halt_loss = F.binary_cross_entropy_with_logits(
             outputs["q_halt_logits"],
-            position_solved.to(outputs["q_halt_logits"].dtype),
+            should_halt.to(outputs["q_halt_logits"].dtype),
             reduction="sum",
         )
         
@@ -483,16 +497,17 @@ class SelfPlayTRMModule(LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer."""
+        all_params = list(self.parameters()) + list(self.model.parameters())
         try:
             optimizer = AdamATan2(
-                self.parameters(),
+                all_params,
                 lr=self.hparams.learning_rate,
                 weight_decay=self.hparams.weight_decay,
                 betas=(0.9, 0.95),
             )
         except NameError:
             optimizer = torch.optim.AdamW(
-                self.parameters(),
+                all_params,
                 lr=self.hparams.learning_rate,
                 weight_decay=self.hparams.weight_decay,
                 betas=(0.9, 0.95),

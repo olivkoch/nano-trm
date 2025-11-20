@@ -393,7 +393,7 @@ class TRMConnectFourModule(LightningModule):
                 # Ensure minimum buffer size
                 min_buffer = self.module.hparams.batch_size * 2
                 while len(self.module.replay_buffer) < min_buffer:
-                    self.module.collect_self_play_games()
+                    self.module.collect_self_play_games_minimax(temp_player1 = 0.1, temp_player2 = 0.8)
                 
                 # Sample batch
                 samples = random.sample(
@@ -473,17 +473,7 @@ class TRMConnectFourModule(LightningModule):
             
             # Periodic buffer refresh for distribution shift
             if self.trainer.current_epoch > 0 and self.trainer.current_epoch % 5 == 0:
-                old_size = len(self.replay_buffer)
-                # Keep only recent half
-                if old_size > min_buffer_size * 2:
-                    recent_games = list(self.replay_buffer)[-old_size//2:]
-                    self.replay_buffer.clear()
-                    self.replay_buffer.extend(recent_games)
-                    log.info(f"Refreshed buffer: kept {len(self.replay_buffer)}/{old_size} recent samples")
-            
-            # Ensure minimum buffer size
-            while len(self.replay_buffer) < min_buffer_size:
-                self.collect_self_play_games()
+                self.replay_buffer.clear()
     
     def on_validation_epoch_end(self):
         """Evaluate against minimax baseline"""
@@ -922,3 +912,163 @@ class TRMConnectFourModule(LightningModule):
             f.write(f"  Correct predictions (error < 0.3): {sum(1 for e in value_errors if e < 0.3)}/{len(value_errors)}\n")
         
         print(f"Game debug written to {output_file}")
+
+    def collect_self_play_games_minimax(self, depth: int = 2, temp_player1: float = 0.0, temp_player2: float = 0.5):
+        """
+        Collect self-play games using Minimax players with different temperatures.
+        Lower temperature = stronger/more deterministic play
+        Higher temperature = weaker/more exploratory play
+        
+        Args:
+            depth: Minimax search depth for both players
+            temp_player1: Temperature for player 1 (X). 0.0 = perfect play, 1.0 = more random
+            temp_player2: Temperature for player 2 (O). Different temp creates variety
+        """
+        from src.nn.modules.minimax import ConnectFourMinimax
+        
+        log.info(f"Collecting self-play games using Minimax (depth={depth}, P1_temp={temp_player1}, P2_temp={temp_player2})...")
+        
+        # Create minimax player
+        minimax = ConnectFourMinimax(depth=depth)
+        
+        # Run multiple games in parallel
+        n_parallel = 8
+        n_batches = max(1, self.hparams.games_per_epoch // n_parallel)
+        n_positions_added = 0
+        
+        for batch_idx in range(n_batches):
+            vec_env = VectorizedConnectFour(n_envs=n_parallel, device=self.device)
+            states = vec_env.reset()
+            trajectories = [[] for _ in range(n_parallel)]
+            
+            # Play all games until completion
+            while not states.is_terminal.all():
+                active_indices = []
+                for i in range(n_parallel):
+                    if not states.is_terminal[i]:
+                        active_indices.append(i)
+                
+                if not active_indices:
+                    break
+                
+                # Get minimax move for each active game
+                actions = torch.zeros(n_parallel, dtype=torch.long, device=self.device)
+                
+                for i in active_indices:
+                    # Get board and current player
+                    board_np = states.boards[i].cpu().numpy()
+                    current_player = states.current_players[i].item()
+                    
+                    # Use different temperatures for different players
+                    temperature = temp_player1 if current_player == 1 else temp_player2
+                    
+                    # Get minimax move with appropriate temperature
+                    action = minimax.get_best_move(board_np, current_player, temperature=temperature)
+                    actions[i] = action
+                    
+                    # Create policy target based on minimax evaluation
+                    # Instead of one-hot, we can create a distribution based on minimax scores
+                    policy = self._create_minimax_policy(
+                        board_np, 
+                        current_player, 
+                        states.legal_moves[i].cpu().numpy(),
+                        minimax, 
+                        temperature
+                    )
+                    
+                    # Store position
+                    trajectories[i].append({
+                        'board': states.boards[i].flatten(),
+                        'policy': torch.tensor(policy, device=self.device, dtype=torch.float32),
+                        'player': current_player
+                    })
+                
+                # Step environment
+                states = vec_env.step(actions)
+            
+            # Process completed games and assign values
+            for i in range(n_parallel):
+                if len(trajectories[i]) < 2:  # Skip very short games
+                    continue
+                
+                winner = states.winners[i].item()
+                
+                for position in trajectories[i]:
+                    # Assign value based on game outcome from this player's perspective
+                    if winner == 0:
+                        value = 0.0  # Draw
+                    elif winner == position['player']:
+                        value = 1.0  # Win
+                    else:
+                        value = -1.0  # Loss
+                    
+                    self.replay_buffer.append({
+                        'board': position['board'],
+                        'policy': position['policy'],
+                        'value': value
+                    })
+                    n_positions_added += 1
+            
+            self.games_played += n_parallel
+        
+        log.info(f"Collected {n_positions_added} positions using Minimax (depth={depth}), replay buffer size: {len(self.replay_buffer)}")
+
+    def _create_minimax_policy(self, board_np, current_player, legal_moves, minimax, temperature):
+        """
+        Create a policy distribution from minimax evaluations.
+        
+        Instead of a one-hot vector, this creates a probability distribution
+        where better moves (according to minimax) get higher probabilities.
+        """
+        import numpy as np
+        
+        policy = np.zeros(7)
+        
+        if temperature == 0.0:
+            # Deterministic: one-hot for best move
+            best_action = minimax.get_best_move(board_np, current_player, temperature=0.0)
+            policy[best_action] = 1.0
+        else:
+            # Get scores for all valid moves
+            move_scores = []
+            valid_actions = []
+            
+            for col in range(7):
+                if legal_moves[col]:
+                    # Make the move
+                    temp_board = board_np.copy()
+                    for row in range(5, -1, -1):
+                        if temp_board[row, col] == C4_EMPTY_CELL:
+                            temp_board[row, col] = current_player
+                            break
+                    
+                    # Evaluate position after this move
+                    # Note: minimax returns score from current player's perspective
+                    score = minimax.minimax(
+                        temp_board,
+                        depth=minimax.depth - 1,
+                        alpha=-float('inf'),
+                        beta=float('inf'),
+                        maximizing=False,  # Opponent's turn next
+                        player=current_player
+                    )
+                    
+                    move_scores.append(score)
+                    valid_actions.append(col)
+            
+            if move_scores:
+                # Convert scores to probabilities using softmax with temperature
+                move_scores = np.array(move_scores)
+                
+                # Normalize scores to prevent overflow in exp
+                move_scores = move_scores - np.max(move_scores)
+                
+                # Apply temperature and softmax
+                exp_scores = np.exp(move_scores / (temperature + 0.1))  # Add small value to prevent division by zero
+                probabilities = exp_scores / np.sum(exp_scores)
+                
+                # Assign probabilities to valid actions
+                for action, prob in zip(valid_actions, probabilities):
+                    policy[action] = prob
+        
+        return policy

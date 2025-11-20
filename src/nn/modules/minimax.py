@@ -178,15 +178,23 @@ class ConnectFourMinimax:
                         break
             return min_eval
     
-    def get_best_move(self, board: np.ndarray, player: int) -> int:
-        """Get the best move for the given player (1 or 2)."""
-        valid_moves = self.get_valid_moves(board)
+    def get_best_move(self, board: np.ndarray, player: int, temperature: float = 0.0) -> int:
+        """Get the best move for the given player (1 or 2).
         
+        Args:
+            board: Current board state
+            player: Player to move (1 or 2)
+            temperature: Randomness parameter (0-1). temp % of the time, play randomly.
+        """
+        valid_moves = self.get_valid_moves(board)
         if not valid_moves:
             return -1
-        
         if len(valid_moves) == 1:
             return valid_moves[0]
+        
+        # With probability = temperature, return random move
+        if np.random.random() < temperature:
+            return np.random.choice(valid_moves)
         
         # Check for immediate wins
         for col in valid_moves:
@@ -204,7 +212,6 @@ class ConnectFourMinimax:
         # Use minimax for best move
         best_move = valid_moves[0]
         best_score = float('-inf')
-        
         # Reset node counter for this move
         self.nodes_evaluated = 0
         
@@ -212,7 +219,7 @@ class ConnectFourMinimax:
             new_board = self.make_move(board, col, player)
             if new_board is not None:
                 score = self.minimax(new_board, self.depth-1, float('-inf'), 
-                                   float('inf'), False, player)
+                                    float('inf'), False, player)
                 if score > best_score:
                     best_score = score
                     best_move = col

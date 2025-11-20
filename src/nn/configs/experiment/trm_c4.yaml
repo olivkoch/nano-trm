@@ -31,9 +31,9 @@ model_tuning:
   ffn_expansion: 2
   
   # Optimization
-  learning_rate: 2e-3
+  learning_rate: 1e-2
   weight_decay: 1e-4
-  warmup_steps: 1000
+  warmup_steps: 0
   max_steps: 100000
   lr_min_ratio: 0.1
   
@@ -50,7 +50,7 @@ c4_tuning:
   steps_per_epoch: 100
   
   # MCTS
-  mcts_simulations: 800
+  mcts_simulations: 20
   mcts_c_puct: 1.0
   mcts_temperature: 1.0
   mcts_dirichlet_alpha: 0.3

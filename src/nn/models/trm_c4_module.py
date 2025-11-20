@@ -62,6 +62,7 @@ class TRMConnectFourModule(LightningModule):
         
         # Evaluation
         eval_games_vs_minimax: int = 20,
+        minimax_temperature: float = 0.5,
         
         output_dir: str = None,
         **kwargs
@@ -212,6 +213,98 @@ class TRMConnectFourModule(LightningModule):
                 exploration_fraction=self.hparams.mcts_exploration_fraction,
                 device=self.device
             )
+    
+    def collect_self_play_games_minimax(self, depth: int = 2, temp_player1: float = 0.0, temp_player2: float = 0.5):
+        """Collect self-play games using Minimax players with different temperatures
+        
+        Args:
+            depth: Minimax search depth
+            temp_player1: Temperature for player 1 (lower = stronger)
+            temp_player2: Temperature for player 2 (higher = weaker)
+        """
+        from src.nn.modules.minimax import ConnectFourMinimax
+        
+        log.info(f"Collecting self-play games using Minimax (depth={depth}, P1_temp={temp_player1}, P2_temp={temp_player2})...")
+        
+        # Run multiple games in parallel
+        n_parallel = 8
+        n_batches = max(1, self.hparams.games_per_epoch // n_parallel)
+        n_positions_added = 0
+        
+        # Create minimax player
+        minimax = ConnectFourMinimax(depth=depth)
+        
+        for batch_idx in range(n_batches):
+            # Use a single vectorized environment
+            vec_env = VectorizedConnectFour(n_envs=n_parallel, device=self.device)
+            states = vec_env.reset()
+            trajectories = [[] for _ in range(n_parallel)]
+            
+            # Play all games until completion
+            while not states.is_terminal.all():
+                # Process each active game
+                active_indices = []
+                for i in range(n_parallel):
+                    if not states.is_terminal[i]:
+                        active_indices.append(i)
+                
+                if not active_indices:
+                    break
+                
+                # Get minimax move for each active game
+                actions = torch.zeros(n_parallel, dtype=torch.long, device=self.device)
+                
+                for i in active_indices:
+                    # Get board and current player
+                    board_np = states.boards[i].cpu().numpy()
+                    current_player = states.current_players[i].item()
+                    
+                    # Use different temperatures for different players
+                    temp = temp_player1 if current_player == 1 else temp_player2
+                    
+                    # Get minimax move with appropriate temperature
+                    action = minimax.get_best_move(board_np, current_player, temperature=temp)
+                    actions[i] = action
+                    
+                    # Create policy target (one-hot for the chosen action)
+                    policy = torch.zeros(7, device=self.device)
+                    policy[action] = 1.0
+                    
+                    # Store position
+                    trajectories[i].append({
+                        'board': states.boards[i].flatten(),
+                        'policy': policy,
+                        'player': current_player
+                    })
+                
+                # Step environment
+                states = vec_env.step(actions)
+            
+            # Process completed games and assign values
+            for i in range(n_parallel):
+                if len(trajectories[i]) < 2:
+                    continue
+                
+                winner = states.winners[i].item()
+                
+                for position in trajectories[i]:
+                    if winner == 0:
+                        value = 0.0
+                    elif winner == position['player']:
+                        value = 1.0
+                    else:
+                        value = -1.0
+                    
+                    self.replay_buffer.append({
+                        'board': position['board'],
+                        'policy': policy,
+                        'value': value
+                    })
+                    n_positions_added += 1
+            
+            self.games_played += n_parallel
+    
+        log.info(f"Collected {n_positions_added} positions using Minimax (depth={depth}), replay buffer size: {len(self.replay_buffer)}")
     
     def collect_self_play_games(self):
         """Collect self-play games using MCTS - fully vectorized version"""
@@ -409,11 +502,13 @@ class TRMConnectFourModule(LightningModule):
                 assert self.module.mcts is not None, "MCTS not initialized!"
 
                 # Ensure enough data
-                min_buffer_size = self.module.hparams.batch_size * 2
-                while len(self.module.replay_buffer) < min_buffer_size:                    
-                    self.module.collect_self_play_games()
-                    print(f"Buffer size: {len(self.module.replay_buffer)}, {min_buffer_size} needed")
+                # min_buffer_size = self.module.hparams.batch_size * 2
+                # while len(self.module.replay_buffer) < min_buffer_size:                    
+                #     self.module.collect_self_play_games()
+                #     print(f"Buffer size: {len(self.module.replay_buffer)}, {min_buffer_size} needed")
                 
+                assert len(self.module.replay_buffer) >= self.module.hparams.batch_size, "Not enough data in replay buffer!"
+
                 # Sample batch
                 samples = random.sample(self.module.replay_buffer, self.module.hparams.batch_size)
                 
@@ -505,7 +600,7 @@ class TRMConnectFourModule(LightningModule):
             if len(self.replay_buffer) < min_buffer_size:
                 log.info(f"Epoch {self.trainer.current_epoch}: Buffer low ({len(self.replay_buffer)}), collecting games...")
                 while len(self.replay_buffer) < min_buffer_size:
-                    self.collect_self_play_games()
+                    self.collect_self_play_games_minimax(temp_player1=0.1, temp_player2=0.9) # minimax for training data
                     print(f"Buffer size: {len(self.replay_buffer)} / {min_buffer_size}")
                 log.info(f"Buffer size: {len(self.replay_buffer)}")
     
@@ -796,7 +891,7 @@ class TRMConnectFourModule(LightningModule):
                 else:
                     # Minimax's turn
                     board_np = self.vec_env.boards[0].cpu().numpy()
-                    action = minimax.get_best_move(board_np, current_player)
+                    action = minimax.get_best_move(board_np, current_player, temperature=self.hparams.minimax_temperature)
                 
                 # Execute action
                 actions = torch.zeros(self.vec_env.n_envs, dtype=torch.long, device=self.device)

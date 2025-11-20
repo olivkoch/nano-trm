@@ -53,6 +53,7 @@ c4_tuning:
 
   # Evaluation
   eval_games_vs_minimax: 20
+  minimax_temperature: 1.0
 
 trainer:
   accumulate_grad_batches: 1

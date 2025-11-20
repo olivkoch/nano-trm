@@ -25,9 +25,9 @@ model_tuning:
   num_layers:  4
   num_heads:  4
   H_cycles: 2
-  L_cycles: 4
-  N_supervision: 6
-  N_supervision_val: 6
+  L_cycles: 2
+  N_supervision: 2
+  N_supervision_val: 2
   ffn_expansion: 2
   
   # Optimization
@@ -76,3 +76,7 @@ logger:
   wandb:
     project: "trm-connectfour"
     tags: ${tags}
+
+callbacks:
+  model_checkpoint:
+    monitor: "val/policy_accuracy"

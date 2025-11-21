@@ -75,7 +75,6 @@ class TRMC4Module(LightningModule):
         learning_rate_emb: float = 1e-2,
         weight_decay: float = 0.01,
         warmup_steps: int = 2000,
-        max_steps: int = 100000,
         halt_exploration_prob: float = 0.1,
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
@@ -85,6 +84,7 @@ class TRMC4Module(LightningModule):
         vocab_size: int = 3,
         num_puzzles: int = 1,
         batch_size: int = 0,
+        max_epochs: int = 300,
         pad_value: int = -1,
         seq_len: int = 0,
         eval_minimax_depth: int = 4,
@@ -183,6 +183,9 @@ class TRMC4Module(LightningModule):
         self.manual_step = 0
         self.games_played = 0
         self.replay_buffer = []
+        self.max_steps = self.hparams.steps_per_epoch * self.hparams.max_epochs
+
+        log.info(f"Learning rates: model={learning_rate}, emb={learning_rate_emb} max steps = {self.max_steps}")
 
         # read game curriculum
         self.load_games_from_file(f"minimax_games_.pkl")
@@ -280,7 +283,7 @@ class TRMC4Module(LightningModule):
         # LM Outputs
         new_carry = TRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         policy_logits = self.lm_head(z_H[:,0])
-        value = self.value_head(z_H[:, 0]).to(torch.float32)
+        value = torch.tanh(self.value_head(z_H[:, 0])).to(torch.float32)
         q_logits = self.q_head(z_H[:, 0]).to(
             torch.float32
         )  # Q-head; uses the first puzzle_emb position
@@ -401,7 +404,7 @@ class TRMC4Module(LightningModule):
             }
         )
 
-        total_loss = policy_loss + value_loss + 0.5 * q_halt_loss
+        total_loss = policy_loss + 0.5 * value_loss + 0.5 * q_halt_loss
 
         return new_carry, total_loss, metrics, new_carry.halted.all()
 
@@ -493,7 +496,7 @@ class TRMC4Module(LightningModule):
 
         # Learning rate scheduling with warmup
         current_step = self.manual_step
-        total_steps = getattr(self, "total_steps", self.hparams.max_steps)
+        total_steps = getattr(self, "total_steps", self.max_steps)
 
         # Base learning rates for each optimizer
         base_lrs = [self.hparams.learning_rate]
@@ -501,7 +504,8 @@ class TRMC4Module(LightningModule):
             base_lrs.append(self.hparams.learning_rate_emb)
 
         # Compute learning rate for this step
-        for opt, base_lr in zip(opts, base_lrs):
+        for i, (opt, base_lr) in enumerate(zip(opts, base_lrs)):
+    
             if current_step < self.hparams.warmup_steps:
                 lr_this_step = compute_lr(
                     base_lr=base_lr,
@@ -526,8 +530,8 @@ class TRMC4Module(LightningModule):
                 opt.step()
                 opt.zero_grad()
 
-        # Log learning rate (will log the last optimizer's LR)
-        self.log("train/lr", lr_this_step, on_step=True)
+            # Log learning rate (will log the last optimizer's LR)
+            self.log(f"train/lr_{i}", lr_this_step, on_step=True)
 
         # Log metrics
         if metrics.get("count", 0) > 0:

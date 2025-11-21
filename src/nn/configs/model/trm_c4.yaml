@@ -1,44 +1,31 @@
-_target_: src.nn.models.trm_c4_module.TRMConnectFourModule
+_target_: src.nn.models.trm_c4_module.TRMC4Module
 _recursive_: false  # Prevent recursive instantiation of nested configs
 
-# TRM architecture
+ffn_expansion: ${model_tuning.ffn_expansion}
 hidden_size: ${model_tuning.hidden_size}
-num_layers:  ${model_tuning.num_layers}
-num_heads:  ${model_tuning.num_heads}
+num_layers: ${model_tuning.num_layers}
+N_supervision: ${model_tuning.N_supervision}
+learning_rate: ${model_tuning.learning_rate}
 H_cycles: ${model_tuning.H_cycles}
 L_cycles: ${model_tuning.L_cycles}
-N_supervision: ${model_tuning.N_supervision}
-N_supervision_val: ${model_tuning.N_supervision_val}
-ffn_expansion: ${model_tuning.ffn_expansion}
-
-# Optimization
-learning_rate: ${model_tuning.learning_rate}
+learning_rate_emb: ${model_tuning.learning_rate_emb}
 weight_decay: ${model_tuning.weight_decay}
+halt_exploration_prob: ${model_tuning.halt_exploration_prob}
 warmup_steps: ${model_tuning.warmup_steps}
+max_steps: ${model_tuning.max_steps}
+puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
+puzzle_emb_len: ${model_tuning.puzzle_emb_len}
+rope_theta: ${model_tuning.rope_theta}
 lr_min_ratio: ${model_tuning.lr_min_ratio}
 
-# DataLoader settings
-num_workers: ${timekeeping.num_workers}
-max_epochs: ${timekeeping.max_epochs}
-batch_size: ${timekeeping.batch_size}
 steps_per_epoch: ${timekeeping.steps_per_epoch}
+batch_size: ${timekeeping.batch_size}
+seq_len: ${model_tuning.seq_len}
+vocab_size: ${model_tuning.vocab_size}
 
-# Loss weights
-policy_weight: ${c4_tuning.policy_weight}
-value_weight: ${c4_tuning.value_weight}
-halt_weight: ${c4_tuning.halt_weight}
-
-# MCTS
-mcts_simulations: ${c4_tuning.mcts_simulations}
-mcts_c_puct: ${c4_tuning.mcts_c_puct}
-mcts_temperature: ${c4_tuning.mcts_temperature}
-mcts_dirichlet_alpha: ${c4_tuning.mcts_dirichlet_alpha}
-mcts_exploration_fraction: ${c4_tuning.mcts_exploration_fraction}
-
-# Evaluation
-eval_games_vs_minimax: ${c4_tuning.eval_games_vs_minimax}
-minimax_temperature: ${c4_tuning.minimax_temperature}
-minimax_depth: ${c4_tuning.minimax_depth}
+eval_minimax_depth: ${model_tuning.eval_minimax_depth}
+eval_minimax_temperature: ${model_tuning.eval_minimax_temperature}
+eval_games_vs_minimax: ${model_tuning.eval_games_vs_minimax}
 
 # Output directory
 output_dir: None

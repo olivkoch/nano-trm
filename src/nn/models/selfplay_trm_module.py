@@ -497,17 +497,16 @@ class SelfPlayTRMModule(LightningModule):
 
     def configure_optimizers(self):
         """Configure optimizer."""
-        all_params = list(self.parameters()) + list(self.model.parameters())
         try:
             optimizer = AdamATan2(
-                all_params,
+                self.parameters(),
                 lr=self.hparams.learning_rate,
                 weight_decay=self.hparams.weight_decay,
                 betas=(0.9, 0.95),
             )
         except NameError:
             optimizer = torch.optim.AdamW(
-                all_params,
+                self.parameters(),
                 lr=self.hparams.learning_rate,
                 weight_decay=self.hparams.weight_decay,
                 betas=(0.9, 0.95),

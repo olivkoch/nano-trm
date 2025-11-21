@@ -445,6 +445,49 @@ class TRMModule(LightningModule):
         scaled_loss = loss / batch_size
         scaled_loss.backward()
 
+        # ADD GRADIENT MONITORING HERE
+        with torch.no_grad():
+            # 1. Total gradient norm
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.parameters(), 
+                max_norm=float('inf')  # Don't actually clip, just compute norm
+            ).item()
+            
+            # 2. Key component gradient norms
+            grad_metrics = {}
+            
+            # First attention layer
+            if self.lenet.layers[0].self_attn.qkv_proj.weight.grad is not None:
+                grad_metrics['first_attn'] = self.lenet.layers[0].self_attn.qkv_proj.weight.grad.norm().item()
+            
+            # Last MLP layer
+            if self.lenet.layers[-1].mlp.down_proj.weight.grad is not None:
+                grad_metrics['last_mlp'] = self.lenet.layers[-1].mlp.down_proj.weight.grad.norm().item()
+            
+            # Output heads
+            if self.lm_head.weight.grad is not None:
+                grad_metrics['lm_head'] = self.lm_head.weight.grad.norm().item()
+            
+            if self.q_head.weight.grad is not None:
+                grad_metrics['q_head'] = self.q_head.weight.grad.norm().item()
+            
+            # Log main metric
+            self.log('grad/total_norm', total_grad_norm, on_step=True, prog_bar=True)
+            
+            # Log gradient flow ratio (first vs last layer)
+            if 'first_attn' in grad_metrics and 'last_mlp' in grad_metrics:
+                ratio = grad_metrics['first_attn'] / (grad_metrics['last_mlp'] + 1e-8)
+                self.log('grad/flow_ratio', ratio, on_step=True, prog_bar=True)
+            
+            # Optional: log individual components
+            for name, value in grad_metrics.items():
+                self.log(f'grad/{name}', value, on_step=True)
+            
+            # Warning for problematic gradients
+            if total_grad_norm < 1e-6 or total_grad_norm > 100:
+                log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
+        
+
         lr_this_step = None
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 

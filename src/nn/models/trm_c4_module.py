@@ -122,7 +122,7 @@ class TRMConnectFourModule(LightningModule):
 
         assert self.n_games % 8 == 0, "steps_per_epoch x batch_size must be multiple of 8 for parallel collection"
 
-        self.replay_buffer = deque(maxlen=self.n_games)
+        self.replay_buffer = [] # deque(maxlen=1000000)#self.n_games)
         
         # Components (initialized in setup)
         self.vec_env = None
@@ -297,9 +297,9 @@ class TRMConnectFourModule(LightningModule):
         target_policies = batch['policies'].to(self.device)
         target_values = batch['values'].to(self.device)
         
-        if batch_idx % 100 == 0:
-            self.debug_training_data(num_samples=15, output_file="debug_training_data.txt")
-            self.debug_game_collection()
+        # if batch_idx % 1000 == 0:
+        #     self.debug_training_data(num_samples=15, output_file=f"debug_training_data_{batch_idx}.txt")
+        #     self.debug_game_collection()
             
         # Get valid actions mask
         boards_reshaped = boards.view(-1, self.board_rows, self.board_cols)
@@ -386,6 +386,7 @@ class TRMConnectFourModule(LightningModule):
             
             def __getitem__(self, idx):
                 # Sample batch
+                assert(len(self.module.replay_buffer) >= self.module.hparams.batch_size)
                 samples = random.sample(
                     self.module.replay_buffer, 
                     self.module.hparams.batch_size
@@ -451,9 +452,9 @@ class TRMConnectFourModule(LightningModule):
     
     def on_train_epoch_start(self):
         """Refresh training data at epoch start"""
-        if self.mcts is not None:            
-            self.replay_buffer.clear()
-            self.collect_self_play_games_minimax(n_games=self.n_games, depth=2, temp_player1=0.2, temp_player2=0.8)
+        if len(self.replay_buffer) == 0:
+            self.load_games_from_file(f"minimax_games_.pkl")
+            # self.collect_self_play_games_minimax(n_games=self.n_games, depth=2, temp_player1=0.2, temp_player2=0.8)
     
     def on_validation_epoch_end(self):
         """Evaluate against minimax baseline"""
@@ -547,14 +548,14 @@ class TRMConnectFourModule(LightningModule):
         try:
             from adam_atan2 import AdamATan2
             optimizer = AdamATan2(
-                self.parameters(),
+                self.model.parameters(),
                 lr=self.hparams.learning_rate,
                 weight_decay=self.hparams.weight_decay,
                 betas=(0.9, 0.95)
             )
         except ImportError:
             optimizer = torch.optim.AdamW(
-                self.parameters(),
+                self.model.parameters(),
                 lr=self.hparams.learning_rate,
                 weight_decay=self.hparams.weight_decay,
                 betas=(0.9, 0.95)
@@ -939,8 +940,10 @@ class TRMConnectFourModule(LightningModule):
         n_parallel = 8
         n_batches = max(1, n_games // n_parallel)
         n_positions_added = 0
-        
+        trajectories_lengths = []
+
         for batch_idx in range(n_batches):
+            print(f"  Batch {batch_idx+1}/{n_batches}...")
             vec_env = VectorizedConnectFour(n_envs=n_parallel, device=self.device)
             states = vec_env.reset()
             trajectories = [[] for _ in range(n_parallel)]
@@ -972,14 +975,9 @@ class TRMConnectFourModule(LightningModule):
                     
                     # Create policy target based on minimax evaluation
                     # Instead of one-hot, we can create a distribution based on minimax scores
-                    policy = self._create_minimax_policy(
-                        board_np, 
-                        current_player, 
-                        states.legal_moves[i].cpu().numpy(),
-                        minimax, 
-                        temperature
-                    )
-                    
+                    policy = np.zeros(7)
+                    policy[action] = 1.0  # One-hot for now; can be improved to a distribution
+ 
                     # Store position
                     trajectories[i].append({
                         'board': states.boards[i].flatten(),
@@ -990,8 +988,13 @@ class TRMConnectFourModule(LightningModule):
                 # Step environment
                 states = vec_env.step(actions)
             
+            trajectories_lengths.extend([len(t) for t in trajectories])
+
             # Process completed games and assign values
             for i in range(n_parallel):
+                assert(len(trajectories[i]) == states.move_counts[i].item())
+                assert(len(trajectories[i]) >= 7)  # Minimum moves to finish a game
+
                 if len(trajectories[i]) < 2:  # Skip very short games
                     continue
                 
@@ -1015,64 +1018,66 @@ class TRMConnectFourModule(LightningModule):
             
             self.games_played += n_parallel
         
-        log.info(f"Collected {n_positions_added} positions using Minimax (depth={depth}), replay buffer size: {len(self.replay_buffer)}")
+        print(f"Collected {n_positions_added} positions using Minimax (depth={depth}), replay buffer size: {len(self.replay_buffer)}")
+        print(f"Average game length: {np.mean(trajectories_lengths):.1f} moves")
 
-    def _create_minimax_policy(self, board_np, current_player, legal_moves, minimax, temperature):
+    def load_games_from_file(self, input_file: str):
         """
-        Create a policy distribution from minimax evaluations.
+        Load games from a JSON file into the replay buffer.
         
-        Instead of a one-hot vector, this creates a probability distribution
-        where better moves (according to minimax) get higher probabilities.
+        Args:
+            input_file: Path to JSON file containing game data
         """
-        import numpy as np
         
-        policy = np.zeros(7)
+        log.info(f"Loading games from {input_file}...")
+        import pickle
+        data = pickle.load(open(input_file, 'rb'))
         
-        if temperature == 0.0:
-            # Deterministic: one-hot for best move
-            best_action = minimax.get_best_move(board_np, current_player, temperature=0.0)
-            policy[best_action] = 1.0
-        else:
-            # Get scores for all valid moves
-            move_scores = []
-            valid_actions = []
+        positions = data['positions']
+        
+        for pos in positions:
+            board = torch.tensor(pos['board'], dtype=torch.float32, device=self.device)
+            policy = torch.tensor(pos['policy'], dtype=torch.float32, device=self.device)
+            value = pos['value']
             
-            for col in range(7):
-                if legal_moves[col]:
-                    # Make the move
-                    temp_board = board_np.copy()
-                    for row in range(5, -1, -1):
-                        if temp_board[row, col] == C4_EMPTY_CELL:
-                            temp_board[row, col] = current_player
-                            break
-                    
-                    # Evaluate position after this move
-                    # Note: minimax returns score from current player's perspective
-                    score = minimax.minimax(
-                        temp_board,
-                        depth=minimax.depth - 1,
-                        alpha=-float('inf'),
-                        beta=float('inf'),
-                        maximizing=False,  # Opponent's turn next
-                        player=current_player
-                    )
-                    
-                    move_scores.append(score)
-                    valid_actions.append(col)
-            
-            if move_scores:
-                # Convert scores to probabilities using softmax with temperature
-                move_scores = np.array(move_scores)
-                
-                # Normalize scores to prevent overflow in exp
-                move_scores = move_scores - np.max(move_scores)
-                
-                # Apply temperature and softmax
-                exp_scores = np.exp(move_scores / (temperature + 0.1))  # Add small value to prevent division by zero
-                probabilities = exp_scores / np.sum(exp_scores)
-                
-                # Assign probabilities to valid actions
-                for action, prob in zip(valid_actions, probabilities):
-                    policy[action] = prob
+            self.replay_buffer.append({
+                'board': board,
+                'policy': policy,
+                'value': value
+            })
         
-        return policy
+        log.info(f"Loaded {len(positions)} positions from {data['num_games']} games")
+        log.info(f"Replay buffer now contains {len(self.replay_buffer)} positions")
+
+if __name__ == "__main__":
+    # collect some games
+    module = TRMConnectFourModule()
+    module.replay_buffer = []# deque(maxlen=1000000)
+    module.collect_self_play_games_minimax(n_games=10000, depth=2, temp_player1=0.2, temp_player2=0.8)
+    # Save games to file
+        
+    output_file = f"minimax_games_.pkl"
+    
+    games_data = []
+    for item in module.replay_buffer:
+        games_data.append({
+            'board': item['board'].cpu().numpy().tolist(),
+            'policy': item['policy'].cpu().numpy().tolist(),
+            'value': float(item['value'])
+        })
+    data = {}
+    data['positions'] = games_data
+    data['num_games'] = module.games_played
+    data['num_positions'] = len(games_data)
+    import pickle
+    with open(output_file, 'wb') as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # import json
+    # with open(output_file, 'w') as f:
+    #     json.dump({
+    #         'num_games': module.games_played,
+    #         'num_positions': len(games_data),
+    #         'positions': games_data
+    #     }, f, separators=(',', ':'))
+    
+    print(f"Saved {len(games_data)} positions from {module.games_played} games to {output_file}")

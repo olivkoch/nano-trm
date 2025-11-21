@@ -12,7 +12,6 @@ learning_rate_emb: ${model_tuning.learning_rate_emb}
 weight_decay: ${model_tuning.weight_decay}
 halt_exploration_prob: ${model_tuning.halt_exploration_prob}
 warmup_steps: ${model_tuning.warmup_steps}
-max_steps: ${model_tuning.max_steps}
 puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
 puzzle_emb_len: ${model_tuning.puzzle_emb_len}
 rope_theta: ${model_tuning.rope_theta}
@@ -20,6 +19,8 @@ lr_min_ratio: ${model_tuning.lr_min_ratio}
 
 steps_per_epoch: ${timekeeping.steps_per_epoch}
 batch_size: ${timekeeping.batch_size}
+max_epochs: ${timekeeping.max_epochs}
+
 seq_len: ${model_tuning.seq_len}
 vocab_size: ${model_tuning.vocab_size}
 

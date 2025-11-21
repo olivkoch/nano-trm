@@ -105,7 +105,6 @@ def train(cfg: DictConfig) -> Optional[float]:
     log.info("="*50)
     log.info(f"Training configuration:")
     log.info(f"  Max epochs: {cfg.trainer.max_epochs}")
-    log.info(f"  MCTS simulations: {cfg.model.mcts_simulations}")
     log.info(f"  Val check interval: {cfg.trainer.get('val_check_interval', '1.0')}")
     
     # Start training

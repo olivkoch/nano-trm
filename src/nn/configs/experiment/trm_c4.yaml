@@ -14,51 +14,41 @@ seed: 42
 
 # Training configuration
 timekeeping:
-  max_epochs: 100
-  batch_size: 128
+  max_epochs: 300
+  batch_size: 512
   num_workers: 0
-  steps_per_epoch: 10
+  steps_per_epoch: 100
 
-# Model tuning parameters (for TRM base)
 model_tuning:
-# TRM architecture
-  hidden_size:  256
-  num_layers:  4
-  num_heads:  4
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-3
+  weight_decay: 0.1
+  warmup_steps: 100
+  lr_min_ratio: 1.0
+  num_heads: 2
+  halt_exploration_prob: 0.1
+  N_supervision: 4
+  N_supervision_val: 4
   H_cycles: 2
   L_cycles: 2
-  N_supervision: 2
-  N_supervision_val: 2
+  num_layers: 1
+  max_steps: 0
+  puzzle_emb_dim: 4
+  puzzle_emb_len: 4
+  hidden_size: 64
   ffn_expansion: 2
-  
-  # Optimization
-  learning_rate: 1e-3
-  weight_decay: 1e-4
-  warmup_steps: 0
-  lr_min_ratio: 0.1
-  
-c4_tuning:
-  # Loss weights
-  policy_weight: 1.0
-  value_weight: 1.0
-  halt_weight: 0.5
-  
-  # MCTS
-  mcts_simulations: 20
-  mcts_c_puct: 1.0
-  mcts_temperature: 1.0
-  mcts_dirichlet_alpha: 0.3
-  mcts_exploration_fraction: 0.25
-  
-  # Evaluation
-  eval_games_vs_minimax: 20
-  minimax_temperature: 0.5
-  minimax_depth: 2
+  rope_theta: 10000
+  seq_len: 42
+  vocab_size: 3
+  eval_minimax_depth: 4
+  eval_minimax_temperature: 0.5
+  eval_games_vs_minimax: 64
 
+  
 trainer:
   accumulate_grad_batches: 1
   check_val_every_n_epoch: 1
-  log_every_n_steps: 50
+  log_every_n_steps: 10
   num_sanity_val_steps: 0
 
 # Paths

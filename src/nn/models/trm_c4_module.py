@@ -359,9 +359,6 @@ class TRMC4Module(LightningModule):
             target_actions = target_policy.argmax(dim=-1)
             policy_accuracy = (pred_actions == target_actions).float()
 
-            target_values = new_carry.current_data["values"]  # From your dataloader
-            value_loss = F.mse_loss(outputs["value"], target_values, reduction="sum")
-
             # outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
 
             # Correctness
@@ -387,7 +384,8 @@ class TRMC4Module(LightningModule):
                 
             }
 
-        # Compute losses - IMPORTANT: These are per-sequence losses that will be summed
+        target_values = new_carry.current_data["values"]  # From your dataloader
+        value_loss = F.mse_loss(outputs["value"], target_values, reduction="sum")
         policy_loss = -torch.sum(target_policy * torch.log(outputs["policy"] + 1e-8), dim=-1).sum()
         
         q_halt_loss = F.binary_cross_entropy_with_logits(
@@ -910,7 +908,7 @@ if __name__ == "__main__":
     # collect some games
     module = TRMC4Module()
     module.replay_buffer = []
-    module.collect_self_play_games_minimax(n_games=5000, depth=2, temp_player1=0.2, temp_player2=0.8)
+    module.collect_self_play_games_minimax(n_games=5000, depth=3, temp_player1=0.3, temp_player2=0.5)
 
     # Save games to file
     output_file = f"minimax_games_.pkl"

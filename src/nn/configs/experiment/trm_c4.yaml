@@ -39,9 +39,9 @@ model_tuning:
   rope_theta: 10000
   seq_len: 42
   vocab_size: 3
-  eval_minimax_depth: 4
+  eval_minimax_depth: 2
   eval_minimax_temperature: 0.5
-  eval_games_vs_minimax: 64
+  eval_games_vs_minimax: 512
 
   
 trainer:

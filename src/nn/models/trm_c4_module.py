@@ -207,7 +207,6 @@ class TRMC4Module(LightningModule):
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
-            # print(f"Catting {puzzle_embedding.view(-1, self.puzzle_emb_len, self.hparams.hidden_size).shape=} and {embedding.shape=}")
             embedding = torch.cat(
                 (
                     puzzle_embedding.view(-1, self.puzzle_emb_len, self.hparams.hidden_size),
@@ -404,7 +403,7 @@ class TRMC4Module(LightningModule):
             }
         )
 
-        total_loss = policy_loss + 0.5 * value_loss + 0.5 * q_halt_loss
+        total_loss = policy_loss + 0.5 * value_loss # + 0.5 * q_halt_loss
 
         return new_carry, total_loss, metrics, new_carry.halted.all()
 
@@ -705,10 +704,14 @@ class TRMC4Module(LightningModule):
                     policy = np.zeros(7)
                     policy[action] = 1.0  # One-hot for now; can be improved to a distribution
 
+                    legal_moves = (states.boards[i].view(6, 7)[0, :] == 0).cpu().numpy()
+                    assert legal_moves[action], "Target move must be legal!"
+
                     # Store position
                     trajectories[i].append({
                         'board': states.boards[i].flatten(),
                         'policy': torch.tensor(policy, device=self.device, dtype=torch.float32),
+                        'legal_moves': torch.tensor(legal_moves, device=self.device, dtype=torch.bool),
                         'player': current_player
                     })
                 
@@ -727,21 +730,31 @@ class TRMC4Module(LightningModule):
                 
                 winner = states.winners[i].item()
                 
-                for position in trajectories[i]:
-                    # Assign value based on game outcome from this player's perspective
-                    if winner == 0:
-                        value = 0.0  # Draw
-                    elif winner == position['player']:
-                        value = 1.0  # Win
-                    else:
-                        value = -1.0  # Loss
+                trajectory = trajectories[i]
+                for position_index, position in enumerate(trajectory):
+                    game_length = len(trajectory)
+
+                    # Distance from end of game
+                    distance_from_end = game_length - position_index - 1
+    
+                    # Decay factor
+                    decay = 0.9 ** distance_from_end
                     
-                    self.replay_buffer.append({
-                        'board': position['board'],
-                        'policy': position['policy'],
-                        'value': value
-                    })
-                    n_positions_added += 1
+                    # Assign value based on outcome and distance
+                    if winner == 0:
+                        value = 0.0
+                    elif winner == position['player']:
+                        value = decay  # Good moves closer to win are better
+                    else:
+                        value = -decay  # Bad moves closer to loss are worse
+                    
+                    if value > 0.2:
+                        self.replay_buffer.append({
+                            'board': position['board'],
+                            'policy': position['policy'],
+                            'value': value
+                        })
+                        n_positions_added += 1
             
             self.games_played += n_parallel
         

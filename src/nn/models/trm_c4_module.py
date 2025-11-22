@@ -10,9 +10,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from src.nn.utils.constants import C4_EMPTY_CELL
 from src.nn.modules.utils import compute_lr
-from src.nn.utils.constants import IGNORE_LABEL_ID
 
 try:
     from adam_atan2 import AdamATan2
@@ -306,7 +305,6 @@ class TRMC4Module(LightningModule):
             new_inner_carry, new_current_data
         )
 
-        from src.nn.utils.constants import C4_EMPTY_CELL
         boards = new_current_data["boards"]
         boards_reshaped = boards.view(-1, self.board_rows, self.board_cols)
         valid_actions = boards_reshaped[:, 0, :] == C4_EMPTY_CELL
@@ -353,7 +351,15 @@ class TRMC4Module(LightningModule):
         """Compute loss and metrics without circular reference."""
         # Get model outputs
         new_carry, outputs = self.forward(carry, batch)
+
+        # Get legal moves for each position
+        boards = new_carry.current_data["boards"]
+        boards_reshaped = boards.view(-1, 6, 7)
+        legal_moves = boards_reshaped[:, 0, :] == C4_EMPTY_CELL  # Top row empty = legal
+
         target_policy = new_carry.current_data["policies"]
+        target_policy = target_policy * legal_moves.float()
+        target_policy = target_policy / target_policy.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
         with torch.no_grad():
 
@@ -361,15 +367,6 @@ class TRMC4Module(LightningModule):
             target_actions = target_policy.argmax(dim=-1)
             policy_accuracy = (pred_actions == target_actions).float()
 
-            # outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
-
-            # Correctness
-            # loss_counts = labels.sum(-1)
-
-            # loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
-
-            # is_correct = torch.argmax(outputs["policy_logits"], dim=-1) == target_policy.argmax(dim=-1)
-            # seq_is_correct = is_correct.sum(-1) == loss_counts
             value_certainty = outputs["value"].abs()  # How sure we are about position
             should_halt = value_certainty > 0.8  # Halt when very certain about outcome
 
@@ -593,7 +590,7 @@ class TRMC4Module(LightningModule):
 
     def on_train_epoch_end(self):
         """Don't interfere with training carry during validation."""
-        # self.evaluate_vs_minimax_fast()
+        self.evaluate_vs_minimax_fast()
         pass
 
     def on_train_epoch_start(self):
@@ -836,7 +833,7 @@ class TRMC4Module(LightningModule):
         
         minimax = ConnectFourMinimax(depth=self.hparams.eval_minimax_depth)
         n_games = self.hparams.eval_games_vs_minimax
-        n_parallel = 8  # Can handle more parallel games without MCTS
+        n_parallel = self.hparams.batch_size  # Can handle more parallel games without MCTS
         n_batches = (n_games + n_parallel - 1) // n_parallel
         
         wins = 0
@@ -882,9 +879,19 @@ class TRMC4Module(LightningModule):
                         boards_tensor = torch.stack(active_model_positions).to(self.device)
                         batch = {'boards': boards_tensor,
                                  'puzzle_identifiers': torch.zeros(len(active_model_positions), dtype=torch.long, device=self.device)}
+                        # Pad to batch size
+                        actual_batch_size = len(active_model_positions)
+                        # print(f"Evaluating {actual_batch_size} positions in batch...")
+                        if actual_batch_size < self.hparams.batch_size:
+                            pad_size = self.hparams.batch_size - actual_batch_size
+                            # print(f"Adding padding of size {pad_size} to match batch size {self.hparams.batch_size}")
+                            boards_tensor = F.pad(boards_tensor, (0, 0, 0, pad_size))
+                            batch['puzzle_identifiers'] = F.pad(batch['puzzle_identifiers'], (0, pad_size))
+                            batch['boards'] = boards_tensor
                         carry = self.initial_carry(batch)
                         _, policies = self.forward(carry, batch)
                         policies = policies['policy']
+                        policies = policies[:actual_batch_size]
                         
                         for j, idx in enumerate(active_model_indices):
                             # Apply legal moves mask
@@ -925,7 +932,7 @@ if __name__ == "__main__":
     # collect some games
     module = TRMC4Module()
     module.replay_buffer = []
-    module.collect_self_play_games_minimax(n_games=5000, depth=3, temp_player1=0.3, temp_player2=0.5)
+    module.collect_self_play_games_minimax(n_games=5000, depth=4, temp_player1=0.1, temp_player2=0.3)
 
     # Save games to file
     output_file = f"minimax_games_.pkl"

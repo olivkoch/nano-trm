@@ -14,16 +14,16 @@ seed: 42
 
 # Training configuration
 timekeeping:
-  max_epochs: 300
+  max_epochs: 1200
   batch_size: 512
   num_workers: 0
   steps_per_epoch: 100
 
 model_tuning:
-  learning_rate: 3e-5
-  learning_rate_emb: 3e-4
+  learning_rate: 3e-3
+  learning_rate_emb: 3e-2
   weight_decay: 0.1
-  warmup_steps: 1000
+  warmup_steps: 10000
   lr_min_ratio: 1.0
   num_heads: 2
   halt_exploration_prob: 0.1

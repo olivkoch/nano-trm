@@ -1,0 +1,56 @@
+# @package _global_
+# Connect Four self-play training experiment
+defaults:
+  - override /model: cnn_c4
+  - override /callbacks: default
+  - override /trainer: gpu
+
+tags: ["connectfour", "trm", "self-play"]
+
+task_name: "train_c4"
+
+# Experiment tracking
+seed: 42
+
+# Training configuration
+timekeeping:
+  max_epochs: 1200
+  batch_size: 512
+  num_workers: 0
+  steps_per_epoch: 100
+
+model_tuning:
+  model_type:  "cnn"  # "cnn" or "mlp"
+  hidden_size:  512
+  num_layers:  4  # For MLP or number of residual blocks for CNN
+  cnn_channels: 128  # Number of channels for CNN
+  learning_rate: 1e-3
+  weight_decay: 0.01
+  warmup_steps:  1000
+  lr_min_ratio:  0.1
+  eval_minimax_depth:  2
+  eval_minimax_temperature:  0.5
+  eval_games_vs_minimax:  512
+  dropout: 0.1
+  use_residual: False  # For CNN - use residual blocks
+
+  
+trainer:
+  accumulate_grad_batches: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 10
+  num_sanity_val_steps: 0
+
+# Paths
+save_dir: /tmp/ml-experiments/connectfour
+append_wandb_name_to_save_dir: true
+
+# Logger
+logger:
+  wandb:
+    project: "trm-connectfour"
+    tags: ${tags}
+
+callbacks:
+  model_checkpoint:
+    monitor: "val/policy_accuracy"

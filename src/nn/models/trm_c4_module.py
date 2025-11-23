@@ -660,7 +660,7 @@ class TRMC4Module(LightningModule):
         minimax = ConnectFourMinimax(depth=depth)
         
         # Run multiple games in parallel
-        n_parallel = 8
+        n_parallel = 512
         n_batches = max(1, n_games // n_parallel)
         n_positions_added = 0
         trajectories_lengths = []
@@ -932,7 +932,7 @@ if __name__ == "__main__":
     # collect some games
     module = TRMC4Module()
     module.replay_buffer = []
-    module.collect_self_play_games_minimax(n_games=5000, depth=4, temp_player1=0.1, temp_player2=0.3)
+    module.collect_self_play_games_minimax(n_games=50000, depth=4, temp_player1=0.1, temp_player2=0.3)
 
     # Save games to file
     output_file = f"minimax_games_.pkl"

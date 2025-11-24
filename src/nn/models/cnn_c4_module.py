@@ -595,7 +595,7 @@ class C4BaselineModule(LightningModule):
         if epoch % self.hparams.eval_interval == 0:
             # Evaluate vs random
                 win_rate, _ = self.evaluate_vs_random()
-                self.log('eval/win_rate_vs_random', win_rate, prog_bar=True)
+                self.log('eval/win_rate_vs_random', win_rate)
                 
                 # Evaluate vs previous version
                 if self.previous_model is not None:
@@ -603,8 +603,8 @@ class C4BaselineModule(LightningModule):
                     self.log('eval/win_rate_vs_previous', win_rate)
 
                 # Evaluate vs minimax
-                win_rate = self.evaluate_vs_minimax_fast()
-                self.log('eval/win_rate_vs_minimax', win_rate, prog_bar=True)
+                win_rate, _ = self.evaluate_vs_minimax_fast()
+                self.log('eval/win_rate_vs_minimax', win_rate)
 
 
         # Update previous model for self-play

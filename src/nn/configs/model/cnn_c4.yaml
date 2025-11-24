@@ -14,6 +14,13 @@ eval_minimax_temperature: ${model_tuning.eval_minimax_temperature}
 eval_games_vs_minimax: ${model_tuning.eval_games_vs_minimax}
 dropout: ${model_tuning.dropout}
 use_residual: ${model_tuning.use_residual}  # For CNN - use residual blocks
+# Self-play settings
+enable_selfplay: ${model_tuning.enable_selfplay}
+selfplay_buffer_size: ${model_tuning.selfplay_buffer_size}
+selfplay_games_per_iteration: ${model_tuning.selfplay_games_per_iteration}
+selfplay_mcts_simulations: ${model_tuning.selfplay_mcts_simulations}
+selfplay_temperature_moves: ${model_tuning.selfplay_temperature_moves}
+selfplay_update_interval: ${model_tuning.selfplay_update_interval} 
 
 batch_size: ${timekeeping.batch_size}
 max_epochs: ${timekeeping.max_epochs}

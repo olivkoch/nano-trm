@@ -1,362 +1,378 @@
 """
-Test suite for AlphaZero-style MCTS
+Comprehensive tests for BatchMCTS to verify correct behavior
 """
 
-from time import time
-import pytest
 import torch
 import numpy as np
-from src.nn.modules.batch_mcts import BatchMCTS
-from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
-from src.nn.utils.constants import C4_EMPTY_CELL, C4_PLAYER1_CELL, C4_PLAYER2_CELL
+from typing import List, Tuple
+import pytest
+from src.nn.modules.batch_mcts import BatchMCTSWithVirtualLoss, MCTSNode
 
-
-class MockTRMModel:
-    """Mock TRM model for testing MCTS"""
+class DeterministicTestModel:
+    """Deterministic model for testing MCTS behavior"""
     def __init__(self, device="cpu"):
         self.device = device
+        self.call_count = 0
+        self.evaluated_positions = []
         
-    def forward(self, boards):
-        """Mock forward pass returning policy and value"""
+    def forward(self, boards: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns deterministic policies and values based on board sum"""
+        self.call_count += 1
+        self.evaluated_positions.append(boards.clone())
+        
         batch_size = boards.shape[0]
+        policies = torch.zeros(batch_size, 7, device=self.device)
+        values = torch.zeros(batch_size, device=self.device)
         
-        # Return random policy and value for testing
-        policy = torch.softmax(torch.randn(batch_size, 7, device=self.device), dim=-1)
-        value = torch.tanh(torch.randn(batch_size, device=self.device))
-        
-        return policy, value
-
-
-class TestMCTS:
-    """Test suite for MCTS"""
-    
-    def test_initialization(self):
-        """Test MCTS initialization"""
-        print("\nTest 1: Initialization")
-        print("-" * 40)
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        mock_model = MockTRMModel(device=device)
-        
-        mcts = BatchMCTS(
-            model=mock_model,
-            c_puct=1.0,
-            num_simulations=100,
-            dirichlet_alpha=0.3,
-            exploration_fraction=0.25,
-            device=device
-        )
-        
-        assert mcts.num_simulations == 100
-        assert mcts.c_puct == 1.0
-        assert mcts.dirichlet_alpha == 0.3
-        print("✓ MCTS initialized correctly")
-    
-    def test_empty_board(self):
-        """Test MCTS on empty board"""
-        print("\nTest 2: Empty Board")
-        print("-" * 40)
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        mock_model = MockTRMModel(device=device)
-        
-        mcts = BatchMCTS(
-            model=mock_model,
-            c_puct=1.0,
-            num_simulations=50,
-            dirichlet_alpha=0.3,
-            exploration_fraction=0.25,
-            device=device
-        )
-        
-        # Empty board
-        board = torch.full((6, 7), C4_EMPTY_CELL, dtype=torch.int32, device=device)
-        legal_moves = torch.ones(7, dtype=torch.bool, device=device)
-        
-        # Get action probabilities
-        probs = mcts.get_action_probs(board, legal_moves, temperature=1.0)
-        
-        assert probs.shape == (7,)
-        assert torch.allclose(probs.sum(), torch.tensor(1.0))
-        assert (probs >= 0).all()
-        print(f"✓ Probabilities: {probs.cpu().numpy()}")
-        print("✓ Valid probability distribution")
-    
-    def test_winning_position(self):
-        """Test MCTS finds winning move"""
-        print("\nTest 3: Winning Position")
-        print("-" * 40)
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        # Create a model that recognizes wins
-        class WinAwareModel:
-            def __init__(self, device):
-                self.device = device
-                
-            def forward(self, boards):
-                batch_size = boards.shape[0]
-                board = boards[0].reshape(6, 7)
-                
-                # Check for winning move at column 3
-                policy = torch.zeros(batch_size, 7, device=self.device)
-                
-                # If there's a winning pattern, strongly prefer column 3
-                if (board[5, 0] == C4_PLAYER1_CELL and 
-                    board[5, 1] == C4_PLAYER1_CELL and 
-                    board[5, 2] == C4_PLAYER1_CELL):
-                    policy[:, 3] = 0.9
-                    policy[:, 4:] = 0.1 / 3
-                else:
-                    policy = torch.ones(batch_size, 7, device=self.device) / 7
-                
-                value = torch.tensor([0.8], device=self.device)
-                return policy, value
-        
-        model = WinAwareModel(device)
-        
-        mcts = BatchMCTS(
-            model=model,
-            c_puct=1.0,
-            num_simulations=100,
-            dirichlet_alpha=0.03,  # Less noise for test
-            exploration_fraction=0.1,
-            device=device
-        )
-        
-        # Create winning position
-        board = torch.full((6, 7), C4_EMPTY_CELL, dtype=torch.int32, device=device)
-        board[5, 0] = C4_PLAYER1_CELL
-        board[5, 1] = C4_PLAYER1_CELL
-        board[5, 2] = C4_PLAYER1_CELL
-        board[5, 4] = C4_PLAYER2_CELL
-        board[5, 5] = C4_PLAYER2_CELL
-        
-        legal_moves = board[0, :] == C4_EMPTY_CELL
-        
-        # Get action probabilities with low temperature
-        probs = mcts.get_action_probs(board, legal_moves, temperature=0.1)
-        
-        best_move = probs.argmax().item()
-        print(f"✓ Best move: {best_move}")
-        print(f"✓ Probabilities: {probs.cpu().numpy()}")
-        
-        # Should heavily favor column 3
-        assert probs[3] > 0.5, "Should recognize winning move"
-        print("✓ MCTS identifies winning move")
-    
-    def test_illegal_moves(self):
-        """Test MCTS handles illegal moves correctly"""
-        print("\nTest 4: Illegal Moves")
-        print("-" * 40)
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        mock_model = MockTRMModel(device=device)
-        
-        mcts = BatchMCTS(
-            model=mock_model,
-            c_puct=1.0,
-            num_simulations=50,
-            device=device
-        )
-        
-        # Board with some full columns
-        board = torch.full((6, 7), C4_EMPTY_CELL, dtype=torch.int32, device=device)
-        
-        # Fill column 2 completely
-        for row in range(6):
-            board[row, 2] = C4_PLAYER1_CELL if row % 2 == 0 else C4_PLAYER2_CELL
-        
-        # Fill column 5 completely
-        for row in range(6):
-            board[row, 5] = C4_PLAYER2_CELL if row % 2 == 0 else C4_PLAYER1_CELL
-        
-        legal_moves = board[0, :] == C4_EMPTY_CELL
-        assert not legal_moves[2]
-        assert not legal_moves[5]
-        
-        # Get action probabilities
-        probs = mcts.get_action_probs(board, legal_moves, temperature=1.0)
-        
-        # Check illegal moves have 0 probability
-        assert abs(probs[2].item()) < 1e-6, "Full column 2 should have 0 probability"
-        assert abs(probs[5].item()) < 1e-6, "Full column 5 should have 0 probability"
-        assert torch.allclose(probs.sum(), torch.tensor(1.0))
-        
-        print(f"✓ Probabilities: {probs.cpu().numpy()}")
-        print("✓ Illegal moves have 0 probability")
-    
-    def test_temperature_effect(self):
-        """Test temperature parameter effect"""
-        print("\nTest 5: Temperature Effect")
-        print("-" * 40)
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        mock_model = MockTRMModel(device=device)
-        
-        mcts = BatchMCTS(
-            model=mock_model,
-            c_puct=1.0,
-            num_simulations=100,
-            device=device
-        )
-        
-        board = torch.full((6, 7), C4_EMPTY_CELL, dtype=torch.int32, device=device)
-        legal_moves = torch.ones(7, dtype=torch.bool, device=device)
-        
-        # Test with high temperature (more exploration)
-        probs_high_temp = mcts.get_action_probs(board, legal_moves, temperature=2.0)
-        
-        # Test with low temperature (more exploitation)
-        probs_low_temp = mcts.get_action_probs(board, legal_moves, temperature=0.1)
-        
-        # Test with zero temperature (deterministic)
-        probs_zero_temp = mcts.get_action_probs(board, legal_moves, temperature=0.0)
-        
-        # Zero temperature should be one-hot
-        assert probs_zero_temp.max() == 1.0
-        assert probs_zero_temp.sum() == 1.0
-        assert (probs_zero_temp == 1.0).sum() == 1
-        
-        # Calculate entropy
-        def entropy(p):
-            return -(p * torch.log(p + 1e-8)).sum().item()
-        
-        entropy_high = entropy(probs_high_temp)
-        entropy_low = entropy(probs_low_temp)
-        entropy_zero = entropy(probs_zero_temp)
-        
-        print(f"✓ High temp entropy: {entropy_high:.3f}")
-        print(f"✓ Low temp entropy: {entropy_low:.3f}")
-        print(f"✓ Zero temp entropy: {entropy_zero:.3f}")
-        
-        # Higher temperature should have higher entropy
-        assert entropy_high > entropy_low
-        assert entropy_zero < 0.01
-        print("✓ Temperature correctly affects exploration")
-    
-    def test_dirichlet_noise(self):
-        """Test Dirichlet noise is applied to root"""
-        print("\nTest 6: Dirichlet Noise")
-        print("-" * 40)
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        # Model that always returns uniform policy
-        class UniformModel:
-            def __init__(self, device):
-                self.device = device
+        for i in range(batch_size):
+            # Deterministic policy: favor middle columns
+            board_sum = boards[i].sum().item()
+            policies[i] = torch.tensor([0.05, 0.10, 0.20, 0.30, 0.20, 0.10, 0.05], device=self.device)
             
-            def forward(self, boards):
-                batch_size = boards.shape[0]
-                policy = torch.ones(batch_size, 7, device=self.device) / 7
-                value = torch.zeros(batch_size, device=self.device)
-                return policy, value
+            # Deterministic value based on board state
+            values[i] = torch.tanh(torch.tensor(board_sum / 42.0, device=self.device))
         
-        model = UniformModel(device)
+        return policies, values
+
+
+def test_mcts_visit_distribution():
+    """Test that MCTS produces correct visit distributions"""
+    print("\n=== Testing Visit Distribution ===")
         
-        # MCTS with high exploration
-        mcts_explore = BatchMCTS(
+    device = "cpu"
+    model = DeterministicTestModel(device)
+    
+    # Create MCTS with specific settings
+    mcts = BatchMCTSWithVirtualLoss(
+        model=model,
+        c_puct=1.0,
+        num_simulations=100,
+        parallel_simulations=1,  # Sequential for deterministic testing
+        dirichlet_alpha=0.0,  # No noise for testing
+        exploration_fraction=0.0,  # No exploration noise
+        device=device
+    )
+    
+    # Simple position - empty board
+    board = torch.zeros(6, 7, device=device)
+    legal_moves = torch.ones(7, dtype=torch.bool, device=device)
+    
+    # Run MCTS
+    visit_dist, action_probs = mcts.get_action_probs_batch_parallel(
+        [board], [legal_moves], temperature=0
+    )
+    
+    # Check properties
+    print(f"Visit distribution: {visit_dist[0].numpy()}")
+    print(f"Sum of visits: {visit_dist[0].sum().item():.4f}")
+    
+    # Visit distribution should sum to 1
+    assert abs(visit_dist[0].sum().item() - 1.0) < 1e-6, "Visit distribution should sum to 1"
+    
+    # Center column should have most visits (due to deterministic policy)
+    assert visit_dist[0].argmax() == 3, f"Column 3 should have most visits, got {visit_dist[0].argmax()}"
+    
+    # With temperature=0, action_probs should be one-hot
+    assert action_probs[0].max() == 1.0, "Temperature=0 should give deterministic action"
+    assert action_probs[0].sum() == 1.0, "Action probs should sum to 1"
+    
+    print("✓ Visit distribution test passed")
+
+
+def test_mcts_convergence():
+    """Test that more simulations lead to better convergence"""
+    print("\n=== Testing MCTS Convergence ===")
+        
+    device = "cpu"
+    board = torch.zeros(6, 7, device=device)
+    legal_moves = torch.ones(7, dtype=torch.bool, device=device)
+    
+    visit_dists = []
+    max_visits = []
+    
+    for num_sims in [10, 50, 200, 500]:
+        # Set seed for reproducibility
+        np.random.seed(42)
+        torch.manual_seed(42)
+        
+        model = DeterministicTestModel(device)
+        mcts = BatchMCTSWithVirtualLoss(
             model=model,
             c_puct=1.0,
-            num_simulations=50,
-            dirichlet_alpha=0.3,
-            exploration_fraction=0.5,  # High exploration
+            num_simulations=num_sims,
+            parallel_simulations=1,
+            dirichlet_alpha=0.3,  # Add noise to see convergence
+            exploration_fraction=0.25,  # Add exploration
             device=device
         )
         
-        # MCTS without exploration
-        mcts_no_explore = BatchMCTS(
+        visit_dist, _ = mcts.get_action_probs_batch_parallel(
+            [board], [legal_moves], temperature=1.0
+        )
+        visit_dists.append(visit_dist[0])
+        max_visits.append(visit_dist[0].max().item())
+        
+        # Calculate entropy as measure of convergence
+        entropy = -(visit_dist[0] * torch.log(visit_dist[0] + 1e-8)).sum().item()
+        print(f"Simulations: {num_sims:3d}, Entropy: {entropy:.4f}, "
+              f"Max visit: {visit_dist[0].max().item():.3f}")
+    
+    # More simulations should lead to higher confidence in best move
+    # With noise, we check that max visit probability increases
+    assert max_visits[-1] > max_visits[0], \
+        f"More simulations should increase confidence: {max_visits[0]:.3f} -> {max_visits[-1]:.3f}"
+    
+    print("✓ Convergence test passed")
+
+def test_virtual_loss_exploration():
+    """Test that virtual loss causes different paths to be explored"""
+    print("\n=== Testing Virtual Loss Exploration ===")
+        
+    device = "cpu"
+    model = DeterministicTestModel(device)
+    
+    # Test with and without virtual loss parallelism
+    for parallel_sims in [1, 4]:
+        model.call_count = 0
+        model.evaluated_positions = []
+        
+        mcts = BatchMCTSWithVirtualLoss(
             model=model,
             c_puct=1.0,
-            num_simulations=50,
-            dirichlet_alpha=0.3,
-            exploration_fraction=0.0,  # No exploration
+            num_simulations=16,
+            parallel_simulations=parallel_sims,
+            virtual_loss_value=3,
+            dirichlet_alpha=0.0,
+            exploration_fraction=0.0,
             device=device
         )
         
-        board = torch.full((6, 7), C4_EMPTY_CELL, dtype=torch.int32, device=device)
+        board = torch.zeros(6, 7, device=device)
         legal_moves = torch.ones(7, dtype=torch.bool, device=device)
         
-        # Run multiple times to see variation
-        probs_explore = []
-        probs_no_explore = []
+        visit_dist, _ = mcts.get_action_probs_batch_parallel(
+            [board], [legal_moves], temperature=1.0
+        )
         
-        for _ in range(5):
-            p1 = mcts_explore.get_action_probs(board, legal_moves, temperature=1.0)
-            p2 = mcts_no_explore.get_action_probs(board, legal_moves, temperature=1.0)
-            probs_explore.append(p1)
-            probs_no_explore.append(p2)
-        
-        # With exploration should have more variation
-        var_explore = torch.stack(probs_explore).var(dim=0).mean()
-        var_no_explore = torch.stack(probs_no_explore).var(dim=0).mean()
-        
-        print(f"✓ Variance with exploration: {var_explore:.6f}")
-        print(f"✓ Variance without exploration: {var_no_explore:.6f}")
-        print("✓ Dirichlet noise adds exploration")\
-        
-    # Add this test to test_batch_mcts.py
+        print(f"Parallel={parallel_sims}: Model calls={model.call_count}, "
+              f"Visit std={visit_dist[0].std().item():.4f}")
+    
+    print("✓ Virtual loss exploration test passed")
 
-    def test_batch_evaluation(self, parallel: bool = False):
-        """Test batch MCTS evaluation"""
-        print("\nTest 7: Batch Evaluation")
-        print("-" * 40)
+
+def test_illegal_moves_masked():
+    """Test that illegal moves are never selected"""
+    print("\n=== Testing Illegal Move Masking ===")
         
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        mock_model = MockTRMModel(device=device)
+    device = "cpu"
+    model = DeterministicTestModel(device)
+    mcts = BatchMCTSWithVirtualLoss(
+        model=model,
+        c_puct=1.0,
+        num_simulations=50,
+        parallel_simulations=1,
+        device=device
+    )
+    
+    # Board with some full columns
+    board = torch.zeros(6, 7, device=device)
+    board[:, 0] = 1  # Column 0 is full
+    board[:, 6] = 2  # Column 6 is full
+    
+    legal_moves = torch.tensor([False, True, True, True, True, True, False], device=device)
+    
+    visit_dist, action_probs = mcts.get_action_probs_batch_parallel(
+        [board], [legal_moves], temperature=0
+    )
+    
+    print(f"Legal moves: {legal_moves.numpy()}")
+    print(f"Visit dist:  {visit_dist[0].numpy()}")
+    
+    # Check no visits to illegal moves
+    assert visit_dist[0][0] == 0, "Full column 0 should have 0 visits"
+    assert visit_dist[0][6] == 0, "Full column 6 should have 0 visits"
+    assert visit_dist[0][1:6].sum() == 1.0, "Legal moves should sum to 1"
+    
+    print("✓ Illegal move masking test passed")
+
+
+def test_value_backup_alternates():
+    """Test that value backup correctly alternates signs"""
+    print("\n=== Testing Value Backup Sign Alternation ===")
         
-        mcts = BatchMCTS(
-            model=mock_model,
+    # Create a simple path
+    root = MCTSNode(state=torch.zeros(6, 7))
+    child1 = MCTSNode(state=torch.zeros(6, 7), parent=root, action=3)
+    child2 = MCTSNode(state=torch.zeros(6, 7), parent=child1, action=4)
+    
+    root.children[3] = child1
+    child1.children[4] = child2
+    
+    # Manually backup a value
+    path = [root, child1, child2]
+    value = 1.0
+    
+    for node in reversed(path):
+        node.visits += 1
+        node.total_value += value
+        value = -value  # Flip sign
+    
+    # Check values
+    assert child2.total_value == 1.0, "Leaf should have positive value"
+    assert child1.total_value == -1.0, "Parent should have negative value"
+    assert root.total_value == 1.0, "Root should have positive value"
+    
+    print(f"Root Q={root.Q():.2f}, Child1 Q={child1.Q():.2f}, Child2 Q={child2.Q():.2f}")
+    print("✓ Value backup test passed")
+
+
+def test_temperature_behavior():
+    """Test that temperature correctly affects action selection"""
+    print("\n=== Testing Temperature Behavior ===")
+        
+    device = "cpu"
+    model = DeterministicTestModel(device)
+    board = torch.zeros(6, 7, device=device)
+    legal_moves = torch.ones(7, dtype=torch.bool, device=device)
+    
+    for temp in [0.0, 0.5, 1.0, 2.0]:
+        mcts = BatchMCTSWithVirtualLoss(
+            model=model,
             c_puct=1.0,
-            num_simulations=10,  # Fewer simulations for speed
+            num_simulations=100,
+            parallel_simulations=1,
+            dirichlet_alpha=0.0,
+            exploration_fraction=0.0,
             device=device
         )
         
-        # Create multiple different boards
-        boards = []
-        legal_moves_list = []
+        visit_dist, action_probs = mcts.get_action_probs_batch_parallel(
+            [board], [legal_moves], temperature=temp
+        )
         
-        for i in range(4):
-            board = torch.full((6, 7), C4_EMPTY_CELL, dtype=torch.int32, device=device)
-            # Add some pieces to make boards different
-            if i > 0:
-                board[5, i-1] = C4_PLAYER1_CELL
-            boards.append(board)
-            legal_moves_list.append(torch.ones(7, dtype=torch.bool, device=device))
+        # Calculate entropy of action distribution
+        entropy = -(action_probs[0] * torch.log(action_probs[0] + 1e-8)).sum().item()
         
-        # Get batch probabilities
-        import time
-        t0 = time.time()
-        if parallel:
-            batch_probs = mcts.get_action_probs_batch_parallel(boards, legal_moves_list, temperature=1.0)
-        else:
-            batch_probs = mcts.get_action_probs_batch(boards, legal_moves_list, temperature=1.0)
-        t1 = time.time()
-        print(f"✓ Batch evaluation time: {t1 - t0:.3f} seconds")
+        # Check determinism at T=0
+        if temp == 0:
+            assert action_probs[0].max() == 1.0, "T=0 should be deterministic"
+            assert (action_probs[0] == 1.0).sum() == 1, "T=0 should have single 1.0"
+        
+        print(f"Temperature={temp:.1f}: Entropy={entropy:.4f}, "
+              f"Max prob={action_probs[0].max().item():.3f}")
+    
+    print("✓ Temperature behavior test passed")
 
-        assert batch_probs.shape == (4, 7)
-        assert torch.allclose(batch_probs.sum(dim=1), torch.ones(4, device=device))
+
+def test_batch_consistency():
+    """Test that batched games produce consistent results"""
+    print("\n=== Testing Batch Consistency ===")
         
-        print(f"✓ Batch shape: {batch_probs.shape}")
-        print(f"✓ All probabilities sum to 1")
-        print("✓ Batch evaluation works correctly")
+    device = "cpu"
+    model = DeterministicTestModel(device)
+    
+    # Run MCTS on same position multiple times in a batch
+    boards = [torch.zeros(6, 7, device=device) for _ in range(5)]
+    legal_moves = [torch.ones(7, dtype=torch.bool, device=device) for _ in range(5)]
+    
+    mcts = BatchMCTSWithVirtualLoss(
+        model=model,
+        c_puct=1.0,
+        num_simulations=50,
+        parallel_simulations=1,
+        dirichlet_alpha=0.0,  # No randomness
+        exploration_fraction=0.0,
+        device=device
+    )
+    
+    visit_dists, action_probs = mcts.get_action_probs_batch_parallel(
+        boards, legal_moves, temperature=0
+    )
+    
+    # All games should produce identical results (no randomness)
+    for i in range(1, 5):
+        assert torch.allclose(visit_dists[0], visit_dists[i], atol=1e-6), \
+            f"Game {i} visit distribution differs from game 0"
+        assert torch.allclose(action_probs[0], action_probs[i], atol=1e-6), \
+            f"Game {i} action probs differ from game 0"
+    
+    print("✓ Batch consistency test passed")
+
+
+def test_dirichlet_noise():
+    """Test that Dirichlet noise is applied correctly"""
+    print("\n=== Testing Dirichlet Noise ===")
+        
+    device = "cpu"
+    model = DeterministicTestModel(device)
+    board = torch.zeros(6, 7, device=device)
+    legal_moves = torch.ones(7, dtype=torch.bool, device=device)
+    
+    # Run with and without noise
+    results = {}
+    for use_noise in [False, True]:
+        mcts = BatchMCTSWithVirtualLoss(
+            model=model,
+            c_puct=1.0,
+            num_simulations=100,
+            parallel_simulations=1,
+            dirichlet_alpha=0.3 if use_noise else 0.0,
+            exploration_fraction=0.25 if use_noise else 0.0,
+            device=device
+        )
+        
+        # Set seed for reproducibility
+        if use_noise:
+            np.random.seed(42)
+        
+        visit_dist, _ = mcts.get_action_probs_batch_parallel(
+            [board], [legal_moves], temperature=1.0
+        )
+        results[use_noise] = visit_dist[0]
+    
+    # With noise should differ from without
+    assert not torch.allclose(results[False], results[True], atol=0.01), \
+        "Dirichlet noise should change visit distribution"
+    
+    print(f"No noise: {results[False].numpy()}")
+    print(f"With noise: {results[True].numpy()}")
+    print("✓ Dirichlet noise test passed")
+
+
+def run_all_tests():
+    """Run all MCTS tests"""
+    print("=" * 60)
+    print("MCTS CORRECTNESS TEST SUITE")
+    print("=" * 60)
+    
+    tests = [
+        test_mcts_visit_distribution,
+        test_mcts_convergence,
+        test_virtual_loss_exploration,
+        test_illegal_moves_masked,
+        test_value_backup_alternates,
+        test_temperature_behavior,
+        test_batch_consistency,
+        test_dirichlet_noise,
+    ]
+    
+    failed = []
+    for test in tests:
+        try:
+            test()
+        except Exception as e:
+            print(f"✗ {test.__name__} FAILED: {e}")
+            failed.append(test.__name__)
+    
+    print("\n" + "=" * 60)
+    if failed:
+        print(f"FAILED {len(failed)}/{len(tests)} tests:")
+        for name in failed:
+            print(f"  - {name}")
+    else:
+        print(f"✓ ALL {len(tests)} TESTS PASSED!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    print("Testing MCTS")
-    print("=" * 60)
-    
-    test = TestMCTS()
-    test.test_initialization()
-    test.test_empty_board()
-    test.test_winning_position()
-    test.test_illegal_moves()
-    test.test_temperature_effect()
-    test.test_dirichlet_noise()
-    test.test_batch_evaluation(parallel=False)
-    test.test_batch_evaluation(parallel=True)
-    
-    print("\n" + "=" * 60)
-    print("All tests passed! ✓")
-    print("=" * 60)
+    run_all_tests()

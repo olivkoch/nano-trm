@@ -115,3 +115,30 @@ def cosine_schedule_with_warmup_lr_lambda(
             (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
         )
     )
+
+def robust_kl_div(pred_probs: torch.Tensor, target_probs: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+    """
+    Compute KL divergence robustly, handling zeros on both sides
+    KL(target || pred) = sum(target * log(target/pred))
+    """
+    # Add epsilon to avoid log(0) but preserve zero structure
+    pred_safe = pred_probs + epsilon
+    target_safe = target_probs + epsilon
+    
+    # Renormalize to ensure they sum to 1
+    pred_safe = pred_safe / pred_safe.sum(dim=-1, keepdim=True)
+    target_safe = target_safe / target_safe.sum(dim=-1, keepdim=True)
+    
+    # Compute KL divergence
+    # Where target is 0, the contribution should be 0 (0 * log(...) = 0)
+    # We mask these out explicitly
+    kl_per_element = target_safe * (torch.log(target_safe) - torch.log(pred_safe))
+    
+    # Mask out contributions where original target was 0
+    mask = target_probs > epsilon
+    kl_per_element = kl_per_element * mask
+    
+    # Sum over action dimension, mean over batch
+    kl_div = kl_per_element.sum(dim=-1).mean()
+    
+    return kl_div

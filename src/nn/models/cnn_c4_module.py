@@ -4,14 +4,14 @@ Matches the TRM interface for direct comparison
 """
 
 import math
-from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lightning import LightningModule
+from src.nn.modules.utils import compute_lr
 
 # You'll need to import these from your codebase
 from src.nn.utils.constants import C4_EMPTY_CELL
@@ -175,28 +175,6 @@ class C4BaselineModule(LightningModule):
     def _board_to_channels(self, boards: torch.Tensor) -> torch.Tensor:
         """
         Convert flat board representation to 3-channel image for CNN
-        boards: [batch_size, 42] with values in {-1, 0, 1}
-        Returns: [batch_size, 3, 6, 7]
-        """
-        batch_size = boards.shape[0]
-        boards_2d = boards.view(batch_size, self.board_rows, self.board_cols)
-        
-        # Create 3-channel representation
-        channels = torch.zeros(batch_size, 3, self.board_rows, self.board_cols, 
-                              device=boards.device, dtype=boards.dtype)
-        
-        # Channel 0: Current player pieces (1s)
-        channels[:, 0] = (boards_2d == 1).float()
-        # Channel 1: Opponent pieces (-1s)
-        channels[:, 1] = (boards_2d == -1).float()
-        # Channel 2: Empty cells (0s)
-        channels[:, 2] = (boards_2d == 0).float()
-        
-        return channels
-    
-    def _board_to_channels(self, boards: torch.Tensor) -> torch.Tensor:
-        """
-        Convert flat board representation to 3-channel image for CNN
         boards: [batch_size, 42] with values in {0, 1, 2}
         Returns: [batch_size, 3, 6, 7]
         """
@@ -326,14 +304,16 @@ class C4BaselineModule(LightningModule):
         current_step = self.manual_step
         total_steps = self.max_steps
         base_lr = self.hparams.learning_rate
-        
         if current_step < self.hparams.warmup_steps:
-            # Linear warmup
-            lr = base_lr * (current_step / self.hparams.warmup_steps)
+            lr = compute_lr(
+                    base_lr=base_lr,
+                    lr_warmup_steps=self.hparams.warmup_steps,
+                    lr_min_ratio=self.hparams.lr_min_ratio,
+                    current_step=current_step,
+                    total_steps=total_steps,
+                )
         else:
-            # Cosine decay
-            progress = (current_step - self.hparams.warmup_steps) / (total_steps - self.hparams.warmup_steps)
-            lr = base_lr * (self.hparams.lr_min_ratio + (1 - self.hparams.lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress)))
+            lr = base_lr
         
         # Update learning rate
         for param_group in opt.param_groups:
@@ -374,8 +354,6 @@ class C4BaselineModule(LightningModule):
     
     def evaluate_vs_minimax_fast(self):
         """Fast evaluation matching TRM interface"""
-        from src.nn.modules.minimax import ConnectFourMinimax
-        from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
         
         print(f"Fast eval vs Minimax (depth={self.hparams.eval_minimax_depth})...")
         

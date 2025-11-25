@@ -1,4 +1,4 @@
-_target_: src.nn.models.cnn_c4_module.C4BaselineModule
+_target_: src.nn.models.cnn_c4_module.C4CNNModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
 
 model_type: ${model_tuning.model_type}  # 'transformer', 'mlp', 'cnn'

@@ -93,9 +93,6 @@ class BatchMCTSWithVirtualLoss:
         self.virtual_loss_value = virtual_loss_value
         self.device = device
         
-        from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
-        self.env = VectorizedConnectFour(n_envs=1, device=device)
-
     def get_action_probs_batch_parallel(
         self,
         boards: List[torch.Tensor],
@@ -143,7 +140,7 @@ class BatchMCTSWithVirtualLoss:
                 else:
                     # Compute state if needed
                     if node.state is None:
-                        node.state = self._compute_state(path)
+                        node.state = self._compute_state_efficient(path)
                     leaves_to_eval.append((tree_idx, node, path))
             
             # Evaluate non-terminal leaves in one batch
@@ -157,18 +154,15 @@ class BatchMCTSWithVirtualLoss:
                 # Expand and backup
                 for i, (tree_idx, node, path) in enumerate(leaves_to_eval):
                     # Check if terminal
-                    self.env.boards[0] = node.state
-                    self.env._check_winners_batch()
+                    is_terminal, winner = self._is_terminal_and_winner(node.state)
                     
-                    if self.env.winners[0] != 0 or not (node.state[0, :] == 0).any():
-                        # Terminal state
+                    if is_terminal:
                         node.is_terminal = True
-                        if self.env.winners[0] == 0:
+                        if winner == 0:
                             value = 0.0  # Draw
                         else:
                             # Determine value from perspective
                             current_player = self._get_current_player(node.state)
-                            winner = self.env.winners[0].item()
                             value = 1.0 if winner == current_player else -1.0
                         node.terminal_value = value
                     else:
@@ -186,6 +180,7 @@ class BatchMCTSWithVirtualLoss:
                         if not node.is_expanded():
                             for action in range(7):
                                 if legal_moves[action]:
+                                    current_player = self._get_current_player(node.state)
                                     child = MCTSNode(
                                         state=None,
                                         parent=node,
@@ -230,13 +225,11 @@ class BatchMCTSWithVirtualLoss:
         """Select leaf and apply virtual loss along the path"""
         node = root
         path = [node]
-        current_player = self._get_current_player(node.state)
         
         while node.is_expanded() and not node.is_terminal:
-            # Apply virtual loss to current node
             node.add_virtual_loss(self.virtual_loss_value)
             
-            # Select child with best PUCT (including virtual loss)
+            # Select child with best PUCT
             best_action = None
             best_score = -float('inf')
             
@@ -249,21 +242,16 @@ class BatchMCTSWithVirtualLoss:
             if best_action is None:
                 break
             
-            child = node.children[best_action]
-
-            # Compute and cache child state if not already done
-            if child.state is None:
-                child.state = self._make_move(node.state, best_action, current_player)
-            
-            current_player = 3 - current_player
-            node = child
+            node = node.children[best_action]
             path.append(node)
         
-        # Apply virtual loss to leaf
-        node.add_virtual_loss(self.virtual_loss_value)
+        # Materialize state only for the SELECTED leaf (lazy + cache)
+        if node.state is None:
+            node.state = self._compute_state_efficient(path)  # ← Only compute once!
         
+        node.add_virtual_loss(self.virtual_loss_value)
         return node, path
-    
+        
     def _backup_with_virtual_loss(self, path: List[MCTSNode], value: float):
         """Backup value and remove virtual loss"""
         for node in reversed(path):
@@ -302,35 +290,26 @@ class BatchMCTSWithVirtualLoss:
                 )
                 node.children[action] = child
     
-    def _compute_state(self, path: List[MCTSNode]) -> torch.Tensor:
-        """Compute state by replaying actions"""
-        # If leaf has state, return it
-        if path[-1].state is not None:
-            return path[-1].state
-
-        # Otherwise compute from last known state
+    def _compute_state_efficient(self, path: List[MCTSNode]) -> torch.Tensor:
+        """Efficiently compute state by finding nearest cached state"""
+        # Work backwards to find first materialized state
         for i in range(len(path) - 1, -1, -1):
             if path[i].state is not None:
+                # Found cached state, replay from here
                 state = path[i].state.clone()
                 current_player = self._get_current_player(state)
                 
+                # Only replay actions from i+1 to end
                 for j in range(i + 1, len(path)):
                     if path[j].action is not None:
                         state = self._make_move(state, path[j].action, current_player)
                         current_player = 3 - current_player
+                    # Cache the state in the node
+                    path[j].state = state  # ← Cache for next time!
                 
                 return state
-        
-        raise RuntimeError("No state found in path")
-        # state = path[0].state.clone()
-        # current_player = self._get_current_player(state)
-        
-        # for i in range(1, len(path)):
-        #     if path[i].action is not None:
-        #         state = self._make_move(state, path[i].action, current_player)
-        #         current_player = 3 - current_player
-        
-        # return state
+    
+        raise RuntimeError("No state found in path - root should always have state")
     
     def _get_current_player(self, state: torch.Tensor) -> int:
         """Determine current player from board state"""
@@ -349,6 +328,45 @@ class BatchMCTSWithVirtualLoss:
             new_board[row, action] = player
         
         return new_board
+    
+    def _is_terminal_and_winner(self, board: torch.Tensor) -> Tuple[bool, int]:
+        """Fast terminal check without environment"""
+        # Check if board is full (draw)
+        if not (board[0, :] == 0).any():
+            return True, 0  # Draw
+        
+        # Fast winner check - only check 4-in-a-row patterns
+        # Horizontal
+        for row in range(6):
+            for col in range(4):
+                window = board[row, col:col+4]
+                if window[0] != 0 and (window == window[0]).all():
+                    return True, int(window[0].item())
+        
+        # Vertical
+        for row in range(3):
+            for col in range(7):
+                window = board[row:row+4, col]
+                if window[0] != 0 and (window == window[0]).all():
+                    return True, int(window[0].item())
+        
+        # Diagonal (both directions)
+        for row in range(3):
+            for col in range(4):
+                # Down-right
+                if board[row, col] != 0 and \
+                board[row, col] == board[row+1, col+1] == board[row+2, col+2] == board[row+3, col+3]:
+                    return True, int(board[row, col].item())
+                # Down-left
+                if board[row, col+3] != 0 and \
+                board[row, col+3] == board[row+1, col+2] == board[row+2, col+1] == board[row+3, col]:
+                    return True, int(board[row, col+3].item())
+        
+        return False, 0
+
+    def _get_legal_moves(self, board: torch.Tensor) -> torch.Tensor:
+        """Fast legal moves check"""
+        return board[0, :] == 0
 
 
 def benchmark_virtual_loss():

@@ -20,8 +20,8 @@ timekeeping:
   steps_per_epoch: 20
 
 model_tuning:
-  learning_rate: 1e-3
-  learning_rate_emb: 1e-2
+  learning_rate: 3e-3
+  learning_rate_emb: 3e-2
   weight_decay: 0.1
   warmup_steps: 10000
   lr_min_ratio: 1.0
@@ -41,10 +41,10 @@ model_tuning:
   vocab_size: 3
 
   #self-play settings
-  enable_selfplay: false
+  enable_selfplay: true
   selfplay_buffer_size: 100000
-  selfplay_games_per_iteration: 100
-  selfplay_mcts_simulations: 20
+  selfplay_games_per_iteration: 200
+  selfplay_mcts_simulations: 100
   selfplay_temperature_moves: 15
   selfplay_update_interval: 10  # Update "previous model" every N epochs
           

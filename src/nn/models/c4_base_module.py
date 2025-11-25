@@ -228,47 +228,19 @@ class C4BaseModule(LightningModule):
         self.train()
         return len(all_positions), len(self.replay_buffer), num_games
     
-    def generate_selfplay_games_mixed(self, num_games: int, verbose: bool = False) -> int:
-        """Mix MCTS and policy-only games for compute efficiency"""
-        # 70% with light MCTS
-        light_mcts_games = int(num_games * 0.7)
-        self.mcts.num_simulations = self.hparams.selfplay_mcts_simulations // 3
-        num_positions1, _, _ = self.generate_selfplay_games(light_mcts_games, verbose=verbose)
-        
-        # 30% with full MCTS
-        full_mcts_games = num_games - light_mcts_games
-        self.mcts.num_simulations = self.hparams.selfplay_mcts_simulations
-        num_positions2, _, _ = self.generate_selfplay_games(full_mcts_games, verbose=verbose)
-        
-        return num_positions1 + num_positions2
-    
     def on_train_epoch_start(self):
         """Do all initialization here when model is on correct device"""
         if self.hparams.get('enable_selfplay', False):
-            epoch = self.trainer.current_epoch
         
-            # For epochs > 0, generate new games
-            if epoch == 0:
-                # Generate more games to supplement bootstrap
-                num_games = self.hparams.selfplay_games_per_iteration // 2
-                if num_games > 0:
-                    start_time = time.time()
-                    num_positions = self.generate_selfplay_games_mixed(num_games, verbose=True)
-                    elapsed = time.time() - start_time
-                    
-                    self.log('selfplay/games_per_second', num_games / elapsed)
-                    self.log('selfplay/positions_generated', num_positions)
-                    self.log('selfplay/buffer_size', len(self.replay_buffer))
-            else:
-                num_games = self.hparams.selfplay_games_per_iteration
-                
-                start_time = time.time()
-                num_positions = self.generate_selfplay_games_mixed(num_games, verbose=False)
-                elapsed = time.time() - start_time
-                
-                self.log('selfplay/games_per_second', num_games / elapsed)
-                self.log('selfplay/positions_generated', num_positions)
-                self.log('selfplay/buffer_size', len(self.replay_buffer))
+            num_games = self.hparams.selfplay_games_per_iteration
+            
+            start_time = time.time()
+            num_positions, _, _ = self.generate_selfplay_games(num_games, verbose=False)
+            elapsed = time.time() - start_time
+            
+            self.log('selfplay/games_per_second', num_games / elapsed)
+            self.log('selfplay/positions_generated', num_positions)
+            self.log('selfplay/buffer_size', len(self.replay_buffer))
     
     def on_train_epoch_end(self):
         """Evaluate against minimax at epoch end"""

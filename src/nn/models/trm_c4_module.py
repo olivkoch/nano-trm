@@ -413,10 +413,13 @@ class TRMC4Module(C4BaseModule):
             "value": outputs["value"][:actual_batch_size]
         }
     
-    def compute_loss_and_metrics(self, carry, batch):
+    def compute_loss_and_metrics(self, batch):
         """Compute loss and metrics for TRM"""
+        if self.carry is None:
+            self.carry = self.initial_carry(batch)
+
         # Get model outputs
-        new_carry, outputs = self.forward(carry, batch)
+        new_carry, outputs = self.forward(self.carry, batch)
         
         # Get legal moves for each position
         boards = new_carry.current_data["boards"]
@@ -438,7 +441,7 @@ class TRMC4Module(C4BaseModule):
             # Metrics (halted)
             valid_metrics = new_carry.halted
             
-            metrics = {
+            raw_metrics = {
                 "count": valid_metrics.sum(),
                 "policy_accuracy": torch.where(valid_metrics, policy_accuracy, 0).sum(),
                 "q_halt_accuracy": (
@@ -456,7 +459,7 @@ class TRMC4Module(C4BaseModule):
             should_halt.to(outputs["q_halt_logits"].dtype),
             reduction="sum",
         )
-        metrics.update(
+        raw_metrics.update(
             {
                 "policy_loss": policy_loss.detach(),
                 "value_loss": value_loss.detach(),
@@ -466,7 +469,22 @@ class TRMC4Module(C4BaseModule):
         
         total_loss = policy_loss + 0.5 * value_loss  # + 0.5 * q_halt_loss
         
-        return new_carry, total_loss, metrics, new_carry.halted.all()
+        self.carry = new_carry
+
+        batch_size = batch["boards"].shape[0]
+        count = raw_metrics["count"].item() if raw_metrics["count"] > 0 else 1
+
+        metrics = {
+                "policy_loss": raw_metrics["policy_loss"].item() / batch_size,
+                "value_loss": raw_metrics["value_loss"].item() / count,
+                "policy_accuracy": raw_metrics["policy_accuracy"].item() / count,
+                "q_halt_accuracy": raw_metrics["q_halt_accuracy"].item() / count,
+                "q_halt_loss": raw_metrics["q_halt_loss"].item() / batch_size,
+                "steps": raw_metrics["steps"].item() / count,
+                "count": count,
+            }
+
+        return total_loss, metrics
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """Training step for TRM with carry state"""
@@ -492,7 +510,7 @@ class TRMC4Module(C4BaseModule):
             self.carry = self.initial_carry(batch)
         
         # Forward with loss computation
-        self.carry, loss, metrics, all_halted = self.compute_loss_and_metrics(self.carry, batch)
+        loss, metrics = self.compute_loss_and_metrics(batch)
         
         scaled_loss = loss / batch_size
         scaled_loss.backward()
@@ -569,40 +587,12 @@ class TRMC4Module(C4BaseModule):
             self.log(f"train/lr_{i}", lr_this_step, on_step=True)
         
         # Log metrics
-        if metrics.get("count", 0) > 0:
-            with torch.no_grad():
-                count = metrics["count"]
-                self.log(
-                    "train/policy_accuracy",
-                    metrics.get("policy_accuracy", 0) / count,
-                    prog_bar=True,
-                    on_step=True,
-                )
-                self.log(
-                    "train/value_loss",
-                    metrics.get("value_loss", 0) / count,
-                    on_step=True,
-                )
-                self.log(
-                    "train/q_halt_accuracy",
-                    metrics.get("q_halt_accuracy", 0) / count,
-                    on_step=True,
-                )
-                self.log(
-                    "train/steps",
-                    metrics.get("steps", 0) / count,
-                    prog_bar=True,
-                    on_step=True,
-                )
-                
-                self.log("train/policy_loss", metrics.get("policy_loss", 0) / batch_size, on_step=True)
-                self.log(
-                    "train/q_halt_loss", metrics.get("q_halt_loss", 0) / batch_size, on_step=True
-                )
-                
-                avg_halt_steps = metrics.get("steps", 0) / metrics["count"]
-                early_halt_rate = avg_halt_steps < self.hparams.N_supervision
-                self.log("train/early_halt_rate", early_halt_rate, on_step=True)
+        self.log("train/policy_accuracy", metrics["policy_accuracy"], prog_bar=True, on_step=True)
+        self.log("train/value_loss", metrics["value_loss"], on_step=True)
+        self.log("train/policy_loss", metrics["policy_loss"], on_step=True)
+        self.log("train/q_halt_accuracy", metrics["q_halt_accuracy"], on_step=True)
+        self.log("train/q_halt_loss", metrics["q_halt_loss"], on_step=True)
+        self.log("train/steps", metrics["steps"], prog_bar=True, on_step=True)
         
         assert not torch.isnan(metrics.get("policy_loss")), f"Policy loss is NaN at step {self.manual_step}"
         

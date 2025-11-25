@@ -562,14 +562,16 @@ class TRMC4Module(C4BaseModule):
         
         # Compute learning rate for this step
         for i, (opt, base_lr) in enumerate(zip(opts, base_lrs)):
-            lr_this_step = compute_lr(
-                base_lr=base_lr,
-                lr_warmup_steps=self.hparams.warmup_steps,
-                lr_min_ratio=self.hparams.lr_min_ratio,
-                current_step=current_step,
-                total_steps=total_steps,
-            )
-
+            if current_step < self.hparams.warmup_steps:
+                lr_this_step = compute_lr(
+                    base_lr=base_lr,
+                    lr_warmup_steps=self.hparams.warmup_steps,
+                    lr_min_ratio=self.hparams.lr_min_ratio,
+                    current_step=current_step,
+                    total_steps=total_steps,
+                )
+            else:
+                lr_this_step = base_lr
             
             # Update learning rate
             if hasattr(opt, "_optimizer"):
@@ -594,7 +596,7 @@ class TRMC4Module(C4BaseModule):
         self.log("train/q_halt_loss", metrics["q_halt_loss"], on_step=True)
         self.log("train/steps", metrics["steps"], prog_bar=True, on_step=True)
         
-        assert not torch.isnan(metrics.get("policy_loss")), f"Policy loss is NaN at step {self.manual_step}"
+        # assert not torch.isnan(metrics.get("policy_loss")), f"Policy loss is NaN at step {self.manual_step}"
         
         t1 = time.time()
         

@@ -31,7 +31,7 @@ model_tuning:
   dropout: 0.1
   use_residual: False  # For CNN - use residual blocks
   # Self-play settings
-  enable_selfplay: False
+  enable_selfplay: true
   selfplay_buffer_size: 100000
   selfplay_games_per_iteration: 100
   selfplay_mcts_simulations: 100

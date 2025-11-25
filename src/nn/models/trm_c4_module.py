@@ -221,10 +221,6 @@ class TRMC4Module(C4BaseModule):
         self.last_step_time = None
         
         log.info(f"Learning rates: model={learning_rate}, emb={learning_rate_emb} max steps = {self.max_steps}")
-        
-        # Load initial games if not using self-play
-        if not enable_selfplay:
-            self.load_games_from_file("minimax_games_.pkl")
     
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -279,10 +275,23 @@ class TRMC4Module(C4BaseModule):
             ),
         )
     
+    # def reset_carry(self, reset_flag: torch.Tensor, carry: TRMInnerCarry) -> TRMInnerCarry:
+    #     return TRMInnerCarry(
+    #         z_H=torch.where(reset_flag.view(-1, 1, 1), self.z_H_init, carry.z_H),
+    #         z_L=torch.where(reset_flag.view(-1, 1, 1), self.z_L_init, carry.z_L),
+    #     )
+    
     def reset_carry(self, reset_flag: torch.Tensor, carry: TRMInnerCarry) -> TRMInnerCarry:
+        """Reset carry with position-aware initialization"""
+        batch_size = carry.z_H.shape[0]
+        
+        # Expand init to batch size: (seq, hidden) -> (batch, seq, hidden)
+        z_H_init_expanded = self.z_H_init.unsqueeze(0).expand(batch_size, -1, -1)
+        z_L_init_expanded = self.z_L_init.unsqueeze(0).expand(batch_size, -1, -1)
+        
         return TRMInnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.z_H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.z_L_init, carry.z_L),
+            z_H=torch.where(reset_flag.view(-1, 1, 1), z_H_init_expanded, carry.z_H),
+            z_L=torch.where(reset_flag.view(-1, 1, 1), z_L_init_expanded, carry.z_L),
         )
     
     def inner_forward(
@@ -535,16 +544,14 @@ class TRMC4Module(C4BaseModule):
         
         # Compute learning rate for this step
         for i, (opt, base_lr) in enumerate(zip(opts, base_lrs)):
-            if current_step < self.hparams.warmup_steps:
-                lr_this_step = compute_lr(
-                    base_lr=base_lr,
-                    lr_warmup_steps=self.hparams.warmup_steps,
-                    lr_min_ratio=self.hparams.lr_min_ratio,
-                    current_step=current_step,
-                    total_steps=total_steps,
-                )
-            else:
-                lr_this_step = base_lr
+            lr_this_step = compute_lr(
+                base_lr=base_lr,
+                lr_warmup_steps=self.hparams.warmup_steps,
+                lr_min_ratio=self.hparams.lr_min_ratio,
+                current_step=current_step,
+                total_steps=total_steps,
+            )
+
             
             # Update learning rate
             if hasattr(opt, "_optimizer"):

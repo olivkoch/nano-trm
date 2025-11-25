@@ -10,7 +10,13 @@ import numpy as np
 
 @dataclass
 class MCTSNode:
-    """MCTS node with virtual loss support"""
+    """MCTS node with virtual loss support
+    
+    Virtual loss discourages multiple parallel simulations from exploring
+    the same path. Each ongoing simulation adds virtual_loss_value to the
+    visit count and subtracts the same amount from the value sum, effectively
+    assuming ongoing simulations will result in losses (value = -1).
+    """
     state: torch.Tensor
     parent: Optional['MCTSNode'] = None
     action: Optional[int] = None
@@ -21,7 +27,7 @@ class MCTSNode:
     prior: float = 0.0
     
     # Virtual loss for parallel simulations
-    virtual_loss: int = 0  # ← NEW: tracks ongoing simulations
+    virtual_loss: int = 0  # tracks ongoing simulations
     
     # Children
     children: Dict[int, 'MCTSNode'] = field(default_factory=dict)
@@ -224,6 +230,7 @@ class BatchMCTSWithVirtualLoss:
         """Select leaf and apply virtual loss along the path"""
         node = root
         path = [node]
+        current_player = self._get_current_player(node.state)
         
         while node.is_expanded() and not node.is_terminal:
             # Apply virtual loss to current node
@@ -242,7 +249,14 @@ class BatchMCTSWithVirtualLoss:
             if best_action is None:
                 break
             
-            node = node.children[best_action]
+            child = node.children[best_action]
+
+            # Compute and cache child state if not already done
+            if child.state is None:
+                child.state = self._make_move(node.state, best_action, current_player)
+            
+            current_player = 3 - current_player
+            node = child
             path.append(node)
         
         # Apply virtual loss to leaf
@@ -290,15 +304,33 @@ class BatchMCTSWithVirtualLoss:
     
     def _compute_state(self, path: List[MCTSNode]) -> torch.Tensor:
         """Compute state by replaying actions"""
-        state = path[0].state.clone()
-        current_player = self._get_current_player(state)
+        # If leaf has state, return it
+        if path[-1].state is not None:
+            return path[-1].state
+
+        # Otherwise compute from last known state
+        for i in range(len(path) - 1, -1, -1):
+            if path[i].state is not None:
+                state = path[i].state.clone()
+                current_player = self._get_current_player(state)
+                
+                for j in range(i + 1, len(path)):
+                    if path[j].action is not None:
+                        state = self._make_move(state, path[j].action, current_player)
+                        current_player = 3 - current_player
+                
+                return state
         
-        for i in range(1, len(path)):
-            if path[i].action is not None:
-                state = self._make_move(state, path[i].action, current_player)
-                current_player = 3 - current_player
+        raise RuntimeError("No state found in path")
+        # state = path[0].state.clone()
+        # current_player = self._get_current_player(state)
         
-        return state
+        # for i in range(1, len(path)):
+        #     if path[i].action is not None:
+        #         state = self._make_move(state, path[i].action, current_player)
+        #         current_player = 3 - current_player
+        
+        # return state
     
     def _get_current_player(self, state: torch.Tensor) -> int:
         """Determine current player from board state"""

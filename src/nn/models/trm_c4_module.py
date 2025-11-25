@@ -2,6 +2,7 @@
 HRM/TRM PyTorch Lightning Module - Refactored to use base class
 """
 
+from itertools import count
 import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -415,8 +416,6 @@ class TRMC4Module(C4BaseModule):
     
     def compute_loss_and_metrics(self, batch):
         """Compute loss and metrics for TRM"""
-        if self.carry is None:
-            self.carry = self.initial_carry(batch)
 
         # Get model outputs
         new_carry, outputs = self.forward(self.carry, batch)
@@ -472,17 +471,21 @@ class TRMC4Module(C4BaseModule):
         self.carry = new_carry
 
         batch_size = batch["boards"].shape[0]
-        count = raw_metrics["count"].item() if raw_metrics["count"] > 0 else 1
+        count = raw_metrics["count"].item()
 
         metrics = {
-                "policy_loss": raw_metrics["policy_loss"].item() / batch_size,
+            "policy_loss": raw_metrics["policy_loss"].item() / batch_size,
+            "q_halt_loss": raw_metrics["q_halt_loss"].item() / batch_size,
+            "count": count,
+        }
+
+        if count > 0:
+            metrics.update({
                 "value_loss": raw_metrics["value_loss"].item() / count,
                 "policy_accuracy": raw_metrics["policy_accuracy"].item() / count,
                 "q_halt_accuracy": raw_metrics["q_halt_accuracy"].item() / count,
-                "q_halt_loss": raw_metrics["q_halt_loss"].item() / batch_size,
                 "steps": raw_metrics["steps"].item() / count,
-                "count": count,
-            }
+                })
 
         return total_loss, metrics
     
@@ -589,12 +592,15 @@ class TRMC4Module(C4BaseModule):
             self.log(f"train/lr_{i}", lr_this_step, on_step=True)
         
         # Log metrics
-        self.log("train/policy_accuracy", metrics["policy_accuracy"], prog_bar=True, on_step=True)
-        self.log("train/value_loss", metrics["value_loss"], on_step=True)
+        if metrics["count"] > 0:
+            self.log("train/policy_accuracy", metrics["policy_accuracy"], prog_bar=True, on_step=True)
+            self.log("train/value_loss", metrics["value_loss"], on_step=True)
+            self.log("train/q_halt_accuracy", metrics["q_halt_accuracy"], on_step=True)
+            self.log("train/steps", metrics["steps"], prog_bar=True, on_step=True)
+    
+        # These can be logged unconditionally (they're per-batch, not per-halted-sample)
         self.log("train/policy_loss", metrics["policy_loss"], on_step=True)
-        self.log("train/q_halt_accuracy", metrics["q_halt_accuracy"], on_step=True)
         self.log("train/q_halt_loss", metrics["q_halt_loss"], on_step=True)
-        self.log("train/steps", metrics["steps"], prog_bar=True, on_step=True)
         
         # assert not torch.isnan(metrics.get("policy_loss")), f"Policy loss is NaN at step {self.manual_step}"
         

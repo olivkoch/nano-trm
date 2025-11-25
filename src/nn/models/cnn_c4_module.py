@@ -356,14 +356,16 @@ class C4CNNModule(C4BaseModule):
         current_step = self.manual_step
         total_steps = self.max_steps
         base_lr = self.hparams.learning_rate
-        lr = compute_lr(
-                base_lr=base_lr,
-                lr_warmup_steps=self.hparams.warmup_steps,
-                lr_min_ratio=self.hparams.lr_min_ratio,
-                current_step=current_step,
-                total_steps=total_steps,
-            )
-
+        if current_step < self.hparams.warmup_steps:
+            lr = compute_lr(
+                    base_lr=base_lr,
+                    lr_warmup_steps=self.hparams.warmup_steps,
+                    lr_min_ratio=self.hparams.lr_min_ratio,
+                    current_step=current_step,
+                    total_steps=total_steps,
+                )
+        else:
+            lr = base_lr
         
         # Update learning rate
         for param_group in opt.param_groups:

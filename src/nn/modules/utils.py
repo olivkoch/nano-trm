@@ -1,6 +1,6 @@
 import math
-
 import torch
+import numpy as np
 
 # def trunc_normal_init(shape, std=1.0):
 #     """Truncated normal initialization."""

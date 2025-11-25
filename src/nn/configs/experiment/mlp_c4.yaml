@@ -28,18 +28,21 @@ model_tuning:
   weight_decay: 0.01
   warmup_steps:  0
   lr_min_ratio:  0.1
-  eval_minimax_depth:  2
-  eval_minimax_temperature:  0.5
-  eval_games_vs_minimax:  512
   dropout: 0.1
   use_residual: False  # For CNN - use residual blocks
   # Self-play settings
-  enable_selfplay: True
+  enable_selfplay: False
   selfplay_buffer_size: 100000
   selfplay_games_per_iteration: 100
   selfplay_mcts_simulations: 100
   selfplay_temperature_moves: 15
   selfplay_update_interval: 10  # Update "previous model" every N epochs
+  # Evaluation parameters
+  eval_minimax_depth: 2
+  eval_minimax_temperature: 0.5
+  eval_games_vs_minimax: 64
+  eval_games_vs_random: 100
+  eval_interval: 5
   
 trainer:
   accumulate_grad_batches: 1

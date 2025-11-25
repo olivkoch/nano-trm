@@ -142,3 +142,36 @@ def robust_kl_div(pred_probs: torch.Tensor, target_probs: torch.Tensor, epsilon:
     kl_div = kl_per_element.sum(dim=-1).mean()
     
     return kl_div
+
+class CircularBuffer:
+    """Efficient circular buffer with O(1) random access"""
+    
+    def __init__(self, maxlen: int):
+        self.maxlen = maxlen
+        self.buffer = []
+        self.position = 0
+    
+    def append(self, item):
+        if len(self.buffer) < self.maxlen:
+            self.buffer.append(item)
+        else:
+            self.buffer[self.position] = item
+        self.position = (self.position + 1) % self.maxlen
+    
+    def extend(self, items):
+        for item in items:
+            self.append(item)
+    
+    def __len__(self):
+        return len(self.buffer)
+    
+    def __getitem__(self, idx):
+        return self.buffer[idx]
+    
+    def sample(self, n: int, replace: bool = False) -> list:
+        """Sample n items efficiently"""
+        if replace or n > len(self.buffer):
+            indices = np.random.randint(0, len(self.buffer), size=n)
+        else:
+            indices = np.random.choice(len(self.buffer), n, replace=False)
+        return [self.buffer[i] for i in indices]

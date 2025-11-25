@@ -4,7 +4,7 @@ Base class for Connect Four models with self-play and evaluation capabilities
 
 import time
 import pickle
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 import numpy as np
 from collections import deque
 import torch
@@ -14,7 +14,7 @@ from lightning import LightningModule
 from torch.utils.data import Dataset, DataLoader
 
 from src.nn.utils.constants import C4_EMPTY_CELL
-from src.nn.modules.utils import compute_lr, robust_kl_div
+from src.nn.modules.utils import CircularBuffer
 from src.nn.modules.batch_mcts import BatchMCTSWithVirtualLoss
 from src.nn.modules.minimax import ConnectFourMinimax
 from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
@@ -56,11 +56,8 @@ class SelfPlayDataset(Dataset):
     def __getitem__(self, idx):
         # Sample from buffer
         buffer = self.module.replay_buffer
-        if len(buffer) < self.batch_size:
-            samples = list(np.random.choice(buffer, self.batch_size, replace=True))
-        else:
-            samples = list(np.random.choice(buffer, self.batch_size, replace=False))
-        
+        samples = buffer.sample(self.batch_size, replace=len(buffer) < self.batch_size)
+
         boards = torch.stack([s['board'] for s in samples])
         policies = torch.stack([s['policy'] for s in samples])
         values = torch.tensor([s['value'] for s in samples], dtype=torch.float32)
@@ -97,7 +94,7 @@ class C4BaseModule(LightningModule):
         
         # Self-play attributes
         if self.hparams.get('enable_selfplay', False):
-            self.replay_buffer = deque(maxlen=self.hparams.selfplay_buffer_size)
+            self.replay_buffer = CircularBuffer(maxlen=self.hparams.selfplay_buffer_size)
             self.games_generated = 0
             self.previous_model = None
             self.mcts = None
@@ -251,7 +248,18 @@ class C4BaseModule(LightningModule):
             epoch = self.trainer.current_epoch
         
             # For epochs > 0, generate new games
-            if epoch > 0:
+            if epoch == 0:
+                # Generate more games to supplement bootstrap
+                num_games = self.hparams.selfplay_games_per_iteration // 2
+                if num_games > 0:
+                    start_time = time.time()
+                    num_positions = self.generate_selfplay_games_mixed(num_games, verbose=True)
+                    elapsed = time.time() - start_time
+                    
+                    self.log('selfplay/games_per_second', num_games / elapsed)
+                    self.log('selfplay/positions_generated', num_positions)
+                    self.log('selfplay/buffer_size', len(self.replay_buffer))
+            else:
                 num_games = self.hparams.selfplay_games_per_iteration
                 
                 start_time = time.time()

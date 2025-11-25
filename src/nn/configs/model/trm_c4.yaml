@@ -24,9 +24,20 @@ max_epochs: ${timekeeping.max_epochs}
 seq_len: ${model_tuning.seq_len}
 vocab_size: ${model_tuning.vocab_size}
 
+#self-play settings
+enable_selfplay: ${model_tuning.enable_selfplay}
+selfplay_buffer_size: ${model_tuning.selfplay_buffer_size}
+selfplay_games_per_iteration: ${model_tuning.selfplay_games_per_iteration}
+selfplay_mcts_simulations: ${model_tuning.selfplay_mcts_simulations}
+selfplay_temperature_moves: ${model_tuning.selfplay_temperature_moves}
+selfplay_update_interval: ${model_tuning.selfplay_update_interval}  # Update "previous model" every N epochs
+        
+# Evaluation parameters
 eval_minimax_depth: ${model_tuning.eval_minimax_depth}
 eval_minimax_temperature: ${model_tuning.eval_minimax_temperature}
 eval_games_vs_minimax: ${model_tuning.eval_games_vs_minimax}
+eval_games_vs_random: ${model_tuning.eval_games_vs_random}
+eval_interval: ${model_tuning.eval_interval}
 
 # Output directory
 output_dir: None

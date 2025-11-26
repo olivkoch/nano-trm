@@ -15,7 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from src.nn.utils.constants import C4_EMPTY_CELL
 from src.nn.modules.utils import CircularBuffer
-from src.nn.modules.batch_mcts import BatchMCTSWithVirtualLoss
+from src.nn.modules.tensor_mcts import TensorMCTSWrapper
 from src.nn.modules.minimax import ConnectFourMinimax
 from src.nn.environments.vectorized_c4_env import VectorizedConnectFour
 
@@ -133,15 +133,18 @@ class C4BaseModule(LightningModule):
         
         # Update MCTS with current model
         self.mcts.model = MCTSModelWrapper(self)
-        
-        if verbose:
-            print(f"Generating {num_games} self-play games...")
-        
-        batch_size = min(128, num_games)
+                
+        batch_size = min(512, num_games)
         num_batches = (num_games + batch_size - 1) // batch_size
         all_positions = []
         
+        t0 = time.time()
+        
+        if verbose:
+            print(f"Generating {num_games} self-play games... in {num_batches} batch(es)")
+
         for batch_idx in range(num_batches):
+
             current_batch_size = min(batch_size, num_games - batch_idx * batch_size)
             
             # Initialize games
@@ -154,7 +157,7 @@ class C4BaseModule(LightningModule):
             
             while not states.is_terminal.all():
                 # Temperature for exploration
-                temperature = 1.0  # if move_count < self.hparams.selfplay_temperature_moves else 0.0
+                temperature = 1.0 if move_count < self.hparams.selfplay_temperature_moves else 0.1
                 
                 # Get active games
                 active_games = ~states.is_terminal
@@ -222,8 +225,10 @@ class C4BaseModule(LightningModule):
         self.games_generated += num_games
         
         if verbose:
+            t1 = time.time()
             print(f"Generated {len(all_positions)} positions from {num_games} games")
             print(f"Buffer size: {len(self.replay_buffer)} positions")
+            print(f"Generation took {t1 - t0:.3f} seconds. Games per second: {num_games / (t1 - t0):.2f}")
         
         self.train()
         return len(all_positions), len(self.replay_buffer), num_games
@@ -232,6 +237,16 @@ class C4BaseModule(LightningModule):
         """Do all initialization here when model is on correct device"""
         if self.hparams.get('enable_selfplay', False):
         
+            if self.mcts is None:
+                self.mcts = TensorMCTSWrapper(
+                    model=MCTSModelWrapper(self),
+                    c_puct=1.0,
+                    num_simulations=self.hparams.selfplay_mcts_simulations,
+                    parallel_simulations=8,
+                    virtual_loss_value=3.0,
+                    device=self.device
+                )
+
             num_games = self.hparams.selfplay_games_per_iteration
             
             start_time = time.time()
@@ -515,17 +530,17 @@ class C4BaseModule(LightningModule):
                 
                 # Create MCTS if needed
                 if not hasattr(self, 'mcts') or self.mcts is None:
-                    self.mcts = BatchMCTSWithVirtualLoss(
+                    self.mcts = TensorMCTSWrapper(
                         model=MCTSModelWrapper(self),
                         c_puct=1.0,
                         num_simulations=self.hparams.selfplay_mcts_simulations,
-                        parallel_simulations=4,
-                        virtual_loss_value=2,
+                        parallel_simulations=8,  # Can increase this now
+                        virtual_loss_value=3.0,
                         device=device
                     )
                 
                 # Generate initial self-play games
-                self.generate_selfplay_games(50, verbose=True)
+                self.generate_selfplay_games(self.hparams.selfplay_games_per_iteration, verbose=True)
             
             # Now create dataset with populated buffer
             dataset = SelfPlayDataset(

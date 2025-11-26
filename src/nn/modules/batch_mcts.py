@@ -3,6 +3,7 @@ Batch MCTS with Virtual Loss for true parallel simulations
 """
 
 import torch
+import time
 import math
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
@@ -97,13 +98,16 @@ class BatchMCTSWithVirtualLoss:
         self,
         boards: List[torch.Tensor],
         legal_moves_list: List[torch.Tensor],
-        temperature: float = 1.0
+        temperature: float = 1.0,
+        verbose: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Run MCTS with both:
         1. Parallel across different games
         2. Parallel simulations within each tree (virtual loss)
         """
+        t0 = time.time()
+
         n_positions = len(boards)
         
         # Create root nodes
@@ -118,6 +122,8 @@ class BatchMCTSWithVirtualLoss:
         num_batches = (self.num_simulations + self.parallel_simulations - 1) // self.parallel_simulations
         
         for batch_idx in range(num_batches):
+
+            t0_collect = time.time()
             sims_in_batch = min(self.parallel_simulations, 
                               self.num_simulations - batch_idx * self.parallel_simulations)
             
@@ -143,26 +149,46 @@ class BatchMCTSWithVirtualLoss:
                         node.state = self._compute_state_efficient(path)
                     leaves_to_eval.append((tree_idx, node, path))
             
+            if verbose:
+                t1_collect = time.time()
+                print(f"Batch {batch_idx + 1}/{num_batches}: Collected {len(all_leaves)} leaves "
+                    f"({len(leaves_to_eval)} to eval, {len(terminal_leaves)} terminal) "
+                    f"in {t1_collect - t0_collect:.3f} seconds")
+
             # Evaluate non-terminal leaves in one batch
             if leaves_to_eval:
-                leaf_boards = torch.stack([node.state.flatten() 
-                                          for _, node, _ in leaves_to_eval])
+                leaf_boards = torch.stack([node.state
+                                          for _, node, _ in leaves_to_eval]) # N, rows, cols
                 
                 with torch.no_grad():
-                    policies, values = self.model.forward(leaf_boards)
+                    t0_forward = time.time()
+                    policies, values = self.model.forward(leaf_boards.flatten(start_dim=1))
+                    t1_forward = time.time()
+                    if verbose:
+                        print(f"Batch evaluation took {t1_forward - t0_forward:.3f} seconds for batch shape {leaf_boards.shape}")
                 
+                t0_terminal = time.time()
+                is_terminal_batch, winners_batch = self._is_terminal_and_winner_batch(leaf_boards)
+                t1_terminal = time.time()
+                if verbose:
+                    print(f"Terminal check took {t1_terminal - t0_terminal:.3f} seconds for batch shape {leaf_boards.shape}")
+
+                current_players_batch = self._get_current_player_batch(leaf_boards)
+
+                t0_expand = time.time()
                 # Expand and backup
                 for i, (tree_idx, node, path) in enumerate(leaves_to_eval):
-                    # Check if terminal
-                    is_terminal, winner = self._is_terminal_and_winner(node.state)
-                    
+
+                    is_terminal = is_terminal_batch[i].item()
+                    winner = winners_batch[i].item()
+                    current_player = current_players_batch[i].item()
+
                     if is_terminal:
                         node.is_terminal = True
                         if winner == 0:
                             value = 0.0  # Draw
                         else:
                             # Determine value from perspective
-                            current_player = self._get_current_player(node.state)
                             value = 1.0 if winner == current_player else -1.0
                         node.terminal_value = value
                     else:
@@ -180,7 +206,6 @@ class BatchMCTSWithVirtualLoss:
                         if not node.is_expanded():
                             for action in range(7):
                                 if legal_moves[action]:
-                                    current_player = self._get_current_player(node.state)
                                     child = MCTSNode(
                                         state=None,
                                         parent=node,
@@ -191,13 +216,17 @@ class BatchMCTSWithVirtualLoss:
                     
                     # Backup with virtual loss removal
                     self._backup_with_virtual_loss(path, value)
-            
+            t1_expand = time.time()
+            if verbose:
+                print(f"Expansion and backup took {t1_expand - t0_expand:.3f} seconds")
+
             # Handle terminal leaves
             for tree_idx, node, path in terminal_leaves:
                 value = node.terminal_value
                 self._backup_with_virtual_loss(path, value)
         
         # Extract final visit distributions
+        t0_extract = time.time()
         visit_distributions = torch.zeros(n_positions, 7, device=self.device)
         action_probs = torch.zeros(n_positions, 7, device=self.device)
         
@@ -218,15 +247,33 @@ class BatchMCTSWithVirtualLoss:
             else:
                 visits_temp = visits ** (1.0 / temperature)
                 action_probs[i] = visits_temp / visits_temp.sum() if visits.sum() > 0 else visit_distributions[i]
-        
+        t1_extract = time.time()
+        if verbose:
+            print(f"Extracting visit distributions took {t1_extract - t0_extract:.3f} seconds")
+
+        t1 = time.time()
+        total = t1 - t0
+        if verbose:
+            print(f"Total MCTS batch time: {total:.3f} seconds")
+
         return visit_distributions, action_probs
     
     def _select_leaf_with_virtual_loss(self, root: MCTSNode) -> Tuple[MCTSNode, List[MCTSNode]]:
         """Select leaf and apply virtual loss along the path"""
         node = root
         path = [node]
+        iterations = 0
+        max_iterations = 100  # Safety check
         
         while node.is_expanded() and not node.is_terminal:
+            iterations += 1
+            if iterations > max_iterations:
+                print(f"ERROR: Infinite loop detected in _select_leaf_with_virtual_loss!")
+                print(f"  Path length: {len(path)}")
+                print(f"  Current node: expanded={node.is_expanded()}, terminal={node.is_terminal}")
+                print(f"  Children: {len(node.children)}")
+                raise RuntimeError("Infinite loop in MCTS selection")
+        
             node.add_virtual_loss(self.virtual_loss_value)
             
             # Select child with best PUCT
@@ -304,9 +351,9 @@ class BatchMCTSWithVirtualLoss:
                     if path[j].action is not None:
                         state = self._make_move(state, path[j].action, current_player)
                         current_player = 3 - current_player
-                    # Cache the state in the node
-                    path[j].state = state  # ← Cache for next time!
-                
+                        # Cache the state in the node
+                        path[j].state = state  # ← Cache for next time!
+                    
                 return state
     
         raise RuntimeError("No state found in path - root should always have state")
@@ -329,40 +376,98 @@ class BatchMCTSWithVirtualLoss:
         
         return new_board
     
-    def _is_terminal_and_winner(self, board: torch.Tensor) -> Tuple[bool, int]:
-        """Fast terminal check without environment"""
-        # Check if board is full (draw)
-        if not (board[0, :] == 0).any():
-            return True, 0  # Draw
+    def _get_current_player_batch(self, boards: torch.Tensor) -> torch.Tensor:
+        """Vectorized current player computation
         
-        # Fast winner check - only check 4-in-a-row patterns
-        # Horizontal
+        Args:
+            boards: (batch, 6, 7) tensor
+        
+        Returns:
+            current_players: (batch,) tensor of 1s and 2s
+        """
+        p1_count = (boards == 1).sum(dim=(1, 2))  # (batch,)
+        p2_count = (boards == 2).sum(dim=(1, 2))  # (batch,)
+        return torch.where(p1_count == p2_count, 
+                        torch.ones_like(p1_count), 
+                        torch.ones_like(p1_count) * 2)
+
+    def _is_terminal_and_winner_batch(self, boards: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized terminal check for batch of boards
+        
+        Args:
+            boards: (batch, 6, 7) tensor
+        
+        Returns:
+            is_terminal: (batch,) bool tensor
+            winners: (batch,) int tensor (0=draw, 1=player1, 2=player2, -1=ongoing)
+        """
+        batch_size = boards.shape[0]
+        device = boards.device
+        
+        # Check for full boards (draws)
+        board_full = ~(boards[:, 0, :] == 0).any(dim=1)  # (batch,)
+        
+        # Initialize winners as -1 (ongoing)
+        winners = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+        
+        # Check horizontal wins
         for row in range(6):
             for col in range(4):
-                window = board[row, col:col+4]
-                if window[0] != 0 and (window == window[0]).all():
-                    return True, int(window[0].item())
+                window = boards[:, row, col:col+4]  # (batch, 4)
+                # Check if all 4 are same and non-zero
+                player = window[:, 0]
+                all_same = (window == player.unsqueeze(1)).all(dim=1)
+                valid_player = player != 0
+                has_winner = all_same & valid_player
+                winners = torch.where(has_winner, player, winners)
         
-        # Vertical
+        # Check vertical wins
         for row in range(3):
             for col in range(7):
-                window = board[row:row+4, col]
-                if window[0] != 0 and (window == window[0]).all():
-                    return True, int(window[0].item())
+                window = boards[:, row:row+4, col]  # (batch, 4)
+                player = window[:, 0]
+                all_same = (window == player.unsqueeze(1)).all(dim=1)
+                valid_player = player != 0
+                has_winner = all_same & valid_player
+                winners = torch.where(has_winner, player, winners)
         
-        # Diagonal (both directions)
+        # Check diagonal wins (down-right)
         for row in range(3):
             for col in range(4):
-                # Down-right
-                if board[row, col] != 0 and \
-                board[row, col] == board[row+1, col+1] == board[row+2, col+2] == board[row+3, col+3]:
-                    return True, int(board[row, col].item())
-                # Down-left
-                if board[row, col+3] != 0 and \
-                board[row, col+3] == board[row+1, col+2] == board[row+2, col+1] == board[row+3, col]:
-                    return True, int(board[row, col+3].item())
+                cells = torch.stack([
+                    boards[:, row, col],
+                    boards[:, row+1, col+1],
+                    boards[:, row+2, col+2],
+                    boards[:, row+3, col+3]
+                ], dim=1)  # (batch, 4)
+                player = cells[:, 0]
+                all_same = (cells == player.unsqueeze(1)).all(dim=1)
+                valid_player = player != 0
+                has_winner = all_same & valid_player
+                winners = torch.where(has_winner, player, winners)
         
-        return False, 0
+        # Check diagonal wins (down-left)
+        for row in range(3):
+            for col in range(4):
+                cells = torch.stack([
+                    boards[:, row, col+3],
+                    boards[:, row+1, col+2],
+                    boards[:, row+2, col+1],
+                    boards[:, row+3, col]
+                ], dim=1)  # (batch, 4)
+                player = cells[:, 0]
+                all_same = (cells == player.unsqueeze(1)).all(dim=1)
+                valid_player = player != 0
+                has_winner = all_same & valid_player
+                winners = torch.where(has_winner, player, winners)
+        
+        # Set draws where board is full but no winner
+        winners = torch.where(board_full & (winners == -1), torch.zeros_like(winners), winners)
+        
+        # is_terminal = has winner OR board full
+        is_terminal = (winners >= 0)
+        
+        return is_terminal, winners
 
     def _get_legal_moves(self, board: torch.Tensor) -> torch.Tensor:
         """Fast legal moves check"""
@@ -376,14 +481,13 @@ def benchmark_virtual_loss():
     # Dummy model for testing
     class RealisticModel:
         """Simulates a real neural network with inference time"""
-        def __init__(self, device, inference_ms=15):
+        def __init__(self, device, inference_ms=2):
             self.device = device
             self.inference_ms = inference_ms
             
         def forward(self, boards):
             import time
             batch_size = boards.shape[0]
-            
             # Simulate model inference time (but with batching efficiency)
             # Real models are more efficient with larger batches
             if batch_size == 1:

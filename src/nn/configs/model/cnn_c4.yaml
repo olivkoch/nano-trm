@@ -19,8 +19,11 @@ enable_selfplay: ${model_tuning.enable_selfplay}
 selfplay_buffer_size: ${model_tuning.selfplay_buffer_size}
 selfplay_games_per_iteration: ${model_tuning.selfplay_games_per_iteration}
 selfplay_mcts_simulations: ${model_tuning.selfplay_mcts_simulations}
+selfplay_eval_mcts_simulations: ${model_tuning.selfplay_eval_mcts_simulations}
+selfplay_parallel_simulations: ${model_tuning.selfplay_parallel_simulations}
 selfplay_temperature_moves: ${model_tuning.selfplay_temperature_moves}
 selfplay_update_interval: ${model_tuning.selfplay_update_interval} 
+eval_use_mcts: ${model_tuning.eval_use_mcts}
 
 batch_size: ${timekeeping.batch_size}
 max_epochs: ${timekeeping.max_epochs}

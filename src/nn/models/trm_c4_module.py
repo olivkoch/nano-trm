@@ -92,6 +92,8 @@ class TRMC4Module(C4BaseModule):
         selfplay_buffer_size: int = 100000,
         selfplay_games_per_iteration: int = 50,
         selfplay_mcts_simulations: int = 30,
+        selfplay_eval_mcts_simulations: int = 100,
+        selfplay_parallel_simulations: int = 8, # for debugging, should be much higher on gpu
         selfplay_temperature_moves: int = 15,
         selfplay_update_interval: int = 10,
         
@@ -101,6 +103,7 @@ class TRMC4Module(C4BaseModule):
         eval_games_vs_minimax: int = 100,
         eval_games_vs_random: int = 100,
         eval_interval: int = 5,
+        eval_use_mcts: bool = True,
         
         output_dir: str = None,
         **kwargs
@@ -120,6 +123,8 @@ class TRMC4Module(C4BaseModule):
             selfplay_buffer_size=selfplay_buffer_size,
             selfplay_games_per_iteration=selfplay_games_per_iteration,
             selfplay_mcts_simulations=selfplay_mcts_simulations,
+
+            selfplay_parallel_simulations=selfplay_parallel_simulations,
             selfplay_temperature_moves=selfplay_temperature_moves,
             selfplay_update_interval=selfplay_update_interval,
             eval_minimax_depth=eval_minimax_depth,
@@ -127,6 +132,7 @@ class TRMC4Module(C4BaseModule):
             eval_games_vs_minimax=eval_games_vs_minimax,
             eval_games_vs_random=eval_games_vs_random,
             eval_interval=eval_interval,
+            eval_use_mcts=eval_use_mcts,
             output_dir=output_dir,
             # TRM-specific parameters
             num_heads=num_heads,

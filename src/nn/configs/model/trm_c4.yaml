@@ -29,8 +29,11 @@ enable_selfplay: ${model_tuning.enable_selfplay}
 selfplay_buffer_size: ${model_tuning.selfplay_buffer_size}
 selfplay_games_per_iteration: ${model_tuning.selfplay_games_per_iteration}
 selfplay_mcts_simulations: ${model_tuning.selfplay_mcts_simulations}
+selfplay_eval_mcts_simulations: ${model_tuning.selfplay_eval_mcts_simulations}
+selfplay_parallel_simulations: ${model_tuning.selfplay_parallel_simulations}
 selfplay_temperature_moves: ${model_tuning.selfplay_temperature_moves}
 selfplay_update_interval: ${model_tuning.selfplay_update_interval}  # Update "previous model" every N epochs
+eval_use_mcts: ${model_tuning.eval_use_mcts}
         
 # Evaluation parameters
 eval_minimax_depth: ${model_tuning.eval_minimax_depth}

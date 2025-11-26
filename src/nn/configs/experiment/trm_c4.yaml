@@ -41,10 +41,12 @@ model_tuning:
   vocab_size: 3
 
   #self-play settings
-  enable_selfplay: false
-  selfplay_buffer_size: 100000
+  enable_selfplay: true
+  selfplay_buffer_size: 1000000
   selfplay_games_per_iteration: 128
-  selfplay_mcts_simulations: 20
+  selfplay_mcts_simulations: 40
+  selfplay_eval_mcts_simulations: 10
+  selfplay_parallel_simulations: 10
   selfplay_temperature_moves: 15
   selfplay_update_interval: 10  # Update "previous model" every N epochs
           
@@ -53,6 +55,7 @@ model_tuning:
   eval_minimax_temperature: 0.5
   eval_games_vs_minimax: 64
   eval_games_vs_random: 100
+  eval_use_mcts: true
   eval_interval: 5
   
 trainer:

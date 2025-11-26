@@ -15,7 +15,7 @@ seed: 42
 # Training configuration
 timekeeping:
   max_epochs: 1200
-  batch_size: 64
+  batch_size: 512
   num_workers: 0
   steps_per_epoch: 20
 
@@ -31,10 +31,10 @@ model_tuning:
   dropout: 0.1
   use_residual: False  # For CNN - use residual blocks
   # Self-play settings
-  enable_selfplay: true
+  enable_selfplay: false
   selfplay_buffer_size: 100000
-  selfplay_games_per_iteration: 100
-  selfplay_mcts_simulations: 100
+  selfplay_games_per_iteration: 128
+  selfplay_mcts_simulations: 20
   selfplay_temperature_moves: 15
   selfplay_update_interval: 10  # Update "previous model" every N epochs
   # Evaluation parameters

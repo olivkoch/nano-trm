@@ -237,16 +237,6 @@ class C4BaseModule(LightningModule):
         """Do all initialization here when model is on correct device"""
         if self.hparams.get('enable_selfplay', False):
         
-            if self.mcts is None:
-                self.mcts = TensorMCTSWrapper(
-                    model=MCTSModelWrapper(self),
-                    c_puct=1.0,
-                    num_simulations=self.hparams.selfplay_mcts_simulations,
-                    parallel_simulations=8,
-                    virtual_loss_value=3.0,
-                    device=self.device
-                )
-
             num_games = self.hparams.selfplay_games_per_iteration
             
             start_time = time.time()
@@ -258,191 +248,225 @@ class C4BaseModule(LightningModule):
             self.log('selfplay/buffer_size', len(self.replay_buffer))
     
     def on_train_epoch_end(self):
-        """Evaluate against minimax at epoch end"""
+        """Evaluate against various opponents at epoch end"""
         epoch = self.trainer.current_epoch if hasattr(self, 'trainer') else 0
+        
         if epoch % self.hparams.eval_interval == 0:
-            # Evaluate vs random
-            win_rate, draw_rate = self.evaluate_vs_random()
-            self.log('eval/win_rate_vs_random', win_rate)
+            use_mcts = self.hparams.get('eval_use_mcts', True)
+            mcts_sims = self.hparams.get('selfplay_eval_mcts_simulations', 100)
+            mcts_parallel = self.hparams.get('selfplay_parallel_simulations', 100)
             
-            # Evaluate vs previous version
+            # Evaluate vs random
+            win_rate, draw_rate, _ = self.evaluate(
+                opponent='random',
+                n_games=self.hparams.eval_games_vs_random,
+                use_mcts=use_mcts,
+                mcts_simulations=mcts_sims,
+                mcts_parallel_simulations=mcts_parallel,
+            )
+            self.log('eval/win_rate_vs_random', win_rate)
+            self.log('eval/draw_rate_vs_random', draw_rate)
+            
+            # Evaluate vs previous
             if self.hparams.get('enable_selfplay', False) and self.previous_model is not None:
-                win_rate, draw_rate = self.evaluate_vs_previous()
+                win_rate, draw_rate, _ = self.evaluate(
+                    opponent='previous',
+                    n_games=50,
+                    use_mcts=use_mcts,
+                    mcts_simulations=mcts_sims,
+                    mcts_parallel_simulations=mcts_parallel,
+                )
                 self.log('eval/win_rate_vs_previous', win_rate)
             
             # Evaluate vs minimax
-            win_rate, draw_rate = self.evaluate_vs_minimax_fast()
+            win_rate, draw_rate, _ = self.evaluate(
+                opponent='minimax',
+                n_games=self.hparams.eval_games_vs_minimax,
+                use_mcts=use_mcts,
+                mcts_simulations=mcts_sims,
+                mcts_parallel_simulations=mcts_parallel,
+                minimax_depth=self.hparams.eval_minimax_depth,
+                minimax_temperature=self.hparams.eval_minimax_temperature,
+            )
             self.log('eval/win_rate_vs_minimax', win_rate)
+            self.log('eval/draw_rate_vs_minimax', draw_rate)
         
-        # Update previous model for self-play
+        # Update previous model checkpoint
         if self.hparams.get('enable_selfplay', False) and epoch > 0:
             if epoch % self.hparams.get('selfplay_update_interval', 10) == 0:
                 self.previous_model = pickle.loads(pickle.dumps(self.state_dict()))
     
-    def evaluate_vs_random(self) -> Tuple[float, float]:
-        """Evaluate against random player"""
-        self.eval()
-        num_games = self.hparams.eval_games_vs_random
-        env = VectorizedConnectFour(n_envs=num_games, device=self.device)
+
+    def evaluate(
+        self,
+        opponent: str = 'random',  # 'random', 'previous', 'minimax'
+        n_games: int = 50,
+        use_mcts: bool = True,
+        mcts_simulations: int = 100,
+        mcts_parallel_simulations: int = 8,
+        minimax_depth: int = 4,
+        minimax_temperature: float = 0.0,
+    ) -> Tuple[float, float, float]:
+        """
+        Unified evaluation against various opponents.
         
-        # Model plays first in half the games
-        model_players = [1 if i < num_games // 2 else 2 for i in range(num_games)]
+        Returns:
+            (win_rate, draw_rate, loss_rate)
+        """
+        self.eval()
+        
+        # Setup opponent
+        prev_model = None
+        prev_mcts = None
+        minimax = None
+        
+        if opponent == 'previous':
+            if self.previous_model is None:
+                self.train()
+                return 0.5, 0.0, 0.5
+            prev_model = self.__class__(**dict(self.hparams))
+            prev_model.load_state_dict(self.previous_model)
+            prev_model.eval()
+            prev_model.to(self.device)
+        elif opponent == 'minimax':
+            minimax = ConnectFourMinimax(depth=minimax_depth)
+        
+        # Setup MCTS for model
+        model_mcts = None
+        if use_mcts:
+            model_mcts = TensorMCTSWrapper(
+                model=MCTSModelWrapper(self),
+                num_simulations=mcts_simulations,
+                parallel_simulations=mcts_parallel_simulations,
+                device=self.device
+            )
+            # Previous model also gets MCTS if applicable
+            if opponent == 'previous':
+                prev_mcts = TensorMCTSWrapper(
+                    model=MCTSModelWrapper(prev_model),
+                    num_simulations=mcts_simulations,
+                    parallel_simulations=mcts_parallel_simulations,
+                    device=self.device
+                )
+        
+        # Run games
+        env = VectorizedConnectFour(n_envs=n_games, device=self.device)
         states = env.reset()
         
+        # Alternate who plays first
+        model_players = [1 if i % 2 == 0 else 2 for i in range(n_games)]
+        
         while not states.is_terminal.all():
-            actions = torch.zeros(num_games, dtype=torch.long, device=self.device)
+            actions = torch.zeros(n_games, dtype=torch.long, device=self.device)
             
-            for i in range(num_games):
+            # Collect positions by who's moving
+            model_positions = []  # (index, board, legal_moves)
+            opponent_positions = []
+            
+            for i in range(n_games):
                 if states.is_terminal[i]:
                     continue
                 
                 current_player = states.current_players[i].item()
-                legal_moves = states.legal_moves[i]
+                board = states.boards[i]
+                legal = states.legal_moves[i]
                 
                 if current_player == model_players[i]:
-                    # Model move (greedy)
-                    with torch.no_grad():
-                        batch = {
-                            'boards': states.boards[i].unsqueeze(0).flatten(1),
-                            'puzzle_identifiers': torch.zeros(1, dtype=torch.long, device=self.device)
-                        }
-                        outputs = self.forward_for_mcts(batch)
-                        masked_policy = outputs['policy'][0] * legal_moves.float()
-                        actions[i] = masked_policy.argmax().item()
+                    model_positions.append((i, board, legal))
                 else:
-                    # Random move
-                    legal_actions = legal_moves.nonzero(as_tuple=True)[0]
-                    actions[i] = legal_actions[torch.randint(len(legal_actions), (1,))].item()
+                    opponent_positions.append((i, board, legal))
             
-            states = env.step(actions)
-        
-        # Count results
-        wins = sum(1 for i in range(num_games) if states.winners[i].item() == model_players[i])
-        draws = sum(1 for i in range(num_games) if states.winners[i].item() == 0)
-        
-        self.train()
-        return wins / num_games, draws / num_games
-    
-    def evaluate_vs_previous(self) -> Tuple[float, float]:
-        """Evaluate against previous version"""
-        if self.previous_model is None:
-            return 0.5, 0.0
-        
-        # Create a temporary model with previous weights
-        prev_model = self.__class__(**self.hparams)
-        prev_model.load_state_dict(self.previous_model)
-        prev_model.eval()
-        prev_model.to(self.device)
-        
-        self.eval()
-        num_games = 50  # Fewer games for speed
-        env = VectorizedConnectFour(n_envs=num_games, device=self.device)
-        
-        # Current model plays first in half the games
-        current_players = [1 if i < num_games // 2 else 2 for i in range(num_games)]
-        states = env.reset()
-        
-        while not states.is_terminal.all():
-            actions = torch.zeros(num_games, dtype=torch.long, device=self.device)
+            # Model moves (batched)
+            if model_positions:
+                model_actions = self._get_actions_batch(
+                    [p[1] for p in model_positions],
+                    [p[2] for p in model_positions],
+                    mcts=model_mcts
+                )
+                for idx, (game_idx, _, _) in enumerate(model_positions):
+                    actions[game_idx] = model_actions[idx]
             
-            for i in range(num_games):
-                if states.is_terminal[i]:
-                    continue
+            # Opponent moves (batched where possible)
+            if opponent_positions:
+                if opponent == 'random':
+                    for game_idx, _, legal in opponent_positions:
+                        legal_actions = legal.nonzero(as_tuple=True)[0]
+                        actions[game_idx] = legal_actions[
+                            torch.randint(len(legal_actions), (1,))
+                        ].item()
                 
-                current_player = states.current_players[i].item()
-                legal_moves = states.legal_moves[i]
+                elif opponent == 'previous':
+                    opp_actions = self._get_actions_batch(
+                        [p[1] for p in opponent_positions],
+                        [p[2] for p in opponent_positions],
+                        model=prev_model,
+                        mcts=prev_mcts
+                    )
+                    for idx, (game_idx, _, _) in enumerate(opponent_positions):
+                        actions[game_idx] = opp_actions[idx]
                 
-                # Determine which model to use
-                use_current = (current_player == current_players[i])
-                model = self if use_current else prev_model
-                
-                with torch.no_grad():
-                    batch = {
-                        'boards': states.boards[i].unsqueeze(0).flatten(1),
-                        'puzzle_identifiers': torch.zeros(1, dtype=torch.long, device=self.device)
-                    }
-                    outputs = model.forward_for_mcts(batch)
-                    masked_policy = outputs['policy'][0] * legal_moves.float()
-                    actions[i] = masked_policy.argmax().item()
-            
-            states = env.step(actions)
-        
-        # Count results
-        wins = sum(1 for i in range(num_games) if states.winners[i].item() == current_players[i])
-        draws = sum(1 for i in range(num_games) if states.winners[i].item() == 0)
-        
-        self.train()
-        return wins / num_games, draws / num_games
-    
-    def evaluate_vs_minimax_fast(self) -> Tuple[float, float]:
-        """Fast evaluation matching interface"""
-        minimax = ConnectFourMinimax(depth=self.hparams.eval_minimax_depth)
-        n_games = self.hparams.eval_games_vs_minimax
-        n_parallel = min(32, n_games)
-        n_batches = (n_games + n_parallel - 1) // n_parallel
-        
-        wins = 0
-        draws = 0
-        
-        for batch_idx in range(n_batches):
-            games_in_batch = min(n_parallel, n_games - batch_idx * n_parallel)
-            vec_env = VectorizedConnectFour(n_envs=games_in_batch, device=self.device)
-            states = vec_env.reset()
-            
-            # Alternate who goes first
-            model_players = [1 if (batch_idx * n_parallel + i) % 2 == 0 else 2 
-                            for i in range(games_in_batch)]
-            
-            while not states.is_terminal.all():
-                actions = torch.zeros(games_in_batch, dtype=torch.long, device=self.device)
-                
-                for i in range(games_in_batch):
-                    if states.is_terminal[i]:
-                        continue
-                    
-                    current_player = states.current_players[i].item()
-                    
-                    if current_player == model_players[i]:
-                        # Model move
-                        with torch.no_grad():
-                            batch = {
-                                'boards': states.boards[i].unsqueeze(0).flatten(1),
-                                'puzzle_identifiers': torch.zeros(1, dtype=torch.long, device=self.device)
-                            }
-                            outputs = self.forward_for_mcts(batch)
-                            
-                            # Apply legal moves mask and sample
-                            legal = states.legal_moves[i]
-                            masked_policy = outputs['policy'][0] * legal.float()
-                            if masked_policy.sum() > 0:
-                                actions[i] = masked_policy.argmax().item()
-                            else:
-                                # Fallback to random
-                                legal_actions = legal.nonzero(as_tuple=True)[0]
-                                actions[i] = legal_actions[torch.randint(len(legal_actions), (1,))].item()
-                    else:
-                        # Minimax move
-                        board_np = states.boards[i].cpu().numpy()
-                        actions[i] = minimax.get_best_move(
+                elif opponent == 'minimax':
+                    for game_idx, board, _ in opponent_positions:
+                        current_player = states.current_players[game_idx].item()
+                        board_np = board.cpu().numpy()
+                        actions[game_idx] = minimax.get_best_move(
                             board_np, current_player,
-                            temperature=self.hparams.eval_minimax_temperature
+                            temperature=minimax_temperature
                         )
-                
-                states = vec_env.step(actions)
             
-            # Count results
-            for i in range(games_in_batch):
-                winner = states.winners[i].item()
-                if winner == model_players[i]:
-                    wins += 1
-                elif winner == 0:
-                    draws += 1
+            states = env.step(actions)
         
-        # Log results
-        win_rate = wins / n_games
-        draw_rate = draws / n_games
+        # Count results
+        wins = sum(1 for i in range(n_games) if states.winners[i].item() == model_players[i])
+        draws = sum(1 for i in range(n_games) if states.winners[i].item() == 0)
+        losses = n_games - wins - draws
         
-        return win_rate, draw_rate
+        self.train()
+        return wins / n_games, draws / n_games, losses / n_games
+
+
+    def _get_actions_batch(
+        self,
+        boards: list,
+        legal_moves: list,
+        model=None,
+        mcts=None,
+    ) -> torch.Tensor:
+        """
+        Get actions for a batch of positions.
+        Uses MCTS if provided, otherwise raw policy.
+        """
+        if not boards:
+            return torch.tensor([], dtype=torch.long, device=self.device)
+        
+        model = model or self
+        
+        if mcts is not None:
+            _, action_probs = mcts.get_action_probs_batch_parallel(
+                boards, legal_moves, temperature=0  # Greedy for eval
+            )
+            return torch.tensor(
+                [p.argmax().item() for p in action_probs],
+                dtype=torch.long, device=self.device
+            )
+        else:
+            # Raw policy (greedy)
+            boards_tensor = torch.stack([b.flatten() for b in boards])
+            batch = {
+                'boards': boards_tensor,
+                'puzzle_identifiers': torch.zeros(
+                    len(boards), dtype=torch.long, device=self.device
+                )
+            }
+            with torch.no_grad():
+                outputs = model.forward_for_mcts(batch)
+            
+            actions = []
+            for i, legal in enumerate(legal_moves):
+                masked = outputs['policy'][i] * legal.float()
+                actions.append(masked.argmax().item())
+            
+            return torch.tensor(actions, dtype=torch.long, device=self.device)
     
     def _bootstrap_random_games(self, num_games: int):
         """Generate initial games with random play"""
@@ -530,11 +554,12 @@ class C4BaseModule(LightningModule):
                 
                 # Create MCTS if needed
                 if not hasattr(self, 'mcts') or self.mcts is None:
+                    log.info(f"Creating a MCTS with {self.hparams.selfplay_parallel_simulations} parallel simulations and {self.hparams.selfplay_mcts_simulations} simulations per move")
                     self.mcts = TensorMCTSWrapper(
                         model=MCTSModelWrapper(self),
                         c_puct=1.0,
                         num_simulations=self.hparams.selfplay_mcts_simulations,
-                        parallel_simulations=8,  # Can increase this now
+                        parallel_simulations=self.hparams.selfplay_parallel_simulations,  # Can increase this now
                         virtual_loss_value=3.0,
                         device=device
                     )

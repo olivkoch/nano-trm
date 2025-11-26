@@ -175,3 +175,4 @@ class CircularBuffer:
         else:
             indices = np.random.choice(len(self.buffer), n, replace=False)
         return [self.buffer[i] for i in indices]
+    

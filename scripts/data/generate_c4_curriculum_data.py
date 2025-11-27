@@ -70,7 +70,7 @@ def collect_self_play_games_minimax(n_games: int, depth: int = 2, temp_player1: 
                     trajectories[i].append({
                         'board': states.boards[i].flatten(),
                         'policy': torch.tensor(policy, device=device, dtype=torch.float32),
-                        'player': current_player
+                        'current_player': current_player
                     })
                 
                 # Step environment
@@ -97,7 +97,7 @@ def collect_self_play_games_minimax(n_games: int, depth: int = 2, temp_player1: 
                     # Assign value based on game outcome from this player's perspective
                     if winner == 0:
                         value = 0.0  # Draw
-                    elif winner == position['player']:
+                    elif winner == position['current_player']:
                         value = 1.0  # Win
                     else:
                         value = -1.0  # Loss
@@ -105,7 +105,8 @@ def collect_self_play_games_minimax(n_games: int, depth: int = 2, temp_player1: 
                     replay_buffer.append({
                         'board': position['board'],
                         'policy': position['policy'],
-                        'value': value
+                        'value': value,
+                        'current_player': position['current_player']
                     })
                     n_positions_added += 1
             
@@ -120,7 +121,7 @@ def collect_self_play_games_minimax(n_games: int, depth: int = 2, temp_player1: 
 
 @click.command()
 @click.option('--n_games', type=int, default=100, help='Number of self-play games to collect')
-@click.option('--depth', type=int, default=2, help='Minimax search depth')
+@click.option('--depth', type=int, default=4, help='Minimax search depth')
 @click.option('--temp_player1', type=float, default=0.0, help='Temperature for player 1 (X)')
 @click.option('--temp_player2', type=float, default=0.5, help='Temperature for player 2 (O)')
 @click.option('--to_file', type=str, default=None, help='Optional output file to save collected positions')
@@ -144,7 +145,8 @@ def main(n_games, depth, temp_player1, temp_player2, to_file):
             games_data.append({
                 'board': item['board'].cpu().numpy().tolist(),
                 'policy': item['policy'].cpu().numpy().tolist(),
-                'value': float(item['value'])
+                'value': float(item['value']),
+                'current_player': int(item['current_player'])
             })
         data = {}
         data['positions'] = games_data

@@ -27,8 +27,8 @@ model_tuning:
   L_cycles: 2
   num_layers: 1
   max_steps: 0
-  puzzle_emb_dim: 4
-  puzzle_emb_len: 4
+  puzzle_emb_dim: 0
+  puzzle_emb_len: 0
   hidden_size: 64
   ffn_expansion: 2
   rope_theta: 10000

@@ -33,6 +33,8 @@ selfplay_eval_mcts_simulations: ${model_tuning.selfplay_eval_mcts_simulations}
 selfplay_parallel_simulations: ${model_tuning.selfplay_parallel_simulations}
 selfplay_temperature_moves: ${model_tuning.selfplay_temperature_moves}
 selfplay_update_interval: ${model_tuning.selfplay_update_interval}  # Update "previous model" every N epochs
+selfplay_bootstrap_weight: ${model_tuning.selfplay_bootstrap_weight}
+selfplay_temporal_decay: ${model_tuning.selfplay_temporal_decay}
 eval_use_mcts: ${model_tuning.eval_use_mcts}
         
 # Evaluation parameters

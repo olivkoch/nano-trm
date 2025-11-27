@@ -28,7 +28,7 @@ To visualize the results of a model, use `notebooks/neural_viewer.ipynb`
 
 # Self-Play (Connect Four)
 
-Generate curriculum training data by pitching two minimax players against each other: `uv run python src/nn/utils/baseline_utils.py --n-games 50000 --temp_player1 0.1 --temp_player2 0.3 --to-file minimax_games_.pkl`
+Generate curriculum training data by pitching two minimax players against each other: `uv run python scripts/data/generate_c4_curriculum_data.py --n-games 50000 --temp-player1 0.1 --temp-player2 0.3 --depth 4 --to-file minimax_games_.pkl`
 
 ## Training & evaluation
 
@@ -43,4 +43,14 @@ The training script produces the evaluation metrics automatically.
 # Comments / contributions
 
 Follow me on [X](https://x.com/olivkoch)
+
+## Sweeps
+
+`uv run python scripts/create_sweep.py --sweep-file configs/sweeps/trm_sudoku6x6_sweep.yaml --project trm-sudoku`
+
+# 2. Run agent
+`uv run python scripts/run_sweep_agent.py --sweep-id <sweep_id> --project trm-sudoku --experiment trm_sudoku6x6`
+
+# Or limit runs
+`uv run python scripts/run_sweep_agent.py --sweep-id <sweep_id> --project trm-sudoku --count 20`
 

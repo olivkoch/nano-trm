@@ -46,11 +46,17 @@ Follow me on [X](https://x.com/olivkoch)
 
 ## Sweeps
 
-`uv run python scripts/create_sweep.py --sweep-file configs/sweeps/trm_sudoku6x6_sweep.yaml --project trm-sudoku`
+### 1. Create sweep
+```uv run python scripts/create_sweep.py \
+    --sweep-file src/nn/configs/sweeps/trm_sudoku6x6_sweep.yaml \
+    --project trm-sudoku
+    ```
 
-# 2. Run agent
-`uv run python scripts/run_sweep_agent.py --sweep-id <sweep_id> --project trm-sudoku --experiment trm_sudoku6x6`
-
-# Or limit runs
-`uv run python scripts/run_sweep_agent.py --sweep-id <sweep_id> --project trm-sudoku --count 20`
+### 2. Run agent
+```uv run python src/nn/train_sweep.py \
+    --sweep-id <sweep_id> \
+    --project trm-sudoku \
+    --experiment trm_sudoku6x6 \
+    --count 20
+```
 

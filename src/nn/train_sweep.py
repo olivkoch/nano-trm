@@ -8,7 +8,6 @@ from functools import partial
 
 import hydra
 import wandb
-from omegaconf import DictConfig, OmegaConf
 
 from src.nn.train import train
 from src.nn.utils import RankedLogger
@@ -26,7 +25,7 @@ def agent_train(experiment: str, save_dir: str = None):
         # Build overrides from sweep config
         overrides = [
             f"experiment={experiment}",
-            "logger=[]",  # Disable Lightning loggers, sweep handles wandb
+            "paths=sweep"
         ]
         
         if save_dir:

@@ -5,15 +5,10 @@ Base class for Connect Four models with self-play and evaluation capabilities
 import time
 import pickle
 from typing import Dict, Tuple
-import numpy as np
-from collections import deque
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from lightning import LightningModule
 from torch.utils.data import Dataset, DataLoader
 
-from src.nn.utils.constants import C4_EMPTY_CELL
 from src.nn.modules.utils import CircularBuffer
 from src.nn.modules.tensor_mcts import TensorMCTSWrapper
 from src.nn.modules.minimax import ConnectFourMinimax

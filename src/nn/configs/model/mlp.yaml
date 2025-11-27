@@ -1,4 +1,4 @@
-_target_: src.nn.models.mlp_module.ConvMLPModule
+_target_: src.nn.models.mlp.ConvMLPModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
 num_colors: 10
 hidden_channels: 128

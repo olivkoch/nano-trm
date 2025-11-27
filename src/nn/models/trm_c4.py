@@ -2,17 +2,15 @@
 HRM/TRM PyTorch Lightning Module - Refactored to use base class
 """
 
-from itertools import count
 import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
-import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.nn.models.c4_base_module import C4BaseModule
+from src.nn.models.c4_base import C4BaseModule
 from src.nn.utils.constants import C4_EMPTY_CELL
 from src.nn.modules.utils import compute_lr
 

@@ -2,7 +2,7 @@
 import argparse
 import json
 from pathlib import Path
-
+import os
 import wandb
 import yaml
 
@@ -18,6 +18,9 @@ def create_sweep_from_file(
     with open(sweep_file, "r") as f:
         sweep_config = yaml.safe_load(f)
 
+    if entity is None:
+        entity = os.environ.get("WANDB_ENTITY", None)
+
     if "project" not in sweep_config:
         sweep_config["project"] = project_name
     if entity and "entity" not in sweep_config:
@@ -25,6 +28,7 @@ def create_sweep_from_file(
 
     print(f"Creating W&B sweep: {sweep_config.get('name', 'Unnamed Sweep')}")
     print(f"   Project: {sweep_config['project']}")
+    print(f"   Entity: {sweep_config.get('entity', 'default')}")
     print(f"   Method: {sweep_config['method']}")
     print(f"   Metric: {sweep_config['metric']['name']} ({sweep_config['metric']['goal']})")
     print(f"   Parameters: {len(sweep_config['parameters'])} hyperparameters")

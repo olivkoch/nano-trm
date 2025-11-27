@@ -17,7 +17,7 @@ timekeeping:
   max_epochs: 1200
   batch_size: 512
   num_workers: 0
-  steps_per_epoch: 20
+  steps_per_epoch: 100
 
 model_tuning:
   learning_rate: 3e-3
@@ -32,8 +32,8 @@ model_tuning:
   H_cycles: 2
   L_cycles: 2
   num_layers: 1
-  puzzle_emb_dim: 4
-  puzzle_emb_len: 4
+  puzzle_emb_dim: 0
+  puzzle_emb_len: 0
   hidden_size: 64
   ffn_expansion: 2
   rope_theta: 10000
@@ -42,13 +42,15 @@ model_tuning:
 
   #self-play settings
   enable_selfplay: true
-  selfplay_buffer_size: 1000000
-  selfplay_games_per_iteration: 128
-  selfplay_mcts_simulations: 40
-  selfplay_eval_mcts_simulations: 10
-  selfplay_parallel_simulations: 10
+  selfplay_buffer_size: 50000
+  selfplay_games_per_iteration: 64
+  selfplay_mcts_simulations: 400
+  selfplay_eval_mcts_simulations: 50
+  selfplay_parallel_simulations: 100
   selfplay_temperature_moves: 15
   selfplay_update_interval: 10  # Update "previous model" every N epochs
+  selfplay_bootstrap_weight: 0.3  # 0 = pure outcome, 1 = pure MCTS value
+  selfplay_temporal_decay: 0.95   # Decay bootstrap for later
           
   # Evaluation parameters
   eval_minimax_depth: 2

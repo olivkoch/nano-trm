@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict
 
-from src.nn.models.c4_base_module import C4BaseModule
+from src.nn.models.c4_base import C4BaseModule
 from src.nn.modules.utils import compute_lr, robust_kl_div
 from src.nn.utils.constants import C4_EMPTY_CELL
 

@@ -149,7 +149,8 @@ class TensorMCTS:
     def _expand_roots(self, legal_masks: torch.Tensor):
         """Expand root nodes with children for legal actions"""
         for action in range(self.config.n_actions):
-            is_legal = legal_masks[:, action]
+            
+            is_legal = legal_masks.bool()[:, action]
             
             # Allocate child nodes where legal
             child_idx = self.next_node_idx.clone()
@@ -361,6 +362,8 @@ class TensorMCTS:
                                         torch.ones(self.n_trees, device=self.device),
                                         torch.full((self.n_trees,), 2, device=self.device))
             
+            print(f"  DEBUG _materialize_states: p1={p1_count.tolist()}, p2={p2_count.tolist()}, current_player={current_player.tolist()}")
+            
             max_len = sim_lengths.max().item()
             
             for depth in range(1, max_len):
@@ -373,19 +376,23 @@ class TensorMCTS:
                 
                 # Get action taken to reach this node
                 action = self.parent_action[self.batch_idx, node_idx]
+
+                if active.any():
+                    print(f"  DEBUG depth={depth}: action={action.tolist()}, player={current_player.tolist()}")
+                # ======================
                 
                 # Make move (vectorized)
                 current_states = self._make_moves_batch(
                     current_states, action, current_player.long(), active
                 )
-                
-                # Switch player
-                current_player = torch.where(active, 3 - current_player, current_player)
-                
+                                
                 # Cache state at this node
                 self.states[self.batch_idx[active], node_idx[active]] = current_states[active]
                 self.has_state[self.batch_idx[active], node_idx[active]] = True
     
+                # # Switch player
+                current_player = torch.where(active, 3 - current_player, current_player)
+
     def _make_moves_batch(self, boards: torch.Tensor, actions: torch.Tensor,
                          players: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """
@@ -442,6 +449,19 @@ class TensorMCTS:
         # Check which are already terminal
         already_terminal = self.is_terminal[flat_tree_idx, flat_leaves]
         
+        # Initialize values - use stored terminal values for already-terminal leaves
+        full_values = torch.zeros(flat_leaves.shape[0], device=self.device)
+        if already_terminal.any():
+            full_values[already_terminal] = self.terminal_value[
+                flat_tree_idx[already_terminal], 
+                flat_leaves[already_terminal]
+            ]
+        
+        # Track terminal status for all leaves
+        full_is_term = already_terminal.clone()
+        full_policies = torch.zeros(flat_leaves.shape[0], self.config.n_actions, 
+                                device=self.device)
+        
         # Only evaluate non-terminal leaves
         needs_eval = ~already_terminal
         
@@ -451,22 +471,25 @@ class TensorMCTS:
             # Check for terminal states
             is_term, winners = self._check_terminal_batch(eval_states)
             
-            # Get current player for value perspective
+            # Get piece counts to determine who just moved
             p1_count = (eval_states == 1).sum(dim=(1, 2))
             p2_count = (eval_states == 2).sum(dim=(1, 2))
-            current_player = torch.where(p1_count == p2_count,
-                                        torch.ones(eval_states.shape[0], device=self.device),
-                                        torch.full((eval_states.shape[0],), 2, device=self.device))
             
-            # Compute terminal values
-            term_values = torch.zeros(eval_states.shape[0], device=self.device)
+            # The player who just moved has MORE pieces on the board
+            last_player = torch.where(
+                p1_count > p2_count,
+                torch.ones(eval_states.shape[0], device=self.device),
+                torch.full((eval_states.shape[0],), 2, device=self.device)
+            )
+            
+            # Compute terminal values from perspective of player who just moved
             term_values = torch.where(
                 winners == 0,  # Draw
-                torch.zeros_like(term_values),
+                torch.zeros(eval_states.shape[0], device=self.device),
                 torch.where(
-                    winners == current_player,  # Win
-                    torch.ones_like(term_values),
-                    -torch.ones_like(term_values)  # Loss
+                    winners == last_player,  # Player who just moved won
+                    torch.ones(eval_states.shape[0], device=self.device),
+                    -torch.ones(eval_states.shape[0], device=self.device)
                 )
             )
             
@@ -474,7 +497,7 @@ class TensorMCTS:
             non_term = ~is_term
             nn_values = torch.zeros(eval_states.shape[0], device=self.device)
             nn_policies = torch.zeros(eval_states.shape[0], self.config.n_actions, 
-                                     device=self.device)
+                                    device=self.device)
             
             if non_term.any():
                 with torch.no_grad():
@@ -487,20 +510,22 @@ class TensorMCTS:
             # Combine terminal and NN values
             final_values = torch.where(is_term, term_values, nn_values)
             
-            # Map back to full leaf tensor
-            full_is_term = torch.zeros(flat_leaves.shape[0], dtype=torch.bool, device=self.device)
-            full_values = torch.zeros(flat_leaves.shape[0], device=self.device)
-            full_policies = torch.zeros(flat_leaves.shape[0], self.config.n_actions, 
-                                       device=self.device)
-            
+            # Update full tensors for evaluated leaves
             full_is_term[needs_eval] = is_term
             full_values[needs_eval] = final_values
             full_policies[needs_eval] = nn_policies
             
-            # Update terminal status
+            # Update terminal status in tree
             self.is_terminal[flat_tree_idx[needs_eval], flat_leaves[needs_eval]] = is_term
-            self.terminal_value[flat_tree_idx[needs_eval & full_is_term], 
-                               flat_leaves[needs_eval & full_is_term]] = term_values[is_term]
+            
+            # Store terminal values for newly discovered terminal states
+            newly_terminal = needs_eval.clone()
+            newly_terminal[needs_eval] = is_term
+            if newly_terminal.any():
+                self.terminal_value[
+                    flat_tree_idx[newly_terminal], 
+                    flat_leaves[newly_terminal]
+                ] = term_values[is_term]
             
             # Expand non-terminal leaves
             expand_mask = needs_eval & ~full_is_term
@@ -511,13 +536,9 @@ class TensorMCTS:
                     full_policies[expand_mask],
                     leaf_states[expand_mask]
                 )
-            
-            # Store values for backup (we need to return these)
-            # For now, store in a temporary attribute
-            self._last_leaf_values = full_values.view(n_sims, n_trees)
-        else:
-            # All terminal - use stored terminal values
-            self._last_leaf_values = self.terminal_value[flat_tree_idx, flat_leaves].view(n_sims, n_trees)
+        
+        # Store values for backup
+        self._last_leaf_values = full_values.view(n_sims, n_trees)
     
     def _expand_nodes(self, tree_indices: torch.Tensor, node_indices: torch.Tensor,
                      policies: torch.Tensor, states: torch.Tensor):

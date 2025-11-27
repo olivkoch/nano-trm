@@ -77,6 +77,8 @@ class C4CNNModule(C4BaseModule):
         selfplay_parallel_simulations: int = 8, # for debugging, should be much higher on gpu
         selfplay_temperature_moves: int = 15,
         selfplay_update_interval: int = 10,  # Update "previous model" every N epochs
+        selfplay_bootstrap_weight: float = 0.3,  # 0 = pure outcome, 1 = pure MCTS value
+        selfplay_temporal_decay: float = 0.95,   # Decay bootstrap for later moves
         
         # Evaluation parameters
         eval_minimax_depth: int = 4,
@@ -108,6 +110,8 @@ class C4CNNModule(C4BaseModule):
             selfplay_parallel_simulations=selfplay_parallel_simulations,
             selfplay_temperature_moves=selfplay_temperature_moves,
             selfplay_update_interval=selfplay_update_interval,
+            selfplay_bootstrap_weight=selfplay_bootstrap_weight,
+            selfplay_temporal_decay=selfplay_temporal_decay,
             eval_minimax_depth=eval_minimax_depth,
             eval_minimax_temperature=eval_minimax_temperature,
             eval_games_vs_minimax=eval_games_vs_minimax,
@@ -208,40 +212,17 @@ class C4CNNModule(C4BaseModule):
         self.policy_head = nn.Linear(self.hparams.hidden_size, self.board_cols)
         self.value_head = nn.Linear(self.hparams.hidden_size, 1)
     
-    def _board_to_channels(self, boards: torch.Tensor) -> torch.Tensor:
-        """
-        Convert flat board representation to 3-channel image for CNN
-        boards: [batch_size, 42] with values in {0, 1, 2}
-        Returns: [batch_size, 3, 6, 7]
-        """
-        batch_size = boards.shape[0]
-        # Ensure boards are float
-        boards = boards.float()
-        boards_2d = boards.view(batch_size, self.board_rows, self.board_cols)
-        
-        # Create 3-channel representation - always use float32
-        channels = torch.zeros(batch_size, 3, self.board_rows, self.board_cols, 
-                              device=boards.device, dtype=torch.float32)
-        
-        # Channel 0: Player 1 pieces
-        channels[:, 0] = (boards_2d == 1).float()
-        # Channel 1: Player 2 pieces
-        channels[:, 1] = (boards_2d == 2).float()
-        # Channel 2: Empty cells
-        channels[:, 2] = (boards_2d == 0).float()
-        
-        return channels
-    
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Forward pass matching TRM interface
         """
         boards = batch["boards"].float()
+        current_player = batch["current_player"]
         batch_size = boards.shape[0]
         
         if self.hparams.model_type == "cnn":
             # Convert to channel format
-            x = self._board_to_channels(boards)
+            x = self._board_to_channels(boards, current_player)
             
             if self.hparams.use_residual:
                 # Residual network forward
@@ -258,7 +239,8 @@ class C4CNNModule(C4BaseModule):
             
         else:  # MLP
             # Direct forward through MLP
-            x = self.mlp(boards)
+            boards_canonical = self._canonicalize_board(boards, current_player)
+            x = self.mlp(boards_canonical)
         
         # Output heads
         policy_logits = self.policy_head(x)
@@ -347,13 +329,7 @@ class C4CNNModule(C4BaseModule):
         # Backward
         loss.backward()
         
-        # gradient monitoring
-        total_grad_norm = 0
-        for p in self.parameters():
-            if p.grad is not None:
-                total_grad_norm += p.grad.data.norm(2).item() ** 2
-        total_grad_norm = total_grad_norm ** 0.5
-        self.log("train/grad_norm", total_grad_norm, on_step=True)
+        self.log_grad_norms()
 
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
@@ -394,6 +370,15 @@ class C4CNNModule(C4BaseModule):
         
         return loss
     
+    def log_grad_norms(self):
+        # gradient monitoring
+        total_grad_norm = 0
+        for p in self.parameters():
+            if p.grad is not None:
+                total_grad_norm += p.grad.data.norm(2).item() ** 2
+        total_grad_norm = total_grad_norm ** 0.5
+        self.log("grad/grad_norm", total_grad_norm, on_step=True)
+
     def configure_optimizers(self):
         """Configure optimizer"""
         return torch.optim.AdamW(
@@ -421,6 +406,7 @@ def test_baseline():
     # Test forward pass
     batch = {
         'boards': torch.randn(32, 42),
+        'current_player': torch.randint(1, 3, (32,)),
         'puzzle_identifiers': torch.zeros(32, dtype=torch.long)
     }
     
@@ -441,7 +427,28 @@ def test_baseline():
     print(f"MLP outputs: policy shape={outputs['policy'].shape}, value shape={outputs['value'].shape}")
     print(f"MLP parameters: {sum(p.numel() for p in mlp_model.parameters())/1e6:.2f}M")
     
+    # Test canonicalization
+    print("\nTesting canonicalization...")
+    board = torch.zeros(2, 42)
+    board[0, 0] = 1  # Player 1 piece
+    board[0, 1] = 2  # Player 2 piece
+    board[1, 0] = 1
+    board[1, 1] = 2
+    
+    current_player = torch.tensor([1, 2])  # First is P1's turn, second is P2's turn
+    
+    canonical = mlp_model._canonicalize_board(board, current_player)
+    print(f"Original board[0]: {board[0, :3].tolist()} (P1's turn)")
+    print(f"Canonical board[0]: {canonical[0, :3].tolist()} (should be same)")
+    print(f"Original board[1]: {board[1, :3].tolist()} (P2's turn)")
+    print(f"Canonical board[1]: {canonical[1, :3].tolist()} (should be swapped)")
+    
+    assert canonical[0, 0] == 1 and canonical[0, 1] == 2, "P1's turn should not swap"
+    assert canonical[1, 0] == 2 and canonical[1, 1] == 1, "P2's turn should swap"
+    print("Canonicalization: ✓")
+    
     print("\nBaseline models ready!")
+
 
 
 if __name__ == "__main__":

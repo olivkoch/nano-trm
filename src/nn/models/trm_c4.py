@@ -94,6 +94,8 @@ class TRMC4Module(C4BaseModule):
         selfplay_parallel_simulations: int = 8, # for debugging, should be much higher on gpu
         selfplay_temperature_moves: int = 15,
         selfplay_update_interval: int = 10,
+        selfplay_bootstrap_weight: float = 0.3,  # 0 = pure outcome, 1 = pure MCTS value
+        selfplay_temporal_decay: float = 0.95,   # Decay bootstrap for later moves
         
         # Evaluation parameters
         eval_minimax_depth: int = 4,
@@ -121,10 +123,12 @@ class TRMC4Module(C4BaseModule):
             selfplay_buffer_size=selfplay_buffer_size,
             selfplay_games_per_iteration=selfplay_games_per_iteration,
             selfplay_mcts_simulations=selfplay_mcts_simulations,
-
             selfplay_parallel_simulations=selfplay_parallel_simulations,
             selfplay_temperature_moves=selfplay_temperature_moves,
             selfplay_update_interval=selfplay_update_interval,
+            selfplay_bootstrap_weight=selfplay_bootstrap_weight,
+            selfplay_temporal_decay=selfplay_temporal_decay,
+            selfplay_eval_mcts_simulations=selfplay_eval_mcts_simulations,
             eval_minimax_depth=eval_minimax_depth,
             eval_minimax_temperature=eval_minimax_temperature,
             eval_games_vs_minimax=eval_games_vs_minimax,
@@ -227,7 +231,10 @@ class TRMC4Module(C4BaseModule):
         
         log.info(f"Learning rates: model={learning_rate}, emb={learning_rate_emb} max steps = {self.max_steps}")
     
-    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor, current_player: torch.Tensor):
+
+        input = self._canonicalize_board(input, current_player)
+
         # Token embedding
         embedding = self.input_embedding(input.to(torch.int32))
         
@@ -307,7 +314,7 @@ class TRMC4Module(C4BaseModule):
         )
         
         # Input encoding
-        input_embeddings = self._input_embeddings(batch["boards"], batch["puzzle_identifiers"])
+        input_embeddings = self._input_embeddings(batch["boards"], batch["puzzle_identifiers"], batch["current_player"])
         
         # Forward iterations
         z_H, z_L = carry.z_H, carry.z_L
@@ -399,7 +406,7 @@ class TRMC4Module(C4BaseModule):
             for k, v in batch.items():
                 if k == "boards":
                     padded_batch[k] = F.pad(v, (0, 0, 0, pad_size))
-                elif k == "puzzle_identifiers":
+                elif k in ("puzzle_identifiers", "current_player"):
                     padded_batch[k] = F.pad(v, (0, pad_size))
                 else:
                     padded_batch[k] = v
@@ -522,38 +529,7 @@ class TRMC4Module(C4BaseModule):
         scaled_loss = loss / batch_size
         scaled_loss.backward()
         
-        # Gradient monitoring
-        with torch.no_grad():
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.parameters(), 
-                max_norm=float('inf')  # Don't actually clip, just compute norm
-            ).item()
-            
-            # Key component gradient norms
-            grad_metrics = {}
-            
-            # First attention layer
-            if self.lenet.layers[0].self_attn.qkv_proj.weight.grad is not None:
-                grad_metrics['first_attn'] = self.lenet.layers[0].self_attn.qkv_proj.weight.grad.norm().item()
-            
-            # Last MLP layer
-            if self.lenet.layers[-1].mlp.down_proj.weight.grad is not None:
-                grad_metrics['last_mlp'] = self.lenet.layers[-1].mlp.down_proj.weight.grad.norm().item()
-            
-            # Output heads
-            if self.lm_head.weight.grad is not None:
-                grad_metrics['lm_head'] = self.lm_head.weight.grad.norm().item()
-            
-            if self.q_head.weight.grad is not None:
-                grad_metrics['q_head'] = self.q_head.weight.grad.norm().item()
-            
-            # Log main metric
-            self.log('grad/total_norm', total_grad_norm, on_step=True, prog_bar=True)
-            
-            # Log gradient flow ratio (first vs last layer)
-            if 'first_attn' in grad_metrics and 'last_mlp' in grad_metrics:
-                ratio = grad_metrics['first_attn'] / (grad_metrics['last_mlp'] + 1e-8)
-                self.log('grad/flow_ratio', ratio, on_step=True, prog_bar=True)
+        self.log_grad_norms()
         
         lr_this_step = None
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
@@ -615,6 +591,40 @@ class TRMC4Module(C4BaseModule):
         
         return loss
     
+    def log_grad_norms(self):
+        # Gradient monitoring
+        with torch.no_grad():
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.parameters(), 
+                max_norm=float('inf')  # Don't actually clip, just compute norm
+            ).item()
+            
+            # Key component gradient norms
+            grad_metrics = {}
+            
+            # First attention layer
+            if self.lenet.layers[0].self_attn.qkv_proj.weight.grad is not None:
+                grad_metrics['first_attn'] = self.lenet.layers[0].self_attn.qkv_proj.weight.grad.norm().item()
+            
+            # Last MLP layer
+            if self.lenet.layers[-1].mlp.down_proj.weight.grad is not None:
+                grad_metrics['last_mlp'] = self.lenet.layers[-1].mlp.down_proj.weight.grad.norm().item()
+            
+            # Output heads
+            if self.lm_head.weight.grad is not None:
+                grad_metrics['lm_head'] = self.lm_head.weight.grad.norm().item()
+            
+            if self.q_head.weight.grad is not None:
+                grad_metrics['q_head'] = self.q_head.weight.grad.norm().item()
+            
+            # Log main metric
+            self.log('grad/total_norm', total_grad_norm, on_step=True, prog_bar=True)
+            
+            # Log gradient flow ratio (first vs last layer)
+            if 'first_attn' in grad_metrics and 'last_mlp' in grad_metrics:
+                ratio = grad_metrics['first_attn'] / (grad_metrics['last_mlp'] + 1e-8)
+                self.log('grad/flow_ratio', ratio, on_step=True, prog_bar=True)
+
     def configure_optimizers(self):
         """Configure optimizer with different learning rates for different parameter groups."""
         base_lr = self.hparams.learning_rate

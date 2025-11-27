@@ -1,17 +1,8 @@
 """
-Tensor-Based MCTS for Connect Four
+Tensor-Based MCTS for Connect Four - With Current Player Tracking
 
-Instead of Python objects (MCTSNode), entire trees are stored as contiguous tensors.
-This enables fully vectorized selection/expansion/backup across all trees simultaneously.
-
-Key insight: MCTS tree operations are essentially sparse matrix operations.
-By pre-allocating fixed-size tensors, we eliminate:
-- Python object overhead
-- Dictionary lookups
-- Memory allocation during search
-- GC pressure
-
-Expected speedup: 10-100x for tree operations (NN forward pass becomes the bottleneck)
+Key addition: current_player is tracked at every node so the model
+always knows whose perspective to evaluate from.
 """
 
 import torch
@@ -26,7 +17,7 @@ import numpy as np
 class TensorMCTSConfig:
     """Configuration for tensor MCTS"""
     n_actions: int = 7
-    max_nodes_per_tree: int = 2000  # ~50 moves × ~20 sims × safety margin
+    max_nodes_per_tree: int = 2000
     max_depth: int = 50
     c_puct: float = 1.0
     virtual_loss_weight: float = 3.0
@@ -36,10 +27,7 @@ class TensorMCTSConfig:
 
 class TensorMCTS:
     """
-    Fully tensorized MCTS for parallel game tree search.
-    
-    All trees are stored in contiguous tensors of shape (n_trees, max_nodes, ...).
-    This enables vectorized operations across all trees simultaneously.
+    Fully tensorized MCTS with current player tracking.
     """
     
     def __init__(
@@ -67,20 +55,21 @@ class TensorMCTS:
         self.total_value = torch.zeros(n, max_nodes, device=self.device)
         self.virtual_loss = torch.zeros(n, max_nodes, device=self.device)
         
-        # Prior probabilities at each node (for selecting among children)
+        # Prior probabilities
         self.priors = torch.zeros(n, max_nodes, n_actions, device=self.device)
         
-        # Tree structure: children[tree, node, action] = child_node_index (-1 if none)
+        # Tree structure
         self.children = torch.full((n, max_nodes, n_actions), -1, 
                                    dtype=torch.long, device=self.device)
-        
-        # Parent tracking for backup
         self.parent = torch.full((n, max_nodes), -1, dtype=torch.long, device=self.device)
         self.parent_action = torch.full((n, max_nodes), -1, dtype=torch.long, device=self.device)
         
-        # Board states (6x7 for Connect Four)
+        # Board states
         self.states = torch.zeros(n, max_nodes, 6, 7, device=self.device)
         self.has_state = torch.zeros(n, max_nodes, dtype=torch.bool, device=self.device)
+        
+        # NEW: Current player at each node (1 or 2) - the player TO MOVE
+        self.current_player = torch.zeros(n, max_nodes, dtype=torch.long, device=self.device)
         
         # Terminal info
         self.is_terminal = torch.zeros(n, max_nodes, dtype=torch.bool, device=self.device)
@@ -89,11 +78,11 @@ class TensorMCTS:
         # Node allocation tracking
         self.next_node_idx = torch.ones(n, dtype=torch.long, device=self.device)
         
-        # Batch indices for efficient indexing
+        # Batch indices
         self.batch_idx = torch.arange(n, device=self.device)
     
     def reset(self, root_states: torch.Tensor, root_policies: torch.Tensor, 
-              legal_masks: torch.Tensor):
+              legal_masks: torch.Tensor, root_players: torch.Tensor):
         """
         Initialize trees with root states.
         
@@ -101,6 +90,7 @@ class TensorMCTS:
             root_states: (n_trees, 6, 7) initial board states
             root_policies: (n_trees, 7) policy priors from neural net
             legal_masks: (n_trees, 7) legal move masks
+            root_players: (n_trees,) current player at root (1 or 2)
         """
         # Zero out everything
         self.visits.zero_()
@@ -112,29 +102,33 @@ class TensorMCTS:
         self.parent_action.fill_(-1)
         self.states.zero_()
         self.has_state.zero_()
+        self.current_player.zero_()
         self.is_terminal.zero_()
         self.terminal_value.zero_()
         self.next_node_idx.fill_(1)
         
-        # Set root node (index 0) for each tree
+        # Set root node
         self.states[:, 0] = root_states
         self.has_state[:, 0] = True
+        self.current_player[:, 0] = root_players  # NEW: store who moves at root
         
         # Apply legal mask and normalize
         masked_policy = root_policies * legal_masks.float()
         masked_policy = masked_policy / (masked_policy.sum(dim=1, keepdim=True) + 1e-8)
         
-        # Add Dirichlet noise for exploration
+        # Add Dirichlet noise
         if self.config.exploration_fraction > 0:
-
-            if "mps" in str(self.device): # could be "mps:0"
-                noise_np = np.random.dirichlet([self.config.dirichlet_alpha] * self.config.n_actions, size=self.n_trees)
+            if "mps" in str(self.device):
+                noise_np = np.random.dirichlet(
+                    [self.config.dirichlet_alpha] * self.config.n_actions, 
+                    size=self.n_trees
+                )
                 noise = torch.from_numpy(noise_np).float().to(self.device)
             else:
                 noise = torch.distributions.Dirichlet(
                     torch.full((self.config.n_actions,), self.config.dirichlet_alpha, 
                               device=self.device)
-                        ).sample((self.n_trees,))
+                ).sample((self.n_trees,))
             noise = noise * legal_masks.float()
             noise = noise / (noise.sum(dim=1, keepdim=True) + 1e-8)
             
@@ -143,27 +137,24 @@ class TensorMCTS:
         
         self.priors[:, 0] = masked_policy
         
-        # Expand root immediately
-        self._expand_roots(legal_masks)
+        # Expand root
+        self._expand_roots(legal_masks, root_players)
     
-    def _expand_roots(self, legal_masks: torch.Tensor):
-        """Expand root nodes with children for legal actions"""
+    def _expand_roots(self, legal_masks: torch.Tensor, root_players: torch.Tensor):
+        """Expand root nodes - children have opposite player"""
+        child_player = 3 - root_players  # Opponent moves at children
+        
         for action in range(self.config.n_actions):
-            
             is_legal = legal_masks.bool()[:, action]
-            
-            # Allocate child nodes where legal
             child_idx = self.next_node_idx.clone()
             
-            # Set children pointers
             self.children[:, 0, action] = torch.where(
                 is_legal, child_idx, torch.full_like(child_idx, -1)
             )
             
-            # Set parent info for children
             self.parent[self.batch_idx, child_idx] = torch.where(
                 is_legal, 
-                torch.zeros_like(child_idx),  # parent is root (0)
+                torch.zeros_like(child_idx),
                 self.parent[self.batch_idx, child_idx]
             )
             self.parent_action[self.batch_idx, child_idx] = torch.where(
@@ -172,30 +163,23 @@ class TensorMCTS:
                 self.parent_action[self.batch_idx, child_idx]
             )
             
-            # Increment allocation counter
+            # NEW: Set current_player for child nodes
+            self.current_player[self.batch_idx, child_idx] = torch.where(
+                is_legal,
+                child_player,
+                self.current_player[self.batch_idx, child_idx]
+            )
+            
             self.next_node_idx += is_legal.long()
     
     def run_simulations(self, num_simulations: int, parallel_sims: int = 8,
                        verbose: bool = False) -> torch.Tensor:
-        """
-        Run MCTS simulations on all trees.
-        
-        Args:
-            num_simulations: Total simulations per tree
-            parallel_sims: Simulations to run in parallel (with virtual loss)
-            verbose: Print timing info
-            
-        Returns:
-            visit_distributions: (n_trees, n_actions) normalized visit counts
-        """
+        """Run MCTS simulations on all trees."""
         num_batches = (num_simulations + parallel_sims - 1) // parallel_sims
         
         for batch_idx in range(num_batches):
             sims_this_batch = min(parallel_sims, num_simulations - batch_idx * parallel_sims)
             
-            t0 = time.time()
-            
-            # Collect leaves from all trees (parallel within each tree too)
             all_leaves = []
             all_paths = []
             all_path_lengths = []
@@ -206,47 +190,18 @@ class TensorMCTS:
                 all_paths.append(paths)
                 all_path_lengths.append(path_lengths)
             
-            # Stack: (sims_this_batch, n_trees)
             leaves_tensor = torch.stack(all_leaves, dim=0)
             paths_tensor = torch.stack(all_paths, dim=0)
             lengths_tensor = torch.stack(all_path_lengths, dim=0)
             
-            if verbose:
-                t1 = time.time()
-                print(f"  Selection: {t1-t0:.4f}s")
-            
-            # Compute states for leaves that need them
-            t0 = time.time()
             self._materialize_states(leaves_tensor, paths_tensor, lengths_tensor)
-            if verbose:
-                t1 = time.time()
-                print(f"  State materialization: {t1-t0:.4f}s")
-            
-            # Batch evaluate all leaves
-            t0 = time.time()
             self._batch_evaluate_and_expand(leaves_tensor)
-            if verbose:
-                t1 = time.time()
-                print(f"  NN eval + expand: {t1-t0:.4f}s")
-            
-            # Backup all paths
-            t0 = time.time()
             self._batch_backup(leaves_tensor, paths_tensor, lengths_tensor)
-            if verbose:
-                t1 = time.time()
-                print(f"  Backup: {t1-t0:.4f}s")
         
         return self._get_visit_distributions()
     
     def _batch_select_leaves(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Select one leaf from each tree using PUCT with virtual loss.
-        
-        Returns:
-            leaves: (n_trees,) selected leaf node indices
-            paths: (n_trees, max_depth) node indices along path
-            path_lengths: (n_trees,) actual path lengths
-        """
+        """Select one leaf from each tree using PUCT with virtual loss."""
         max_depth = self.config.max_depth
         vl_weight = self.config.virtual_loss_weight
         c_puct = self.config.c_puct
@@ -259,26 +214,19 @@ class TensorMCTS:
             paths[:, depth] = current
             path_lengths += 1
             
-            # Check if expanded (has any valid children)
-            current_children = self.children[self.batch_idx, current]  # (n_trees, n_actions)
-            has_children = (current_children >= 0).any(dim=1)  # (n_trees,)
-            
-            # Check terminal
+            current_children = self.children[self.batch_idx, current]
+            has_children = (current_children >= 0).any(dim=1)
             is_term = self.is_terminal[self.batch_idx, current]
             
-            # Continue if expanded and not terminal
             should_continue = has_children & ~is_term
             if not should_continue.any():
                 break
             
-            # Apply virtual loss to current node
             self.virtual_loss[self.batch_idx, current] += vl_weight * should_continue.float()
             
-            # Compute PUCT scores for children
             valid_children = current_children >= 0
             safe_indices = current_children.clamp(min=0)
             
-            # Gather child stats using advanced indexing
             tree_expand = self.batch_idx.unsqueeze(1).expand(-1, self.config.n_actions)
             
             child_visits = self.visits[tree_expand, safe_indices]
@@ -286,52 +234,34 @@ class TensorMCTS:
             child_vl = self.virtual_loss[tree_expand, safe_indices]
             child_priors = self.priors[self.batch_idx, current]
             
-            # Q with virtual loss (VL assumes loss = -1)
             effective_visits = child_visits + child_vl
             effective_value = child_values - child_vl
             Q = torch.where(
                 effective_visits > 0,
-                effective_value / effective_visits,
+                -effective_value / effective_visits,
                 torch.zeros_like(effective_value)
             )
             
-            # U (exploration bonus)
             parent_visits = self.visits[self.batch_idx, current].unsqueeze(1)
             U = c_puct * child_priors * torch.sqrt(parent_visits + 1) / (1 + effective_visits)
             
-            # PUCT score with mask for invalid children
             puct = Q + U
             puct = torch.where(valid_children, puct, torch.full_like(puct, -1e9))
             
-            # Select best action
             best_actions = puct.argmax(dim=1)
             next_nodes = self.children[self.batch_idx, current, best_actions]
             
-            # Only advance where should_continue
             current = torch.where(should_continue, next_nodes, current)
         
-        # Apply virtual loss to leaves
         self.virtual_loss[self.batch_idx, current] += vl_weight
         
         return current, paths, path_lengths
     
     def _materialize_states(self, leaves: torch.Tensor, paths: torch.Tensor,
                            path_lengths: torch.Tensor):
-        """
-        Compute board states for leaf nodes by replaying moves from root.
-        
-        Args:
-            leaves: (n_sims, n_trees) leaf node indices
-            paths: (n_sims, n_trees, max_depth) paths
-            path_lengths: (n_sims, n_trees) path lengths
-        
-        This is vectorized where possible but has some sequential dependency
-        due to move application.
-        """
+        """Compute board states for leaf nodes by replaying moves from root."""
         n_sims, n_trees = leaves.shape
         
-        # For each tree, find leaves that don't have states materialized
-        # Need to properly index: for each (sim, tree), check has_state[tree, leaf]
         needs_state = torch.zeros(n_sims, n_trees, dtype=torch.bool, device=self.device)
         for sim_idx in range(n_sims):
             needs_state[sim_idx] = ~self.has_state[self.batch_idx, leaves[sim_idx]]
@@ -339,31 +269,19 @@ class TensorMCTS:
         if not needs_state.any():
             return
         
-        # For leaves needing states, replay from root
-        # This is per-simulation, so we iterate over sims
-        n_sims = leaves.shape[0]
-        
         for sim_idx in range(n_sims):
-            sim_leaves = leaves[sim_idx]  # (n_trees,)
-            sim_paths = paths[sim_idx]    # (n_trees, max_depth)
-            sim_lengths = path_lengths[sim_idx]  # (n_trees,)
-            sim_needs = needs_state[sim_idx]  # (n_trees,)
+            sim_leaves = leaves[sim_idx]
+            sim_paths = paths[sim_idx]
+            sim_lengths = path_lengths[sim_idx]
+            sim_needs = needs_state[sim_idx]
             
             if not sim_needs.any():
                 continue
             
-            # Start from root state
-            current_states = self.states[:, 0].clone()  # (n_trees, 6, 7)
-            
-            # Determine current player from root
-            p1_count = (current_states == 1).sum(dim=(1, 2))
-            p2_count = (current_states == 2).sum(dim=(1, 2))
-            current_player = torch.where(p1_count == p2_count, 
-                                        torch.ones(self.n_trees, device=self.device),
-                                        torch.full((self.n_trees,), 2, device=self.device))
-            
-            print(f"  DEBUG _materialize_states: p1={p1_count.tolist()}, p2={p2_count.tolist()}, current_player={current_player.tolist()}")
-            
+            current_states = self.states[:, 0].clone()
+            # NEW: Use stored current_player from root instead of inferring
+            current_player = self.current_player[:, 0].clone()
+                        
             max_len = sim_lengths.max().item()
             
             for depth in range(1, max_len):
@@ -371,56 +289,35 @@ class TensorMCTS:
                 if not active.any():
                     break
                 
-                # Get node at this depth
                 node_idx = sim_paths[:, depth]
-                
-                # Get action taken to reach this node
                 action = self.parent_action[self.batch_idx, node_idx]
-
-                if active.any():
-                    print(f"  DEBUG depth={depth}: action={action.tolist()}, player={current_player.tolist()}")
-                # ======================
                 
-                # Make move (vectorized)
+                # Make move with current player
                 current_states = self._make_moves_batch(
-                    current_states, action, current_player.long(), active
+                    current_states, action, current_player, active
                 )
-                                
-                # Cache state at this node
+                
+                # Cache state
                 self.states[self.batch_idx[active], node_idx[active]] = current_states[active]
                 self.has_state[self.batch_idx[active], node_idx[active]] = True
-    
-                # # Switch player
+                
+                # Switch player
                 current_player = torch.where(active, 3 - current_player, current_player)
 
     def _make_moves_batch(self, boards: torch.Tensor, actions: torch.Tensor,
                          players: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
-        """
-        Make moves on multiple boards simultaneously.
-        
-        Args:
-            boards: (n_trees, 6, 7) current board states
-            actions: (n_trees,) column indices
-            players: (n_trees,) player making move (1 or 2)
-            active: (n_trees,) which boards to update
-            
-        Returns:
-            new_boards: (n_trees, 6, 7) updated boards
-        """
+        """Make moves on multiple boards simultaneously."""
         new_boards = boards.clone()
         
-        # For each active board, find lowest empty row in the action column
         for i in range(self.n_trees):
             if not active[i]:
                 continue
             
             col = actions[i].item()
-            if col < 0:  # Invalid action
+            if col < 0:
                 continue
                 
             player = players[i].item()
-            
-            # Find lowest empty row
             col_vals = new_boards[i, :, col]
             empty_rows = (col_vals == 0).nonzero(as_tuple=True)[0]
             
@@ -431,25 +328,18 @@ class TensorMCTS:
         return new_boards
     
     def _batch_evaluate_and_expand(self, leaves: torch.Tensor):
-        """
-        Evaluate leaf positions with neural network and expand.
-        
-        Args:
-            leaves: (n_sims, n_trees) leaf node indices
-        """
+        """Evaluate leaf positions with neural network and expand."""
         n_sims, n_trees = leaves.shape
         
-        # Flatten leaves for batch evaluation
-        flat_leaves = leaves.flatten()  # (n_sims * n_trees,)
+        flat_leaves = leaves.flatten()
         flat_tree_idx = self.batch_idx.unsqueeze(0).expand(n_sims, -1).flatten()
         
-        # Get states for all leaves
-        leaf_states = self.states[flat_tree_idx, flat_leaves]  # (n_sims * n_trees, 6, 7)
+        leaf_states = self.states[flat_tree_idx, flat_leaves]
+        # NEW: Get current_player for each leaf
+        leaf_players = self.current_player[flat_tree_idx, flat_leaves]
         
-        # Check which are already terminal
         already_terminal = self.is_terminal[flat_tree_idx, flat_leaves]
         
-        # Initialize values - use stored terminal values for already-terminal leaves
         full_values = torch.zeros(flat_leaves.shape[0], device=self.device)
         if already_terminal.any():
             full_values[already_terminal] = self.terminal_value[
@@ -457,37 +347,25 @@ class TensorMCTS:
                 flat_leaves[already_terminal]
             ]
         
-        # Track terminal status for all leaves
         full_is_term = already_terminal.clone()
         full_policies = torch.zeros(flat_leaves.shape[0], self.config.n_actions, 
                                 device=self.device)
         
-        # Only evaluate non-terminal leaves
         needs_eval = ~already_terminal
         
         if needs_eval.any():
-            eval_states = leaf_states[needs_eval]  # (?, 6, 7)
+            eval_states = leaf_states[needs_eval]
+            eval_players = leaf_players[needs_eval]  # NEW
             
-            # Check for terminal states
             is_term, winners = self._check_terminal_batch(eval_states)
             
-            # Get piece counts to determine who just moved
-            p1_count = (eval_states == 1).sum(dim=(1, 2))
-            p2_count = (eval_states == 2).sum(dim=(1, 2))
-            
-            # The player who just moved has MORE pieces on the board
-            last_player = torch.where(
-                p1_count > p2_count,
-                torch.ones(eval_states.shape[0], device=self.device),
-                torch.full((eval_states.shape[0],), 2, device=self.device)
-            )
-            
-            # Compute terminal values from perspective of player who just moved
+            # Terminal values from perspective of current player (player to move)
+            # If current player won, value = 1; if opponent won, value = -1
             term_values = torch.where(
                 winners == 0,  # Draw
                 torch.zeros(eval_states.shape[0], device=self.device),
                 torch.where(
-                    winners == last_player,  # Player who just moved won
+                    winners == eval_players,  # Current player won
                     torch.ones(eval_states.shape[0], device=self.device),
                     -torch.ones(eval_states.shape[0], device=self.device)
                 )
@@ -501,24 +379,22 @@ class TensorMCTS:
             
             if non_term.any():
                 with torch.no_grad():
+                    # NEW: Pass current_player to model
                     policies, values = self.model.forward(
-                        eval_states[non_term].flatten(start_dim=1)
+                        eval_states[non_term].flatten(start_dim=1),
+                        eval_players[non_term]
                     )
                 nn_values[non_term] = values.squeeze(-1) if values.dim() > 1 else values
                 nn_policies[non_term] = policies
             
-            # Combine terminal and NN values
             final_values = torch.where(is_term, term_values, nn_values)
             
-            # Update full tensors for evaluated leaves
             full_is_term[needs_eval] = is_term
             full_values[needs_eval] = final_values
             full_policies[needs_eval] = nn_policies
             
-            # Update terminal status in tree
             self.is_terminal[flat_tree_idx[needs_eval], flat_leaves[needs_eval]] = is_term
             
-            # Store terminal values for newly discovered terminal states
             newly_terminal = needs_eval.clone()
             newly_terminal[needs_eval] = is_term
             if newly_terminal.any():
@@ -534,103 +410,81 @@ class TensorMCTS:
                     flat_tree_idx[expand_mask],
                     flat_leaves[expand_mask],
                     full_policies[expand_mask],
-                    leaf_states[expand_mask]
+                    leaf_states[expand_mask],
+                    leaf_players[expand_mask]  # NEW: pass current players
                 )
         
-        # Store values for backup
         self._last_leaf_values = full_values.view(n_sims, n_trees)
     
     def _expand_nodes(self, tree_indices: torch.Tensor, node_indices: torch.Tensor,
-                     policies: torch.Tensor, states: torch.Tensor):
+                     policies: torch.Tensor, states: torch.Tensor,
+                     node_players: torch.Tensor):  # NEW parameter
         """Expand nodes with children"""
         n_nodes = tree_indices.shape[0]
         
-        # Get legal moves from states
-        legal_masks = states[:, 0, :] == 0  # Top row empty = legal
+        legal_masks = states[:, 0, :] == 0
         
-        # Mask and normalize policies
         masked_policies = policies * legal_masks.float()
         masked_policies = masked_policies / (masked_policies.sum(dim=1, keepdim=True) + 1e-8)
         
-        # Store priors
         self.priors[tree_indices, node_indices] = masked_policies
         
-        # Create children for each legal action
+        # Children have opposite player
+        child_players = 3 - node_players
+        
         for action in range(self.config.n_actions):
             is_legal = legal_masks[:, action]
             if not is_legal.any():
                 continue
             
-            # Get next available node indices for each tree
             legal_tree_idx = tree_indices[is_legal]
             legal_node_idx = node_indices[is_legal]
+            legal_child_players = child_players[is_legal]  # NEW
             child_idx = self.next_node_idx[legal_tree_idx]
             
-            # Set child pointers
             self.children[legal_tree_idx, legal_node_idx, action] = child_idx
-            
-            # Set parent info
             self.parent[legal_tree_idx, child_idx] = legal_node_idx
             self.parent_action[legal_tree_idx, child_idx] = action
             
-            # Increment allocation counter
+            # NEW: Set current_player for children
+            self.current_player[legal_tree_idx, child_idx] = legal_child_players
+            
             self.next_node_idx[legal_tree_idx] += 1
     
     def _batch_backup(self, leaves: torch.Tensor, paths: torch.Tensor,
                      path_lengths: torch.Tensor):
-        """
-        Backup values along all paths.
-        
-        Args:
-            leaves: (n_sims, n_trees) leaf indices
-            paths: (n_sims, n_trees, max_depth) paths
-            path_lengths: (n_sims, n_trees) path lengths
-        """
+        """Backup values along all paths."""
         n_sims = leaves.shape[0]
         vl_weight = self.config.virtual_loss_weight
         
-        # Get leaf values from last evaluation
-        values = self._last_leaf_values  # (n_sims, n_trees)
+        values = self._last_leaf_values
         
         for sim_idx in range(n_sims):
-            sim_paths = paths[sim_idx]  # (n_trees, max_depth)
-            sim_lengths = path_lengths[sim_idx]  # (n_trees,)
-            sim_values = values[sim_idx].clone()  # (n_trees,)
+            sim_paths = paths[sim_idx]
+            sim_lengths = path_lengths[sim_idx]
+            sim_values = values[sim_idx].clone()
             
             max_len = sim_lengths.max().item()
             
-            # Backup from leaf to root
             for depth in range(max_len - 1, -1, -1):
                 active = sim_lengths > depth
                 node_idx = sim_paths[:, depth]
                 
-                # Update statistics
                 self.visits[self.batch_idx, node_idx] += active.float()
                 self.total_value[self.batch_idx, node_idx] += sim_values * active.float()
-                
-                # Remove virtual loss
                 self.virtual_loss[self.batch_idx, node_idx] -= vl_weight * active.float()
                 
                 # Flip value for opponent
                 sim_values = -sim_values
         
-        # Clamp virtual loss to non-negative
         self.virtual_loss.clamp_(min=0)
     
     def _check_terminal_batch(self, boards: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Check for terminal states in batch.
-        
-        Returns:
-            is_terminal: (batch,) bool
-            winners: (batch,) 0=draw, 1=p1, 2=p2, -1=ongoing
-        """
+        """Check for terminal states in batch."""
         batch_size = boards.shape[0]
         device = boards.device
         
-        # Check for full board
         board_full = ~(boards[:, 0, :] == 0).any(dim=1)
-        
         winners = torch.full((batch_size,), -1, dtype=torch.long, device=device)
         
         # Horizontal
@@ -683,7 +537,6 @@ class TensorMCTS:
                 has_win = all_same & valid
                 winners = torch.where(has_win, player, winners)
         
-        # Set draws
         winners = torch.where(board_full & (winners == -1), 
                              torch.zeros_like(winners), winners)
         
@@ -693,7 +546,7 @@ class TensorMCTS:
     
     def _get_visit_distributions(self) -> torch.Tensor:
         """Get normalized visit distributions from root"""
-        root_children = self.children[:, 0]  # (n_trees, n_actions)
+        root_children = self.children[:, 0]
         valid = root_children >= 0
         safe_idx = root_children.clamp(min=0)
         
@@ -711,22 +564,18 @@ class TensorMCTS:
         distributions = self._get_visit_distributions()
         
         if temperature == 0:
-            # Greedy
             probs = torch.zeros_like(distributions)
             probs.scatter_(1, distributions.argmax(dim=1, keepdim=True), 1.0)
             return probs
         else:
-            # Temperature scaling
             visits_temp = distributions ** (1.0 / temperature)
             return visits_temp / (visits_temp.sum(dim=1, keepdim=True) + 1e-8)
 
 
 class TensorMCTSWrapper:
     """
-    Wrapper to provide similar interface to BatchMCTSWithVirtualLoss.
-    
-    This handles dynamic batch sizes by creating new TensorMCTS instances
-    as needed (or reusing if same size).
+    Wrapper providing interface compatible with existing code.
+    Now accepts current_players parameter.
     """
     
     def __init__(
@@ -752,23 +601,28 @@ class TensorMCTSWrapper:
             exploration_fraction=exploration_fraction
         )
         
-        self._cached_mcts = {}  # Cache by n_trees
+        self._cached_mcts = {}
     
     def get_action_probs_batch_parallel(
         self,
         boards: List[torch.Tensor],
         legal_moves_list: List[torch.Tensor],
         temperature: float = 1.0,
+        current_players: torch.Tensor = None,  # NEW parameter
         verbose: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Run MCTS on batch of positions.
         
-        Compatible with BatchMCTSWithVirtualLoss interface.
+        Args:
+            boards: List of (6, 7) board tensors
+            legal_moves_list: List of (7,) legal move masks
+            temperature: Temperature for action selection
+            current_players: (n_positions,) tensor of current players (1 or 2)
+                           If None, inferred from piece counts (legacy behavior)
         """
         n_positions = len(boards)
         
-        # Get or create TensorMCTS for this batch size
         if n_positions not in self._cached_mcts:
             self._cached_mcts[n_positions] = TensorMCTS(
                 model=self.model,
@@ -778,20 +632,36 @@ class TensorMCTSWrapper:
             )
         
         mcts = self._cached_mcts[n_positions]
-        mcts.model = self.model  # Update model reference
+        mcts.model = self.model
         
         # Stack inputs
-        boards_tensor = torch.stack(boards)  # (n, 6, 7)
+        boards_tensor = torch.stack(boards)
         if boards_tensor.dim() == 2:
             boards_tensor = boards_tensor.view(n_positions, 6, 7)
-        legal_masks = torch.stack(legal_moves_list)  # (n, 7)
+        legal_masks = torch.stack(legal_moves_list)
         
-        # Get initial policies from model
+        # Handle current_players
+        if current_players is None:
+            # Legacy: infer from piece counts
+            p1_count = (boards_tensor == 1).sum(dim=(1, 2))
+            p2_count = (boards_tensor == 2).sum(dim=(1, 2))
+            current_players = torch.where(
+                p1_count == p2_count,
+                torch.ones(n_positions, dtype=torch.long, device=self.device),
+                torch.full((n_positions,), 2, dtype=torch.long, device=self.device)
+            )
+        else:
+            current_players = current_players.to(self.device)
+        
+        # Get initial policies from model - NOW WITH current_players
         with torch.no_grad():
-            policies, _ = self.model.forward(boards_tensor.flatten(start_dim=1))
+            policies, _ = self.model.forward(
+                boards_tensor.flatten(start_dim=1),
+                current_players
+            )
         
-        # Initialize trees
-        mcts.reset(boards_tensor, policies, legal_masks)
+        # Initialize trees with current_players
+        mcts.reset(boards_tensor, policies, legal_masks, current_players)
         
         # Run simulations
         visit_distributions = mcts.run_simulations(
@@ -800,88 +670,69 @@ class TensorMCTSWrapper:
             verbose=verbose
         )
         
-        # Get action probs with temperature
         action_probs = mcts.get_action_probs(temperature)
         
         return visit_distributions, action_probs
 
 
-def benchmark_comparison():
-    """Compare tensor MCTS vs original implementation"""
+def test_current_player_tracking():
+    """Test that current_player is correctly tracked through the tree"""
     
-    print("=" * 60)
-    print("MCTS Benchmark: Tensor-Based vs Object-Based")
-    print("=" * 60)
-    
-    # Dummy model
-    class RealisticModel:
-        """Simulates a real neural network with inference time"""
-        def __init__(self, device, inference_ms=2):
+    class DebugModel:
+        """Model that prints what it receives"""
+        def __init__(self, device):
             self.device = device
-            self.inference_ms = inference_ms
+            self.call_count = 0
             
-        def forward(self, boards):
-            import time
+        def forward(self, boards, current_players):
+            self.call_count += 1
             batch_size = boards.shape[0]
-            # Simulate model inference time (but with batching efficiency)
-            # Real models are more efficient with larger batches
-            if batch_size == 1:
-                time.sleep(self.inference_ms / 1000)
-            else:
-                # Batching provides sublinear scaling
-                time.sleep(self.inference_ms * (1 + batch_size * 0.2) / 1000)
+            print(f"  Model call {self.call_count}: batch_size={batch_size}, "
+                  f"players={current_players.tolist()}")
             
-            policies = torch.rand(batch_size, 7, device=self.device)
-            policies = torch.softmax(policies, dim=-1)
-            values = torch.rand(batch_size, device=self.device) * 2 - 1
+            policies = torch.ones(batch_size, 7, device=self.device) / 7
+            values = torch.zeros(batch_size, device=self.device)
             return policies, values
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = RealisticModel(device)
+    device = "cpu"
+    model = DebugModel(device)
     
-    # Test configs
-    configs = [
-        (32, 20, 4),   # Small batch, few sims
-        (128, 20, 8),  # Medium batch
-        (512, 20, 8),  # Large batch (your use case)
-        (512, 50, 8),  # More simulations
-    ]
+    # Create a simple position where it's player 1's turn
+    board = torch.zeros(6, 7, device=device)
+    legal = torch.ones(7, dtype=torch.bool, device=device)
+    current_player = torch.tensor([1], dtype=torch.long, device=device)
     
-    for n_games, n_sims, parallel in configs:
-        print(f"\n--- {n_games} games, {n_sims} sims, {parallel} parallel ---")
-        
-        # Create test boards
-        boards = [torch.zeros(6, 7, device=device) for _ in range(n_games)]
-        legal = [torch.ones(7, dtype=torch.bool, device=device) for _ in range(n_games)]
-        
-        # Tensor MCTS
-        tensor_mcts = TensorMCTSWrapper(
-            model=model,
-            num_simulations=n_sims,
-            parallel_simulations=parallel,
-            device=device
-        )
-        
-        # Warmup
-        _ = tensor_mcts.get_action_probs_batch_parallel(boards[:8], legal[:8])
-        
-        # Benchmark
-        if device == "cuda":
-            torch.cuda.synchronize()
-        
-        t0 = time.time()
-        visit_dist, action_probs = tensor_mcts.get_action_probs_batch_parallel(
-            boards, legal, temperature=1.0
-        )
-        
-        if device == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.time()
-        
-        print(f"Tensor MCTS: {t1-t0:.3f}s ({n_games/(t1-t0):.1f} games/sec)")
-        print(f"  Visit dist shape: {visit_dist.shape}")
-        print(f"  Sample distribution: {visit_dist[0].cpu().numpy().round(3)}")
-
+    print("Testing with player 1 to move...")
+    wrapper = TensorMCTSWrapper(
+        model=model,
+        num_simulations=5,
+        parallel_simulations=1,
+        device=device
+    )
+    
+    visit_dist, action_probs = wrapper.get_action_probs_batch_parallel(
+        [board], [legal], temperature=1.0, current_players=current_player
+    )
+    
+    print(f"\nVisit distribution: {visit_dist[0].numpy().round(3)}")
+    print(f"Action probs: {action_probs[0].numpy().round(3)}")
+    
+    # Now test with player 2 to move
+    print("\n" + "="*50)
+    print("Testing with player 2 to move...")
+    model.call_count = 0
+    
+    # Add one piece so it's player 2's turn
+    board2 = board.clone()
+    board2[5, 0] = 1  # Player 1 played column 0
+    current_player2 = torch.tensor([2], dtype=torch.long, device=device)
+    
+    visit_dist2, action_probs2 = wrapper.get_action_probs_batch_parallel(
+        [board2], [legal], temperature=1.0, current_players=current_player2
+    )
+    
+    print(f"\nVisit distribution: {visit_dist2[0].numpy().round(3)}")
+    
 
 if __name__ == "__main__":
-    benchmark_comparison()
+    test_current_player_tracking()

@@ -2,11 +2,11 @@
 
 defaults:
   - override /data: sudoku6x6
-  - override /model: trm
+  - override /model: mlp
   - override /callbacks: default
   - override /trainer: gpu
 
-tags: ["sudoku", "trm"]
+tags: ["sudoku", "mlp"]
 
 timekeeping:
   max_epochs: 750
@@ -14,24 +14,19 @@ timekeeping:
   num_workers: 0
 
 model_tuning:
-  learning_rate: 1e-3
+  hidden_size: 200
+  num_layers: 4
+  max_grid_size: 30
+  ffn_expansion: 2
+  dropout: 0.1
+  learning_rate: 1e-4
   learning_rate_emb: 1e-2
+  weight_decay: 0.01
   warmup_steps: 2000
-  weight_decay: 0.1
+  max_steps: 100000
   lr_min_ratio: 1.0
-  num_heads: 8
-  halt_exploration_prob: 0.1
-  N_supervision: 6
-  N_supervision_val: 16
-  H_cycles: 3
-  L_cycles: 1
-  num_layers: 1
-  max_steps: 0
   puzzle_emb_dim: 0
   puzzle_emb_len: 0
-  hidden_size: 256
-  ffn_expansion: 2
-  rope_theta: 10000
 
 trainer:
   check_val_every_n_epoch: 1

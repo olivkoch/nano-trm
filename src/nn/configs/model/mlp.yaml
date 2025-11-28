@@ -1,11 +1,22 @@
-_target_: src.nn.models.mlp.ConvMLPModule
+_target_: src.nn.models.mlp.MLPModule
 _recursive_: false  # Prevent recursive instantiation of nested configs
-num_colors: 10
-hidden_channels: 128
-num_conv_layers: 4
-num_mlp_layers: 2
-kernel_size: 3
-dropout: 0.1
-learning_rate: 1e-4
-weight_decay: 0.01
-output_dir: null
+
+hidden_size: ${model_tuning.hidden_size}
+num_layers: ${model_tuning.num_layers}
+max_grid_size: ${model_tuning.max_grid_size}
+ffn_expansion: ${model_tuning.ffn_expansion}
+dropout: ${model_tuning.dropout}
+learning_rate: ${model_tuning.learning_rate}
+learning_rate_emb: ${model_tuning.learning_rate_emb}
+weight_decay: ${model_tuning.weight_decay}
+warmup_steps: ${model_tuning.warmup_steps}
+max_steps: ${model_tuning.max_steps}
+lr_min_ratio: ${model_tuning.lr_min_ratio}
+puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
+puzzle_emb_len: ${model_tuning.puzzle_emb_len}
+
+vocab_size: 0  # Should be set from datamodule
+num_puzzles: 0  # Should be set from datamodule
+batch_size: 0  # Should be set from datamodule
+pad_value: 0  # Should be set from datamodule
+seq_len: 0  # Should be set from datamodule

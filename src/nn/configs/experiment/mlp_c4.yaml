@@ -17,7 +17,7 @@ timekeeping:
   max_epochs: 1200
   batch_size: 512
   num_workers: 0
-  steps_per_epoch: 100
+  steps_per_epoch: 200
 
 model_tuning:
   model_type:  "mlp"  # "cnn" or "mlp"
@@ -34,7 +34,7 @@ model_tuning:
   enable_selfplay: true
   selfplay_buffer_size: 50000
   selfplay_games_per_iteration: 64
-  selfplay_mcts_simulations: 400
+  selfplay_mcts_simulations: 800
   selfplay_eval_mcts_simulations: 50
   selfplay_parallel_simulations: 100
   selfplay_temperature_moves: 15

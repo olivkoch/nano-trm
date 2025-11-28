@@ -23,7 +23,7 @@ class VectorizedC4State:
     
     def to_trm_input(self) -> torch.Tensor:
         """Convert board states to token sequences for TRM input.
-        Boards use C4_EMPTY_CELL=1, C4_PLAYER1_CELL=2, C4_PLAYER2_CELL=3
+        Boards use C4_EMPTY_CELL, C4_PLAYER1_CELL, C4_PLAYER2_CELL
         Returns: (n_envs, 42) tensor of tokens
         """
         return self.boards.flatten(1).long()

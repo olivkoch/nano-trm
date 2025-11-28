@@ -709,9 +709,9 @@ class C4BaseModule(LightningModule):
                     log.info(f"Creating a MCTS with {self.hparams.selfplay_parallel_simulations} parallel simulations and {self.hparams.selfplay_mcts_simulations} simulations per move")
                     self.mcts = TensorMCTSWrapper(
                         model=MCTSModelWrapper(self),
-                        c_puct=1.0,
+                        c_puct=0.5,
                         num_simulations=self.hparams.selfplay_mcts_simulations,
-                        parallel_simulations=self.hparams.selfplay_parallel_simulations,  # Can increase this now
+                        parallel_simulations=self.hparams.selfplay_parallel_simulations,
                         virtual_loss_value=3.0,
                         device=device
                     )

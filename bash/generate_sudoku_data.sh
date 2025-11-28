@@ -11,10 +11,11 @@ echo "Select a configuration:"
 echo "1) 4x4 - Small (10k train, 1k val) - Quick"
 echo "2) 4x4 - Medium (50k train, 5k val)"
 echo "3) 4x4 - Large (100k train, 10k val)"
-echo "4) 6x6 - Medium (50k train, 5k val)"
-echo "5) Custom configuration"
+echo "4) 6x6 - Small (5k train, 1k val)"
+echo "5) 6x6 - Medium (50k train, 5k val)"
+echo "6) Custom configuration"
 echo ""
-read -p "Enter choice [1-5]: " choice
+read -p "Enter choice [1-6]: " choice
 
 cmd="uv run python scripts/data/generate_sudoku_data.py"
 
@@ -47,6 +48,15 @@ case $choice in
             --output-dir ./data/sudoku_4x4_large
         ;;
     4)
+        echo "Generating 6x6 Small dataset..."
+        $cmd \
+            --grid-size 6 \
+            --num-train 5000 \
+            --num-val 1000 \
+            --num-test 1000 \
+            --output-dir ./data/sudoku_6x6_small
+        ;;
+    5)
         echo "Generating 6x6 Medium dataset..."
         $cmd \
             --grid-size 6 \
@@ -55,7 +65,7 @@ case $choice in
             --num-test 5000 \
             --output-dir ./data/sudoku_6x6_medium
         ;;
-    5)
+    6)
         read -p "Grid size [4]: " grid_size
         grid_size=${grid_size:-4}
         

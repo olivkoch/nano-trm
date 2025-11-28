@@ -9,13 +9,13 @@ defaults:
 tags: ["arc", "trm"]
 
 timekeeping:
-  max_epochs: 300
+  max_epochs: 30
   batch_size: 512
   num_workers: 0
 
 model_tuning:
-  learning_rate: 1e-5
-  learning_rate_emb: 1e-4
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-3
   weight_decay: 0.1
   warmup_steps: 100
   lr_min_ratio: 1.0

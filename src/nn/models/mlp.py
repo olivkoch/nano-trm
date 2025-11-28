@@ -68,8 +68,11 @@ class MLPModule(LightningModule):
         self.embed_scale = math.sqrt(hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.input_embedding = CastedEmbedding(
-            vocab_size, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
+        # self.input_embedding = CastedEmbedding(
+        #     vocab_size, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
+        # )
+        self.input_embedding = nn.Embedding(
+            vocab_size, hidden_size
         )
 
         # Puzzle embeddings (optional, for fair comparison)
@@ -89,23 +92,10 @@ class MLPModule(LightningModule):
             self.puzzle_emb_len = 0
 
         # MLP layers
-        mlp_layers = []
-        for i in range(num_layers):
-            in_dim = hidden_size if i > 0 else hidden_size
-            out_dim = hidden_size
-            
-            mlp_layers.extend([
-                CastedLinear(in_dim, out_dim * ffn_expansion, bias=True),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                CastedLinear(out_dim * ffn_expansion, out_dim, bias=True),
-                nn.Dropout(dropout),
-            ])
-        
-        self.mlp = nn.Sequential(*mlp_layers)
+        self._build_mlp()
 
         # Output head
-        self.lm_head = CastedLinear(hidden_size, vocab_size, bias=False)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
         self.manual_step = 0
 
@@ -163,23 +153,53 @@ class MLPModule(LightningModule):
         # Scale
         return self.embed_scale * embedding
 
+    def _build_mlp(self):
+        """Build MLP architecture - adapted from C4 baseline"""
+        # Calculate flattened input size
+        total_seq_len = self.hparams.seq_len + self.puzzle_emb_len
+        input_size = total_seq_len * self.hparams.hidden_size
+        output_size = total_seq_len * self.hparams.hidden_size  # Will reshape back
+        
+        layers = []
+        
+        # Input layer - from flattened embeddings to expanded hidden
+        layers.append(nn.Linear(input_size, self.hparams.hidden_size * self.hparams.ffn_expansion))
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(self.hparams.dropout))
+        
+        # Hidden layers
+        for _ in range(self.hparams.num_layers - 2):
+            layers.append(nn.Linear(
+                self.hparams.hidden_size * self.hparams.ffn_expansion,
+                self.hparams.hidden_size * self.hparams.ffn_expansion
+            ))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(self.hparams.dropout))
+        
+        # Output layer - back to sequence representation
+        layers.append(nn.Linear(
+            self.hparams.hidden_size * self.hparams.ffn_expansion,
+            output_size
+        ))
+        
+        self.mlp = nn.Sequential(*layers)
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            batch: Dictionary with 'input' and 'puzzle_identifiers'
-
-        Returns:
-            logits: [batch, seq_len, vocab_size]
-        """
-        # Get embeddings
+        # Get embeddings [batch, total_seq_len, hidden]
         x = self._input_embeddings(batch["input"], batch["puzzle_identifiers"])
         
-        # Apply MLP
-        x = self.mlp(x)
+        batch_size, total_seq_len, hidden_size = x.shape
         
-        # Output projection
+        # Flatten to single vector per sample
+        x = x.reshape(batch_size, -1)  # [batch, total_seq_len * hidden]
+        
+        # Process through MLP (now sees all positions!)
+        x = self.mlp(x)  # [batch, total_seq_len * hidden]
+        
+        # Reshape back to sequence
+        x = x.reshape(batch_size, total_seq_len, hidden_size)
+        
+        # Project to vocabulary
         logits = self.lm_head(x)
         
         # Remove puzzle embedding positions
@@ -217,6 +237,13 @@ class MLPModule(LightningModule):
         loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
         loss = (loss / loss_divisor).sum()
         
+        # print(f"Input: {batch['input'][0,:48]}")
+        # print(f"Labels: {labels[0,:48]}")
+        # print(f"Loss before assert: {loss.item() / batch_size}")
+
+        assert not torch.isnan(loss), "Loss is NaN"
+        assert not torch.isinf(loss), "Loss is Inf"
+
         # Compute metrics
         with torch.no_grad():
             preds = torch.argmax(logits, dim=-1)

@@ -25,7 +25,7 @@ model_tuning:
   weight_decay: 0.1
   warmup_steps: 10000
   lr_min_ratio: 1.0
-  num_heads: 2
+  num_heads: 8
   halt_exploration_prob: 0.1
   N_supervision: 4
   N_supervision_val: 4

@@ -5,9 +5,11 @@ ffn_expansion: ${model_tuning.ffn_expansion}
 hidden_size: ${model_tuning.hidden_size}
 num_layers: ${model_tuning.num_layers}
 N_supervision: ${model_tuning.N_supervision}
+N_supervision_val: ${model_tuning.N_supervision_val}
 learning_rate: ${model_tuning.learning_rate}
 H_cycles: ${model_tuning.H_cycles}
 L_cycles: ${model_tuning.L_cycles}
+num_heads: ${model_tuning.num_heads}
 learning_rate_emb: ${model_tuning.learning_rate_emb}
 weight_decay: ${model_tuning.weight_decay}
 halt_exploration_prob: ${model_tuning.halt_exploration_prob}

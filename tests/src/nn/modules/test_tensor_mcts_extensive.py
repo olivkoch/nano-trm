@@ -17,6 +17,7 @@ class DummyModel:
         self.device = device
     
     def forward(self, boards, current_players):
+        # Note: boards are passed as float (42,) for NN, but represent discrete game state
         batch_size = boards.shape[0]
         policies = torch.ones(batch_size, 7, device=self.device) / 7
         values = torch.zeros(batch_size, device=self.device)
@@ -33,7 +34,11 @@ def print_board(board):
 
 def run_single_tree_mcts(board, current_player, model, n_sims=100, device="cpu", 
                          exploration_fraction=0.0, config=None):
-    """Run MCTS on a single position"""
+    """Run MCTS on a single position
+    
+    Note: Boards can be float or long - wrapper converts to long internally,
+    then converts to float when passing to model.
+    """
     if config is None:
         config = TensorMCTSConfig(
             n_actions=7,
@@ -49,7 +54,8 @@ def run_single_tree_mcts(board, current_player, model, n_sims=100, device="cpu",
     current_players = torch.tensor([current_player], dtype=torch.long, device=device)
     
     with torch.no_grad():
-        policies, _ = model.forward(board_tensor.flatten(start_dim=1), current_players)
+        # Convert to float for model (NNs expect float inputs)
+        policies, _ = model.forward(board_tensor.flatten(start_dim=1).float(), current_players)
     
     mcts.reset(board_tensor, policies, legal_mask, current_players)
     mcts.run_simulations(n_sims, parallel_sims=4)
@@ -396,7 +402,8 @@ def test_batch_consistency():
     current_players = torch.ones(n_copies, dtype=torch.long, device=device)  # All player 1
     
     with torch.no_grad():
-        policies, _ = model.forward(boards_tensor.flatten(start_dim=1), current_players)
+        # Convert to float for model
+        policies, _ = model.forward(boards_tensor.flatten(start_dim=1).float(), current_players)
     
     mcts.reset(boards_tensor, policies, legal_tensor, current_players)
     mcts.run_simulations(100, parallel_sims=4)
@@ -437,7 +444,7 @@ def test_virtual_loss_diversity():
     current_players = torch.tensor([1], dtype=torch.long, device=device)
     
     with torch.no_grad():
-        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1), current_players)
+        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1).float(), current_players)
     
     mcts.reset(board.unsqueeze(0), policies, legal, current_players)
     mcts.run_simulations(50, parallel_sims=8)
@@ -501,7 +508,7 @@ def test_temperature_scaling():
     current_players = torch.tensor([1], dtype=torch.long, device=device)
     
     with torch.no_grad():
-        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1), current_players)
+        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1).float(), current_players)
     
     mcts.reset(board.unsqueeze(0), policies, legal, current_players)
     mcts.run_simulations(100, parallel_sims=4)
@@ -549,7 +556,7 @@ def test_value_propagation():
     current_players = torch.tensor([1], dtype=torch.long, device=device)
     
     with torch.no_grad():
-        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1), current_players)
+        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1).float(), current_players)
     
     mcts.reset(board.unsqueeze(0), policies, legal, current_players)
     mcts.run_simulations(50, parallel_sims=1)
@@ -599,7 +606,7 @@ def test_deep_search_allocation():
     current_players = torch.tensor([1], dtype=torch.long, device=device)
     
     with torch.no_grad():
-        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1), current_players)
+        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1).float(), current_players)
     
     mcts.reset(board.unsqueeze(0), policies, legal, current_players)
     mcts.run_simulations(500, parallel_sims=8)
@@ -638,7 +645,7 @@ def test_puct_scores():
     current_players = torch.tensor([1], dtype=torch.long, device=device)
     
     with torch.no_grad():
-        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1), current_players)
+        policies, _ = model.forward(board.unsqueeze(0).flatten(start_dim=1).float(), current_players)
     
     mcts.reset(board.unsqueeze(0), policies, legal, current_players)
     mcts.run_simulations(30, parallel_sims=1)
@@ -718,7 +725,7 @@ def test_terminal_value_perspective():
 def run_all_tests():
     """Run all tests"""
     print("\n" + "=" * 60)
-    print("TENSOR MCTS COMPREHENSIVE TEST SUITE")
+    print("OPTIMIZED TENSOR MCTS COMPREHENSIVE TEST SUITE")
     print("(with current_player tracking)")
     print("=" * 60)
     

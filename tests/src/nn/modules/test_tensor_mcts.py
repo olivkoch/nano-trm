@@ -525,7 +525,7 @@ def test_terminal_value_perspective():
 
 
 def test_wrapper_interface():
-    """Test the TensorMCTSWrapper with current_players"""
+    """Test the OptimizedTensorMCTSWrapper with current_players"""
     print("\n" + "="*60)
     print("TEST: Wrapper Interface with current_players")
     print("="*60)
@@ -655,7 +655,7 @@ def visualize_tree_structure(mcts, tree_idx=0, max_depth=2):
 def run_all_tests():
     """Run all functional tests"""
     print("\n" + "="*60)
-    print("TENSOR MCTS FUNCTIONAL TESTS (with current_player)")
+    print("OPTIMIZED TENSOR MCTS FUNCTIONAL TESTS")
     print("="*60)
     
     # Core functionality

@@ -14,10 +14,10 @@ timekeeping:
   num_workers: 0
 
 model_tuning:
-  hidden_size: 200
+  hidden_size: 64
   num_layers: 4
   max_grid_size: 30
-  ffn_expansion: 2
+  ffn_expansion: 8
   dropout: 0.1
   learning_rate: 1e-4
   learning_rate_emb: 1e-2

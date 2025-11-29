@@ -1,21 +1,19 @@
 # configs/sweeps/trm_sudoku_sweep.yaml
-name: trm-sudoku6x6-sweep
+name: mlp-sudoku6x6-sweep
 method: bayes
 metric:
   name: val/exact_accuracy
   goal: maximize
 
 parameters:
-  model_tuning.N_supervision:
-    values: [2 ,4, 6, 8]
-  model_tuning.H_cycles:
-    values: [1, 2, 3]
-  model_tuning.L_cycles:
-    values: [1, 2]
   model_tuning.hidden_size:
     values: [64, 128, 256]
   model_tuning.num_layers:
-    values: [1, 2, 3]
+    values: [1, 2, 4]
+  model_tuning.ffn_expansion:
+    values: [2, 4, 8]
+  model_tuning.dropout:
+    values: [0.0, 0.1, 0.2]
   model_tuning.learning_rate:
     distribution: log_uniform_values
     min: 1e-4

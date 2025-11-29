@@ -10,9 +10,13 @@ ARC-AGI: You need to download the data from the [kaggle challenge page](https://
 
 Other datasets are generated locally.
 
+# Sudoku
+
+## Data
+
 To generate a Sudoku dataset: `./bash/generate_sudoku_data.sh`
 
-# Sudoku
+To test the data: `uv run tests/src/nn/data/test_sudoku_data.py <data_dir>`
 
 ## Training
 

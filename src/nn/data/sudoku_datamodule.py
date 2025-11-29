@@ -5,6 +5,9 @@ Supports 4x4, 6x6, and 9x9 Sudoku puzzles
 Two modes:
 1. Generation mode (data_dir=None): Generate unique puzzle pool and split
 2. Loading mode (data_dir="/path"): Load pre-generated data from disk
+
+Optional full enumeration mode:
+- Pass base_grids (canonical representatives) for uniform sampling over ALL valid grids
 """
 
 import hashlib
@@ -24,9 +27,9 @@ from src.nn.utils.constants import IGNORE_LABEL_ID
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
-def puzzle_hash(puzzle: np.ndarray) -> str:
-    """Create a unique hash for a puzzle to detect duplicates."""
-    return hashlib.md5(puzzle.tobytes()).hexdigest()
+def puzzle_hash(grid: np.ndarray) -> str:
+    """Create a unique hash for a grid to detect duplicates."""
+    return hashlib.md5(grid.tobytes()).hexdigest()
 
 
 class SudokuDataset(Dataset):
@@ -183,12 +186,34 @@ class SudokuDataset(Dataset):
 
 
 class PuzzleGenerator:
-    """Helper class for generating Sudoku puzzles."""
+    """
+    Helper class for generating Sudoku puzzles.
+    
+    Supports two modes:
+    - Standard: Uses transformation-based generation from a single base grid
+    - Full: Uses pre-computed base grids with full symmetry operations
+    """
 
-    def __init__(self, grid_size: int, min_givens: int, max_givens: int):
+    def __init__(
+        self, 
+        grid_size: int, 
+        min_givens: int, 
+        max_givens: int,
+        base_grids: Optional[np.ndarray] = None,
+    ):
+        """
+        Args:
+            grid_size: Size of the Sudoku grid (4, 6, or 9)
+            min_givens: Minimum number of given cells
+            max_givens: Maximum number of given cells
+            base_grids: Optional array of canonical base grids for full enumeration mode
+                        Shape: (num_classes, grid_size, grid_size)
+        """
         self.grid_size = grid_size
         self.min_givens = min_givens
         self.max_givens = max_givens
+        self.base_grids = base_grids
+        self.full_mode = base_grids is not None
 
         # Determine box dimensions
         if grid_size == 4:
@@ -199,6 +224,9 @@ class PuzzleGenerator:
             self.box_rows, self.box_cols = 3, 3
         else:
             raise ValueError(f"Unsupported grid_size: {grid_size}")
+        
+        self.n_bands = grid_size // self.box_rows
+        self.n_stacks = grid_size // self.box_cols
 
     def is_valid_sudoku(self, grid: np.ndarray) -> bool:
         """Check if a Sudoku grid is valid (no duplicates in rows/cols/boxes)."""
@@ -269,12 +297,70 @@ class PuzzleGenerator:
 
     def generate_complete_grid(self, rng: np.random.RandomState) -> np.ndarray:
         """Generate a complete valid Sudoku grid."""
-        if self.grid_size == 4:
+        if self.full_mode:
+            return self._generate_complete_full(rng)
+        elif self.grid_size == 4:
             return self._generate_complete_4x4(rng)
         elif self.grid_size == 6:
             return self._generate_complete_6x6(rng)
         else:
             return self._generate_complete_9x9(rng)
+
+    def _generate_complete_full(self, rng: np.random.RandomState) -> np.ndarray:
+        """
+        Generate a complete grid using full symmetry operations.
+        This provides uniform sampling over ALL valid grids.
+        """
+        # Pick a random base grid
+        base_idx = rng.randint(len(self.base_grids))
+        base = self.base_grids[base_idx].copy()
+        
+        # 1. Digit permutation (n!)
+        perm = rng.permutation(self.grid_size) + 1
+        complete = np.zeros_like(base)
+        for i in range(self.grid_size):
+            complete[base == i + 1] = perm[i]
+        
+        # 2. Band permutation (n_bands!)
+        band_order = rng.permutation(self.n_bands)
+        new_grid = np.zeros_like(complete)
+        for new_band, old_band in enumerate(band_order):
+            new_grid[new_band*self.box_rows:(new_band+1)*self.box_rows] = \
+                complete[old_band*self.box_rows:(old_band+1)*self.box_rows]
+        complete = new_grid
+        
+        # 3. Row swaps within bands (2^n_bands for 2-row bands)
+        for band in range(self.n_bands):
+            if self.box_rows == 2:
+                # Simple swap
+                if rng.rand() > 0.5:
+                    r1, r2 = band * self.box_rows, band * self.box_rows + 1
+                    complete[[r1, r2]] = complete[[r2, r1]]
+            else:
+                # Full permutation for 3-row bands
+                rows = list(range(band * self.box_rows, (band + 1) * self.box_rows))
+                rng.shuffle(rows)
+                temp = complete[band * self.box_rows:(band + 1) * self.box_rows].copy()
+                for new_pos, old_row in enumerate(rows):
+                    complete[band * self.box_rows + new_pos] = temp[old_row - band * self.box_rows]
+        
+        # 4. Stack permutation (n_stacks!)
+        stack_order = rng.permutation(self.n_stacks)
+        new_grid = np.zeros_like(complete)
+        for new_stack, old_stack in enumerate(stack_order):
+            new_grid[:, new_stack*self.box_cols:(new_stack+1)*self.box_cols] = \
+                complete[:, old_stack*self.box_cols:(old_stack+1)*self.box_cols]
+        complete = new_grid
+        
+        # 5. Column shuffles within stacks (box_cols! per stack)
+        for stack in range(self.n_stacks):
+            cols = list(range(stack * self.box_cols, (stack + 1) * self.box_cols))
+            rng.shuffle(cols)
+            temp = complete[:, stack * self.box_cols:(stack + 1) * self.box_cols].copy()
+            for new_pos, old_col in enumerate(cols):
+                complete[:, stack * self.box_cols + new_pos] = temp[:, old_col - stack * self.box_cols]
+        
+        return complete
 
     def _generate_complete_4x4(self, rng: np.random.RandomState) -> np.ndarray:
         """Generate a complete valid 4x4 Sudoku grid."""
@@ -422,6 +508,9 @@ class SudokuDataModule(LightningDataModule):
     Two modes:
     - Generation (data_dir=None): Generate unique puzzle pool and split
     - Loading (data_dir="/path"): Load pre-generated data from disk
+    
+    Optional full enumeration mode:
+    - Pass base_grids for uniform sampling over ALL valid grids
     """
 
     def __init__(
@@ -438,6 +527,7 @@ class SudokuDataModule(LightningDataModule):
         num_workers: int = 0,
         seed: int = 42,
         pad_value: int = 0,
+        base_grids: Optional[np.ndarray] = None,
     ):
         """
         Args:
@@ -452,6 +542,7 @@ class SudokuDataModule(LightningDataModule):
             max_grid_size: Padding size (defaults to grid_size + 2)
             num_workers: DataLoader workers
             seed: Random seed
+            base_grids: Optional canonical base grids for full enumeration mode
         """
         super().__init__()
 
@@ -460,6 +551,7 @@ class SudokuDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.seed = seed
         self.pad_value = pad_value
+        self.base_grids = base_grids
 
         log.info(
             f"Loading Sudoku DataModule with data_dir={data_dir} {os.path.exists(data_dir) if data_dir else ''}"
@@ -522,7 +614,7 @@ class SudokuDataModule(LightningDataModule):
         self.split_indices = None
 
         # Save hyperparameters after everything is set
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['base_grids'])
 
     def _load_metadata(self, data_dir: str) -> Optional[dict]:
         """Load metadata from pre-generated data directory."""
@@ -556,12 +648,18 @@ class SudokuDataModule(LightningDataModule):
         Generate a global pool of unique puzzles and deterministically split them.
         This guarantees no overlap between train/val/test.
         """
-        print(f"Generating puzzle pool for {self.grid_size}x{self.grid_size} Sudoku...")
+        mode_str = "FULL" if self.base_grids is not None else "STANDARD"
+        print(f"Generating puzzle pool for {self.grid_size}x{self.grid_size} Sudoku ({mode_str} mode)...")
 
         total_puzzles = self.num_train_puzzles + self.num_val_puzzles + self.num_test_puzzles
 
         # Initialize puzzle generator
-        generator = PuzzleGenerator(self.grid_size, self.min_givens, self.max_givens)
+        generator = PuzzleGenerator(
+            self.grid_size, 
+            self.min_givens, 
+            self.max_givens,
+            base_grids=self.base_grids,
+        )
 
         # Generate unique puzzles
         rng = np.random.RandomState(self.seed)
@@ -579,8 +677,9 @@ class SudokuDataModule(LightningDataModule):
             # Generate puzzle
             puzzle, solution = generator.generate_puzzle(rng, num_givens)
 
-            # Check for uniqueness using hash
-            h = puzzle_hash(puzzle)
+            # Check for uniqueness using hash of SOLUTION (not puzzle)
+            # This ensures we have diverse underlying grids, not just different cell removals
+            h = puzzle_hash(solution)
             if h not in seen_hashes:
                 seen_hashes.add(h)
                 self.puzzle_pool.append((puzzle, solution))

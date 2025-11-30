@@ -1,20 +1,19 @@
 """
-Evaluation script for Sudoku 4x4 models
-Uses the existing SudokuDataModule for data loading and processing
+Evaluation script for Sudoku models
+Supports standard and cross-size evaluation (train on 6x6, test on 9x9)
 """
 
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import torch
 from tqdm import tqdm
 
-# Import your modules
 from src.nn.data.sudoku_datamodule import SudokuDataModule
-from src.nn.models.trm_module import TRMModule
+from src.nn.models.trm import TRMModule
 
 
 class SudokuEvaluator:
@@ -27,19 +26,28 @@ class SudokuEvaluator:
         batch_size: int = 256,
         device: str = "auto",
         num_workers: int = 0,
+        eval_split: str = "val",
     ):
         """
         Initialize evaluator.
 
         Args:
             checkpoint_path: Path to model checkpoint
-            data_dir: Path to dataset directory (e.g., data/sudoku_4x4_small)
+            data_dir: Path to dataset directory
             batch_size: Batch size for evaluation
             device: Device to use (auto, cpu, mps, cuda)
             num_workers: Number of workers for dataloader
+            eval_split: Which split to evaluate ('train', 'val', 'test')
         """
         self.checkpoint_path = Path(checkpoint_path)
         self.batch_size = batch_size
+        self.eval_split = eval_split
+
+        if data_dir is None:
+            raise ValueError("data_dir is required for evaluation. Cannot generate puzzles on-the-fly.")
+    
+        if not Path(data_dir).exists():
+            raise ValueError(f"data_dir does not exist: {data_dir}")
 
         # Set device
         if device == "auto":
@@ -54,10 +62,10 @@ class SudokuEvaluator:
 
         print(f"Using device: {self.device}")
 
-        # Load model
+        # Load model first to get its configuration
         self.model = self.load_model()
 
-        # Create data module (loading mode only)
+        # Create data module (loading mode)
         self.datamodule = SudokuDataModule(
             data_dir=data_dir,
             batch_size=batch_size,
@@ -67,38 +75,84 @@ class SudokuEvaluator:
         # Setup datasets
         self.datamodule.setup()
 
-        # Get grid parameters from datamodule
-        self.grid_size = self.datamodule.grid_size
+        # Handle cross-size vs standard mode
+        self.cross_size = getattr(self.datamodule, 'cross_size', False)
+        
+        if self.cross_size:
+            self.train_grid_size = self.datamodule.train_grid_size
+            self.eval_grid_size = self.datamodule.eval_grid_size
+            # For evaluation, use eval grid size
+            self.grid_size = self.eval_grid_size
+            print(f"Cross-size mode: trained on {self.train_grid_size}x{self.train_grid_size}, "
+                  f"evaluating on {self.eval_grid_size}x{self.eval_grid_size}")
+        else:
+            self.grid_size = self.datamodule.grid_size
+            self.train_grid_size = self.grid_size
+            self.eval_grid_size = self.grid_size
+            
         self.max_grid_size = self.datamodule.max_grid_size
         self.vocab_size = self.datamodule.vocab_size
 
-        print(f"Grid size: {self.grid_size}x{self.grid_size}")
+        print(f"Evaluation grid size: {self.grid_size}x{self.grid_size}")
         print(f"Max grid size: {self.max_grid_size}x{self.max_grid_size}")
         print(f"Vocab size: {self.vocab_size}")
+        
+        # Verify model compatibility
+        self._verify_model_compatibility()
+
+    def _verify_model_compatibility(self):
+        """Check that model config matches data config."""
+        model_vocab = self.model.hparams.get('vocab_size', None)
+        model_seq_len = self.model.hparams.get('seq_len', None)
+        
+        data_seq_len = self.max_grid_size * self.max_grid_size
+        
+        if model_vocab is not None and model_vocab != self.vocab_size:
+            print(f"⚠ Warning: Model vocab_size ({model_vocab}) != data vocab_size ({self.vocab_size})")
+            
+        if model_seq_len is not None and model_seq_len != data_seq_len:
+            print(f"⚠ Warning: Model seq_len ({model_seq_len}) != data seq_len ({data_seq_len})")
 
     def load_model(self):
         """Load TRM model from checkpoint."""
         print(f"Loading model from {self.checkpoint_path}")
 
-        model = TRMModule.load_from_checkpoint(self.checkpoint_path, map_location=self.device)
+        model = TRMModule.load_from_checkpoint(
+            self.checkpoint_path, 
+            map_location=self.device
+        )
 
         model = model.to(self.device)
         model.eval()
 
         print(f"Model loaded: {model.__class__.__name__}")
 
-        # Print model configuration
         if hasattr(model, "hparams"):
             print("Model configuration:")
-            for key in ["hidden_dim", "N_L", "N_H", "N_supervision"]:
+            for key in ["hidden_size", "num_layers", "H_cycles", "L_cycles", 
+                       "N_supervision", "vocab_size", "seq_len"]:
                 if key in model.hparams:
-                    print(f"  - {key}: {model.hparams[key]}")
+                    print(f"  {key}: {model.hparams[key]}")
 
         return model
 
-    def check_sudoku_validity(self, grid: torch.Tensor) -> bool:
+    def _get_box_dims(self, grid_size: int) -> tuple:
+        """Get box dimensions for a grid size."""
+        if grid_size == 4:
+            return 2, 2
+        elif grid_size == 6:
+            return 2, 3
+        elif grid_size == 9:
+            return 3, 3
+        else:
+            raise ValueError(f"Unsupported grid_size: {grid_size}")
+
+    def check_sudoku_validity(self, grid: torch.Tensor, grid_size: int = None) -> bool:
         """Check if a Sudoku solution is valid."""
-        n = self.grid_size
+        if grid_size is None:
+            grid_size = self.grid_size
+            
+        n = grid_size
 
         # Check if all values are in range [1, n]
         if not torch.all((grid >= 1) & (grid <= n)):
@@ -115,14 +169,7 @@ class SudokuEvaluator:
                 return False
 
         # Check boxes
-        if n == 4:
-            box_rows, box_cols = 2, 2
-        elif n == 6:
-            box_rows, box_cols = 2, 3
-        elif n == 9:
-            box_rows, box_cols = 3, 3
-        else:
-            return False
+        box_rows, box_cols = self._get_box_dims(n)
 
         for br in range(0, n, box_rows):
             for bc in range(0, n, box_cols):
@@ -132,11 +179,11 @@ class SudokuEvaluator:
 
         return True
 
-    def evaluate_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    def evaluate_batch(self, batch: Dict[str, torch.Tensor], print_examples: bool = False) -> Dict[str, Any]:
         """Evaluate a single batch."""
-        # Move batch to device
         batch = {
-            k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+            for k, v in batch.items()
         }
 
         inputs = batch["input"]
@@ -144,43 +191,38 @@ class SudokuEvaluator:
         batch_size = len(inputs)
 
         with torch.no_grad():
-            # Initialize carry for this batch
             carry = self.model.initial_carry(batch)
 
-            # Run forward passes until all sequences halt
             all_outputs = []
             all_halted = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
 
             while not all_halted.all():
-                # Forward pass through TRM with carry
                 carry, outputs = self.model.forward(carry, batch)
 
-                # Store outputs for sequences that just halted
                 newly_halted = carry.halted & ~all_halted
                 if newly_halted.any():
                     all_outputs.append((newly_halted, outputs["logits"]))
 
                 all_halted = all_halted | carry.halted
 
-                # Safety check to avoid infinite loops
                 if carry.steps.max() > self.model.hparams.N_supervision_val:
                     break
 
-            # Combine outputs from all halted sequences
+            # Combine outputs
             final_logits = torch.zeros_like(all_outputs[0][1]) if all_outputs else None
             for halted_mask, logits in all_outputs:
                 final_logits = torch.where(
                     halted_mask.unsqueeze(-1).unsqueeze(-1), logits, final_logits
                 )
 
-            # Get predictions
             predictions = final_logits.argmax(dim=-1)
 
-            # Calculate metrics
+            if print_examples:
+                self.print_examples(batch, predictions, num_examples=5)
+
             # Mask for cells to predict (encoded empty cells = 2)
             mask = (inputs == 2).float()
 
-            # Cell-level accuracy
             correct_cells = (predictions == targets).float()
 
             if mask.sum() > 0:
@@ -188,54 +230,54 @@ class SudokuEvaluator:
             else:
                 cell_accuracy = torch.tensor(1.0)
 
-            # Puzzle-level metrics
             puzzle_correct = []
             valid_puzzles = []
+            steps_taken = []
 
             for i in range(batch_size):
-                # Reshape to grid
                 pred_flat = predictions[i]
                 target_flat = targets[i]
 
                 pred_grid = pred_flat.reshape(self.max_grid_size, self.max_grid_size)
                 target_grid = target_flat.reshape(self.max_grid_size, self.max_grid_size)
 
-                # Extract actual Sudoku grid
+                # Extract actual Sudoku grid (use eval grid size)
                 pred_sudoku = pred_grid[: self.grid_size, : self.grid_size]
                 target_sudoku = target_grid[: self.grid_size, : self.grid_size]
 
-                # Check exact match
                 exact_match = torch.all(pred_sudoku == target_sudoku).item()
                 puzzle_correct.append(exact_match)
 
-                # Decode predictions to check validity
+                # Decode predictions
                 pred_decoded = pred_sudoku.clone()
-                # Decode: values >= 3 are actual Sudoku values (shifted by 2)
                 valid_mask = pred_sudoku >= 3
                 pred_decoded[valid_mask] = pred_sudoku[valid_mask] - 2
-                pred_decoded[~valid_mask] = 0  # Invalid predictions
+                pred_decoded[~valid_mask] = 0
 
-                # Check if valid Sudoku
                 is_valid = self.check_sudoku_validity(pred_decoded)
                 valid_puzzles.append(is_valid)
+                
+                steps_taken.append(carry.steps[i].item())
 
         return {
             "cell_accuracy": cell_accuracy.item(),
             "puzzle_correct": puzzle_correct,
             "valid_puzzles": valid_puzzles,
+            "steps_taken": steps_taken,
             "batch_size": batch_size,
         }
 
-    def evaluate(self, split: str = "val") -> Dict[str, Any]:
-        """
-        Run evaluation on specified split.
-
-        Args:
-            split: Which split to evaluate ('train', 'val', or 'test')
-        """
+    def evaluate(self, split: str = None, print_examples: bool = False) -> Dict[str, Any]:
+        """Run evaluation on specified split."""
+        if split is None:
+            split = self.eval_split
+            
         print(f"\nEvaluating on {split} split...")
+        
+        if self.cross_size:
+            print(f"  (Model trained on {self.train_grid_size}x{self.train_grid_size}, "
+                  f"testing on {self.eval_grid_size}x{self.eval_grid_size})")
 
-        # Get appropriate dataloader
         if split == "train":
             dataloader = self.datamodule.train_dataloader()
         elif split == "val":
@@ -250,35 +292,37 @@ class SudokuEvaluator:
         total_puzzles_correct = 0
         total_valid_puzzles = 0
         total_puzzles = 0
+        total_steps = 0
 
         all_results = []
 
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Evaluating {split}")):
-            results = self.evaluate_batch(batch)
+        first_batch = True
 
-            # Update totals
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Evaluating {split}")):
+            results = self.evaluate_batch(batch, print_examples=(first_batch and print_examples))
+            first_batch = False
+
             batch_size = results["batch_size"]
             total_cell_correct += results["cell_accuracy"] * batch_size
             total_cells += batch_size
             total_puzzles_correct += sum(results["puzzle_correct"])
             total_valid_puzzles += sum(results["valid_puzzles"])
             total_puzzles += len(results["puzzle_correct"])
+            total_steps += sum(results["steps_taken"])
 
-            # Store detailed results
             for i in range(batch_size):
-                all_results.append(
-                    {
-                        "batch_idx": batch_idx,
-                        "sample_idx": i,
-                        "exact_match": results["puzzle_correct"][i],
-                        "valid_sudoku": results["valid_puzzles"][i],
-                    }
-                )
+                all_results.append({
+                    "batch_idx": batch_idx,
+                    "sample_idx": i,
+                    "exact_match": results["puzzle_correct"][i],
+                    "valid_sudoku": results["valid_puzzles"][i],
+                    "steps": results["steps_taken"][i],
+                })
 
-        # Calculate final metrics
         overall_cell_accuracy = total_cell_correct / total_cells if total_cells > 0 else 0
         overall_puzzle_accuracy = total_puzzles_correct / total_puzzles if total_puzzles > 0 else 0
         overall_validity_rate = total_valid_puzzles / total_puzzles if total_puzzles > 0 else 0
+        avg_steps = total_steps / total_puzzles if total_puzzles > 0 else 0
 
         return {
             "split": split,
@@ -288,24 +332,28 @@ class SudokuEvaluator:
             "puzzles_correct": total_puzzles_correct,
             "valid_puzzles": total_valid_puzzles,
             "total_puzzles": total_puzzles,
+            "avg_steps": avg_steps,
+            "cross_size": self.cross_size,
+            "train_grid_size": self.train_grid_size,
+            "eval_grid_size": self.eval_grid_size,
             "detailed_results": all_results,
         }
 
-    def evaluate_full(self, split: str = "val") -> Dict[str, Any]:
-        """
-        Compatibility method that returns results with ARC-style naming.
-        This is for compatibility with existing evaluation scripts.
-        """
-        results = self.evaluate(split)
+    def evaluate_full(self, split: str = None, print_examples: bool = False) -> Dict[str, Any]:
+        """Evaluate with backward-compatible naming."""
+        results = self.evaluate(split, print_examples=print_examples)
 
-        # Map Sudoku metrics to ARC-style naming for compatibility
         return {
-            "pixel_accuracy": results["cell_accuracy"],  # cell -> pixel
-            "task_accuracy": results["puzzle_accuracy"],  # puzzle -> task
+            "pixel_accuracy": results["cell_accuracy"],
+            "task_accuracy": results["puzzle_accuracy"],
             "validity_rate": results["validity_rate"],
-            "tasks_correct": results["puzzles_correct"],  # puzzles -> tasks
+            "tasks_correct": results["puzzles_correct"],
             "valid_solutions": results["valid_puzzles"],
-            "total_tasks": results["total_puzzles"],  # puzzles -> tasks
+            "total_tasks": results["total_puzzles"],
+            "avg_steps": results["avg_steps"],
+            "cross_size": results["cross_size"],
+            "train_grid_size": results["train_grid_size"],
+            "eval_grid_size": results["eval_grid_size"],
             "detailed_results": results.get("detailed_results", []),
         }
 
@@ -315,68 +363,11 @@ class SudokuEvaluator:
 
         for split in ["train", "val", "test"]:
             try:
-                results[split] = self.evaluate(split)
+                results[split] = self.evaluate(split, print_examples=False)
             except Exception as e:
                 print(f"Could not evaluate {split} split: {e}")
 
         return results
-
-    def analyze_difficulty(self, split: str = "val") -> pd.DataFrame:
-        """
-        Analyze performance by difficulty (number of given cells).
-        """
-        print(f"\nAnalyzing difficulty for {split} split...")
-
-        # Get dataset
-        if split == "train":
-            dataset = self.datamodule.train_dataset
-        elif split == "val":
-            dataset = self.datamodule.val_dataset
-        elif split == "test":
-            dataset = self.datamodule.test_dataset
-        else:
-            raise ValueError(f"Invalid split: {split}")
-
-        # Count givens from encoded inputs
-        results_list = []
-
-        for idx in range(len(dataset)):
-            sample = dataset[idx]
-            input_flat = sample["input"]
-
-            # Reshape and extract grid
-            input_grid = input_flat.reshape(self.max_grid_size, self.max_grid_size)
-            sudoku_grid = input_grid[: self.grid_size, : self.grid_size]
-
-            # Count given cells (values >= 3 in encoded format)
-            num_given = torch.sum(sudoku_grid >= 3).item()
-            num_empty = self.grid_size * self.grid_size - num_given
-
-            results_list.append(
-                {
-                    "idx": idx,
-                    "num_given": num_given,
-                    "num_empty": num_empty,
-                }
-            )
-
-        df = pd.DataFrame(results_list)
-
-        # Add difficulty categories
-        if self.grid_size == 4:
-            bins = [0, 4, 8, 12, 16]
-        elif self.grid_size == 6:
-            bins = [0, 6, 12, 18, 24, 36]
-        else:  # 9x9
-            bins = [0, 20, 40, 60, 81]
-
-        df["difficulty"] = pd.cut(
-            df["num_empty"],
-            bins=bins,
-            labels=["Easy", "Medium", "Hard", "Very Hard"][: len(bins) - 1],
-        )
-
-        return df
 
     def save_results(self, results: Dict[str, Any], output_dir: str = "evaluation_results"):
         """Save evaluation results to files."""
@@ -385,37 +376,35 @@ class SudokuEvaluator:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Save summary
-        summary_file = output_path / f"sudoku_eval_{timestamp}.json"
-
-        # Create summary based on the results format
         summary = {
             "checkpoint": str(self.checkpoint_path),
             "timestamp": timestamp,
             "grid_size": self.grid_size,
+            "cross_size": self.cross_size,
+            "train_grid_size": self.train_grid_size,
+            "eval_grid_size": self.eval_grid_size,
         }
 
-        # Check if results are from evaluate_full (ARC-style) or evaluate (Sudoku-style)
+        # Handle different result formats
         if "pixel_accuracy" in results:
-            # ARC-style naming from evaluate_full
             summary["results"] = {
                 "pixel_accuracy": results["pixel_accuracy"],
                 "task_accuracy": results["task_accuracy"],
                 "validity_rate": results.get("validity_rate", 0),
                 "tasks_correct": results.get("tasks_correct", 0),
                 "total_tasks": results.get("total_tasks", 0),
+                "avg_steps": results.get("avg_steps", 0),
             }
         elif "cell_accuracy" in results:
-            # Sudoku-style naming from evaluate
             summary["results"] = {
                 "cell_accuracy": results["cell_accuracy"],
                 "puzzle_accuracy": results["puzzle_accuracy"],
                 "validity_rate": results.get("validity_rate", 0),
                 "puzzles_correct": results.get("puzzles_correct", 0),
                 "total_puzzles": results.get("total_puzzles", 0),
+                "avg_steps": results.get("avg_steps", 0),
             }
         else:
-            # Multi-split results
             summary["results"] = {}
             for split, split_results in results.items():
                 if isinstance(split_results, dict):
@@ -425,14 +414,15 @@ class SudokuEvaluator:
                         "validity_rate": split_results.get("validity_rate", 0),
                         "puzzles_correct": split_results.get("puzzles_correct", 0),
                         "total_puzzles": split_results.get("total_puzzles", 0),
+                        "avg_steps": split_results.get("avg_steps", 0),
                     }
 
+        summary_file = output_path / f"sudoku_eval_{timestamp}.json"
         with open(summary_file, "w") as f:
             json.dump(summary, f, indent=2)
 
         print(f"\nResults saved to {summary_file}")
 
-        # Save detailed results if available
         if "detailed_results" in results and results["detailed_results"]:
             detailed_file = output_path / f"sudoku_eval_detailed_{timestamp}.csv"
             df = pd.DataFrame(results["detailed_results"])
@@ -445,13 +435,14 @@ class SudokuEvaluator:
         """Print evaluation summary."""
         print("\n" + "=" * 60)
         print("SUDOKU EVALUATION RESULTS")
+        if self.cross_size:
+            print(f"(Cross-size: {self.train_grid_size}x{self.train_grid_size} → "
+                  f"{self.eval_grid_size}x{self.eval_grid_size})")
         print("=" * 60)
 
         if "split" in results:
-            # Single split
             self._print_split_results(results["split"], results)
         else:
-            # Multiple splits
             for split, split_results in results.items():
                 self._print_split_results(split, split_results)
                 print("-" * 60)
@@ -465,3 +456,104 @@ class SudokuEvaluator:
         print(f"  Valid Sudoku rate: {results['validity_rate']:.2%}")
         print(f"  Puzzles solved: {results['puzzles_correct']}/{results['total_puzzles']}")
         print(f"  Valid solutions: {results['valid_puzzles']}/{results['total_puzzles']}")
+        print(f"  Average steps: {results.get('avg_steps', 0):.1f}")
+
+    def print_examples(self, batch: Dict[str, torch.Tensor], predictions: torch.Tensor, 
+                   num_examples: int = 3):
+        """Print a few input/output/prediction examples for debugging."""
+        inputs = batch["input"]
+        targets = batch["output"]
+        
+        num_examples = min(num_examples, len(inputs))
+        
+        print("\n" + "=" * 70)
+        print("EXAMPLE PREDICTIONS")
+        print("=" * 70)
+        
+        for i in range(num_examples):
+            inp = inputs[i].reshape(self.max_grid_size, self.max_grid_size)
+            tgt = targets[i].reshape(self.max_grid_size, self.max_grid_size)
+            pred = predictions[i].reshape(self.max_grid_size, self.max_grid_size)
+            
+            # Extract actual grid
+            inp_grid = inp[:self.grid_size, :self.grid_size]
+            tgt_grid = tgt[:self.grid_size, :self.grid_size]
+            pred_grid = pred[:self.grid_size, :self.grid_size]
+            
+            # Decode: 0=PAD, 1=EOS, 2=empty, 3+=values
+            def decode_cell(val, is_input=False):
+                val = val.item()
+                if val == 0:
+                    return "."  # PAD
+                elif val == 1:
+                    return "X"  # EOS
+                elif val == 2:
+                    return "_" if is_input else "?"  # Empty
+                else:
+                    return str(val - 2)  # Actual value
+            
+            def grid_to_str(grid, is_input=False):
+                lines = []
+                box_rows, box_cols = self._get_box_dims(self.grid_size)
+                
+                for r in range(self.grid_size):
+                    if r > 0 and r % box_rows == 0:
+                        # Add horizontal separator
+                        sep = "+".join(["-" * (box_cols * 2 - 1)] * (self.grid_size // box_cols))
+                        lines.append(sep)
+                    
+                    row_str = ""
+                    for c in range(self.grid_size):
+                        if c > 0 and c % box_cols == 0:
+                            row_str += "|"
+                        row_str += decode_cell(grid[r, c], is_input) + " "
+                    lines.append(row_str.rstrip())
+                
+                return "\n".join(lines)
+            
+            # Check correctness
+            is_correct = torch.all(pred_grid == tgt_grid).item()
+            
+            # Decode for validity check
+            pred_decoded = pred_grid.clone()
+            valid_mask = pred_grid >= 3
+            pred_decoded[valid_mask] = pred_grid[valid_mask] - 2
+            pred_decoded[~valid_mask] = 0
+            is_valid = self.check_sudoku_validity(pred_decoded)
+            
+            # Count errors
+            errors = (pred_grid != tgt_grid).sum().item()
+            
+            print(f"\n--- Example {i + 1} ---")
+            print(f"Status: {'✓ CORRECT' if is_correct else f'✗ WRONG ({errors} errors)'} | "
+                f"Valid Sudoku: {'✓' if is_valid else '✗'}")
+            
+            # Print side by side
+            inp_lines = grid_to_str(inp_grid, is_input=True).split("\n")
+            tgt_lines = grid_to_str(tgt_grid).split("\n")
+            pred_lines = grid_to_str(pred_grid).split("\n")
+            
+            # Calculate width for alignment
+            width = max(len(line) for line in inp_lines) + 4
+            
+            print(f"\n{'INPUT':<{width}}{'TARGET':<{width}}{'PREDICTION'}")
+            print(f"{'-' * (width - 2):<{width}}{'-' * (width - 2):<{width}}{'-' * (width - 2)}")
+            
+            for inp_line, tgt_line, pred_line in zip(inp_lines, tgt_lines, pred_lines):
+                print(f"{inp_line:<{width}}{tgt_line:<{width}}{pred_line}")
+            
+            # Highlight differences
+            if not is_correct:
+                print("\nDifferences (row, col): ", end="")
+                diffs = []
+                for r in range(self.grid_size):
+                    for c in range(self.grid_size):
+                        if pred_grid[r, c] != tgt_grid[r, c]:
+                            pred_val = decode_cell(pred_grid[r, c])
+                            tgt_val = decode_cell(tgt_grid[r, c])
+                            diffs.append(f"({r},{c}): pred={pred_val} vs target={tgt_val}")
+                print(", ".join(diffs[:10]))
+                if len(diffs) > 10:
+                    print(f"  ... and {len(diffs) - 10} more")
+        
+        print("\n" + "=" * 70)

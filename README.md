@@ -52,7 +52,7 @@ Follow me on [X](https://x.com/olivkoch)
 
 ### 1. Create sweep
 ```uv run python scripts/create_sweep.py \
-    --sweep-file src/nn/configs/sweeps/trm_sudoku6x6_sweep.yaml \
+    --sweep-file src/nn/configs/sweeps/trm_sweep.yaml \
     --project trm-sudoku
     ```
 

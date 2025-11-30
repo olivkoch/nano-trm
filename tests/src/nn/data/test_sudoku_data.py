@@ -5,10 +5,15 @@ Independent test script to validate pre-generated Sudoku datasets.
 Reads a dataset from disk, prints samples, and validates correctness.
 No dependencies on the main codebase - just numpy and click.
 
+Supports all modes:
+- standard/full/hybrid: Single grid_size for all splits
+- cross-size: Different grid_size per split (train vs val/test)
+- mixed-size: Multiple grid sizes within each split
+
 Usage:
-    python test_sudoku_dataset.py ./data/sudoku_pregenerated
-    python test_sudoku_dataset.py ./data/sudoku_pregenerated --num-samples 10
-    python test_sudoku_dataset.py ./data/sudoku_pregenerated --validate-all
+    python test_sudoku_data.py ./data/sudoku_pregenerated
+    python test_sudoku_data.py ./data/sudoku_pregenerated --num-samples 10
+    python test_sudoku_data.py ./data/sudoku_pregenerated --validate-all
 """
 
 import json
@@ -28,10 +33,17 @@ def load_dataset(data_dir: Path, split: str = "train"):
     inputs = np.load(split_dir / "all__inputs.npy")
     labels = np.load(split_dir / "all__labels.npy")
     
+    # Load optional grid_sizes array for mixed-size mode
+    grid_sizes_path = split_dir / "all__grid_sizes.npy"
+    if grid_sizes_path.exists():
+        grid_sizes = np.load(grid_sizes_path)
+    else:
+        grid_sizes = None
+    
     with open(split_dir / "dataset.json") as f:
         metadata = json.load(f)
     
-    return inputs, labels, metadata
+    return inputs, labels, grid_sizes, metadata
 
 
 def load_global_metadata(data_dir: Path):
@@ -158,7 +170,7 @@ def print_grid(grid: np.ndarray, grid_size: int, title: str = ""):
 def print_sample(idx: int, puzzle: np.ndarray, solution: np.ndarray, grid_size: int):
     """Print a single sample with puzzle and solution side by side."""
     print(f"\n{'='*60}")
-    print(f"Sample {idx}")
+    print(f"Sample {idx} (grid_size={grid_size}x{grid_size})")
     print(f"{'='*60}")
     
     num_givens = np.sum(puzzle > 0)
@@ -226,42 +238,60 @@ def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet
     
     DATA_DIR is the path to the pre-generated dataset directory.
     """
-    # Load metadata
+    # Load global metadata
     click.echo(f"Loading dataset from: {data_dir}")
     metadata = load_global_metadata(data_dir)
     
-    grid_size = metadata["grid_size"]
-    max_grid_size = metadata["max_grid_size"]
+    # Detect mode from global metadata
+    mode = metadata.get("mode", "standard")
     
-    click.echo(f"\nDataset metadata:")
-    click.echo(f"  Grid size: {grid_size}x{grid_size}")
-    click.echo(f"  Max grid size: {max_grid_size}x{max_grid_size}")
+    click.echo(f"\nGlobal metadata ({mode.upper()}):")
+    click.echo(f"  Max grid size: {metadata['max_grid_size']}x{metadata['max_grid_size']}")
     click.echo(f"  Vocab size: {metadata['vocab_size']}")
     click.echo(f"  Sequence length: {metadata['seq_len']}")
     click.echo(f"  Train/Val/Test: {metadata['num_train']}/{metadata['num_val']}/{metadata['num_test']}")
-    click.echo(f"  Givens range: {metadata.get('min_givens', '?')}-{metadata.get('max_givens', '?')}")
-    if metadata.get('full_enumeration'):
-        click.echo(f"  Generation mode: FULL ({metadata.get('num_base_grids', '?')} base grids)")
-    else:
-        click.echo(f"  Generation mode: STANDARD")
     
     # Load split
     click.echo(f"\nLoading {split} split...")
-    inputs, labels, split_meta = load_dataset(data_dir, split)
+    inputs, labels, grid_sizes_array, split_meta = load_dataset(data_dir, split)
     
     total_samples = len(inputs)
-    click.echo(f"Loaded {total_samples} samples")
+    max_grid_size = split_meta["max_grid_size"]
+    is_mixed = split_meta.get("mixed_size", False) or grid_sizes_array is not None
+    
+    click.echo(f"\nSplit metadata:")
+    click.echo(f"  Samples: {total_samples}")
+    
+    if is_mixed:
+        # Mixed-size mode: multiple grid sizes in this split
+        grid_sizes_list = split_meta.get("grid_sizes", [])
+        size_counts = split_meta.get("grid_size_counts", {})
+        click.echo(f"  Mixed sizes: {grid_sizes_list}")
+        for gs in grid_sizes_list:
+            count = size_counts.get(str(gs), "?")
+            click.echo(f"    {gs}x{gs}: {count} puzzles")
+    else:
+        # Single grid size for this split
+        grid_size = split_meta["grid_size"]
+        click.echo(f"  Grid size: {grid_size}x{grid_size}")
+        click.echo(f"  Givens: {split_meta.get('min_givens', '?')}-{split_meta.get('max_givens', '?')}")
     
     # Print some samples
     if not quiet:
         print_indices = np.linspace(0, total_samples - 1, min(num_samples, total_samples), dtype=int)
         
         for idx in print_indices:
-            puzzle = decode_grid(inputs[idx], grid_size, max_grid_size)
-            solution = decode_grid(labels[idx], grid_size, max_grid_size)
-            print_sample(idx, puzzle, solution, grid_size)
+            # Get grid_size for this sample
+            if is_mixed and grid_sizes_array is not None:
+                sample_grid_size = int(grid_sizes_array[idx])
+            else:
+                sample_grid_size = split_meta["grid_size"]
             
-            errors = validate_sample(puzzle, solution, grid_size)
+            puzzle = decode_grid(inputs[idx], sample_grid_size, max_grid_size)
+            solution = decode_grid(labels[idx], sample_grid_size, max_grid_size)
+            print_sample(idx, puzzle, solution, sample_grid_size)
+            
+            errors = validate_sample(puzzle, solution, sample_grid_size)
             if errors:
                 click.echo("❌ ERRORS:")
                 for err in errors:
@@ -279,14 +309,20 @@ def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet
         error_details = []
         
         for idx in range(total_samples):
-            puzzle = decode_grid(inputs[idx], grid_size, max_grid_size)
-            solution = decode_grid(labels[idx], grid_size, max_grid_size)
+            # Get grid_size for this sample
+            if is_mixed and grid_sizes_array is not None:
+                sample_grid_size = int(grid_sizes_array[idx])
+            else:
+                sample_grid_size = split_meta["grid_size"]
             
-            errors = validate_sample(puzzle, solution, grid_size)
+            puzzle = decode_grid(inputs[idx], sample_grid_size, max_grid_size)
+            solution = decode_grid(labels[idx], sample_grid_size, max_grid_size)
+            
+            errors = validate_sample(puzzle, solution, sample_grid_size)
             if errors:
                 invalid_count += 1
                 if len(error_details) < 10:  # Keep first 10 errors
-                    error_details.append((idx, errors))
+                    error_details.append((idx, sample_grid_size, errors))
             
             if (idx + 1) % 1000 == 0:
                 click.echo(f"  Validated {idx + 1}/{total_samples}...")
@@ -303,8 +339,8 @@ def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet
         else:
             click.echo(f"\n❌ {invalid_count} INVALID SAMPLES")
             click.echo("\nFirst few errors:")
-            for idx, errors in error_details:
-                click.echo(f"\n  Sample {idx}:")
+            for idx, gs, errors in error_details:
+                click.echo(f"\n  Sample {idx} ({gs}x{gs}):")
                 for err in errors:
                     click.echo(f"    - {err}")
     

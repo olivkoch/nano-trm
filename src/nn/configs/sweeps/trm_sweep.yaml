@@ -7,7 +7,9 @@ metric:
 
 parameters:
   model_tuning.N_supervision:
-    values: [2 ,4, 6, 8]
+    values: [6, 8, 12]
+  model_tuning.N_supervision_val:
+    values: [8, 64, 128]
   model_tuning.H_cycles:
     values: [1, 2, 3]
   model_tuning.L_cycles:

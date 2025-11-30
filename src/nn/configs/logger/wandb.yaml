@@ -8,7 +8,7 @@ wandb:
   id: null  # Same as version, can be used to resume runs.
   anonymous: null  # Set to enable anonymous logging
   entity: "olivier-koch"
-  project: "arc-agi"
+  project: "nano-trm"
   log_model: false  # If true, upload lightning ckpts
   prefix: ""  # String to put at the beginning of metric keys
   tags: ${tags}

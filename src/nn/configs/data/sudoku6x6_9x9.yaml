@@ -3,13 +3,13 @@ _recursive_: false
 batch_size: ${timekeeping.batch_size}
 num_workers: ${timekeeping.num_workers}
 
-num_train_puzzles: 2000
-num_val_puzzles: 800
+num_train_puzzles: 0
+num_val_puzzles: 0
 num_test_puzzles: 0
-grid_size: 6
-max_grid_size: 8
+grid_size: 9
+max_grid_size: 10
 min_givens: null
 max_givens: null
 seed: 42
-data_dir: ./data/sudoku6x6_standard_50k
+data_dir: ./data/sudoku_mixed_6x6_9x9
 pad_value: 0

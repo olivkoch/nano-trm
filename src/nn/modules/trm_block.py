@@ -69,7 +69,9 @@ class CastedEmbedding(nn.Module):
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings, base, device=None):
         super().__init__()
-
+        self.enabled = base > 0
+        if not self.enabled:
+            return
         # RoPE
         inv_freq = 1.0 / (
             base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
@@ -83,6 +85,8 @@ class RotaryEmbedding(nn.Module):
         self.sin_cached = nn.Buffer(emb.sin(), persistent=False)
 
     def forward(self):
+        if not self.enabled:
+            return None, None
         return self.cos_cached, self.sin_cached
 
 

@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /data: sudoku_6x6_hybrid
+  - override /data: sudoku_cross_6x6_9x9
   - override /model: trm
   - override /callbacks: default
   - override /trainer: gpu
@@ -9,7 +9,7 @@ defaults:
 tags: ["sudoku", "trm"]
 
 timekeeping:
-  max_epochs: 750
+  max_epochs: 100
   batch_size: 768
   num_workers: 0
 

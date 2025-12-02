@@ -1,0 +1,173 @@
+from typing import Optional
+import os
+import csv
+import json
+import numpy as np
+
+import click
+from tqdm import tqdm
+from huggingface_hub import hf_hub_download
+
+
+def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
+    # Create a random digit mapping: a permutation of 1..9, with zero (blank) unchanged
+    digit_map = np.pad(np.random.permutation(np.arange(1, 10)), (1, 0))
+    
+    # Randomly decide whether to transpose.
+    transpose_flag = np.random.rand() < 0.5
+
+    # Generate a valid row permutation:
+    # - Shuffle the 3 bands (each band = 3 rows) and for each band, shuffle its 3 rows.
+    bands = np.random.permutation(3)
+    row_perm = np.concatenate([b * 3 + np.random.permutation(3) for b in bands])
+
+    # Similarly for columns (stacks).
+    stacks = np.random.permutation(3)
+    col_perm = np.concatenate([s * 3 + np.random.permutation(3) for s in stacks])
+
+    # Build an 81->81 mapping. For each new cell at (i, j)
+    # (row index = i // 9, col index = i % 9),
+    # its value comes from old row = row_perm[i//9] and old col = col_perm[i%9].
+    mapping = np.array([row_perm[i // 9] * 9 + col_perm[i % 9] for i in range(81)])
+
+    def apply_transformation(x: np.ndarray) -> np.ndarray:
+        # Apply transpose flag
+        if transpose_flag:
+            x = x.T
+        # Apply the position mapping.
+        new_board = x.flatten()[mapping].reshape(9, 9).copy()
+        # Apply digit mapping
+        return digit_map[new_board]
+
+    return apply_transformation(board), apply_transformation(solution)
+
+
+def convert_subset(set_name: str, source_repo: str, output_dir: str, 
+                   subsample_size: Optional[int], min_difficulty: Optional[int], num_aug: int) -> int:
+    """Convert a subset and return the number of puzzles generated."""
+    # Read CSV
+    inputs = []
+    labels = []
+    
+    with open(hf_hub_download(source_repo, f"{set_name}.csv", repo_type="dataset"), newline="") as csvfile:
+        reader = csv.reader(csvfile)
+        next(reader)  # Skip header
+        for source, q, a, rating in reader:
+            if (min_difficulty is None) or (int(rating) >= min_difficulty):
+                assert len(q) == 81 and len(a) == 81
+                
+                inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
+                labels.append(np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
+
+    # If subsample_size is specified, randomly sample the desired number of examples.
+    if subsample_size is not None:
+        total_samples = len(inputs)
+        if subsample_size < total_samples:
+            indices = np.random.choice(total_samples, size=subsample_size, replace=False)
+            inputs = [inputs[i] for i in indices]
+            labels = [labels[i] for i in indices]
+
+    # Generate dataset
+    num_augments = num_aug if set_name == "train" else 0
+
+    all_inputs = []
+    all_labels = []
+    
+    for orig_inp, orig_out in zip(tqdm(inputs), labels):
+        for aug_idx in range(1 + num_augments):
+            # First index is not augmented
+            if aug_idx == 0:
+                inp, out = orig_inp, orig_out
+            else:
+                inp, out = shuffle_sudoku(orig_inp, orig_out)
+
+            all_inputs.append(inp)
+            all_labels.append(out)
+        
+    # To Numpy
+    def _seq_to_numpy(seq):
+        arr = np.concatenate(seq).reshape(len(seq), -1)
+        assert np.all((arr >= 0) & (arr <= 9))
+        return arr + 1
+    
+    inputs_arr = _seq_to_numpy(all_inputs)
+    labels_arr = _seq_to_numpy(all_labels)
+    puzzle_identifiers = np.zeros(len(all_inputs), dtype=np.int32)
+
+    num_puzzles = len(all_inputs)
+    grid_size = 9
+    seq_len = 81
+    vocab_size = 3 + grid_size  # PAD + BLANK + 1-9
+
+    # Calculate min/max givens from the data (count non-zero cells in inputs)
+    givens_counts = [np.count_nonzero(inp) for inp in all_inputs]
+    min_givens = int(min(givens_counts))
+    max_givens = int(max(givens_counts))
+
+    # Metadata matching the other generator's format
+    metadata = {
+        "num_puzzles": num_puzzles,
+        "grid_size": grid_size,
+        "max_grid_size": grid_size,
+        "min_givens": min_givens,
+        "max_givens": max_givens,
+        "seq_len": seq_len,
+        "vocab_size": vocab_size,
+    }
+
+    # Save
+    save_dir = os.path.join(output_dir, set_name)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    with open(os.path.join(save_dir, "dataset.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+        
+    np.save(os.path.join(save_dir, "all__inputs.npy"), inputs_arr)
+    np.save(os.path.join(save_dir, "all__labels.npy"), labels_arr)
+    np.save(os.path.join(save_dir, "all__puzzle_identifiers.npy"), puzzle_identifiers)
+        
+    print(f"✓ Saved {set_name} split:")
+    print(f"  - inputs: {inputs_arr.shape}")
+    print(f"  - labels: {labels_arr.shape}")
+    
+    return num_puzzles
+
+
+@click.command()
+@click.option("--source-repo", default="sapientinc/sudoku-extreme", help="Source HuggingFace repository")
+@click.option("--output-dir", default="data/sudoku-extreme-full", help="Output directory")
+@click.option("--subsample-size", type=int, default=None, help="Subsample size for training set")
+@click.option("--min-difficulty", type=int, default=None, help="Minimum difficulty rating")
+@click.option("--num-aug", type=int, default=0, help="Number of augmentations per puzzle")
+@click.option("--test-ratio", type=float, default=0.1, help="Test set size as ratio of training size")
+@click.option("--seed", type=int, default=42, help="Random seed")
+def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[int], 
+                    min_difficulty: Optional[int], num_aug: int, test_ratio: float, seed: int):
+    np.random.seed(seed)
+    
+    num_train = convert_subset("train", source_repo, output_dir, subsample_size, min_difficulty, num_aug)
+    
+    # Test set size is a percentage of training size
+    test_subsample_size = int(num_train * test_ratio)
+    num_test = convert_subset("test", source_repo, output_dir, test_subsample_size, min_difficulty, num_aug=0)
+    
+    # Save global metadata
+    overall_meta = {
+        "mode": "extreme",
+        "max_grid_size": 9,
+        "vocab_size": 12,
+        "seq_len": 81,
+        "num_train": num_train,
+        "num_val": 0,
+        "num_test": num_test,
+        "seed": seed,
+    }
+    
+    with open(os.path.join(output_dir, "metadata.json"), "w") as f:
+        json.dump(overall_meta, f, indent=2)
+    
+    print(f"\n✓ Saved to {output_dir}")
+
+
+if __name__ == "__main__":
+    preprocess_data()

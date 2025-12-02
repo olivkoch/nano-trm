@@ -89,7 +89,60 @@ class RotaryEmbedding(nn.Module):
             return None, None
         return self.cos_cached, self.sin_cached
 
-
+class RotaryEmbedding2D(nn.Module):
+    """2D RoPE using same frequency basis as 1D, with prefix support."""
+    
+    def __init__(self, dim, prefix_len, max_grid_size, base=10000, device=None):
+        super().__init__()
+        self.prefix_len = prefix_len
+        self.max_grid_size = max_grid_size
+        self.dim = dim
+        
+        # SAME frequency formula as 1D RoPE
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
+        self._build_cache(device)
+    
+    def _build_cache(self, device=None):
+        if device is None:
+            device = self.inv_freq.device
+        
+        n_freq = self.inv_freq.shape[0]  # dim // 2 (32 for dim=64)
+        quarter = n_freq // 2            # dim // 4 (16 for dim=64)
+        
+        # Prefix: standard 1D positions
+        if self.prefix_len > 0:
+            prefix_pos = torch.arange(self.prefix_len, dtype=torch.float32, device=device)
+            prefix_freqs = torch.outer(prefix_pos, self.inv_freq)  # [prefix, 32]
+            prefix_emb = torch.cat((prefix_freqs, prefix_freqs), dim=-1)  # [prefix, 64]
+        
+        # Grid: 2D positions
+        grid_len = self.max_grid_size ** 2
+        indices = torch.arange(grid_len, dtype=torch.float32, device=device)
+        rows = indices // self.max_grid_size
+        cols = indices % self.max_grid_size
+        
+        # Row and col BOTH use the same frequencies (first quarter of inv_freq)
+        # This gives them equal expressiveness
+        row_freqs = torch.outer(rows, self.inv_freq[:quarter])  # [grid, 16]
+        col_freqs = torch.outer(cols, self.inv_freq[:quarter])  # [grid, 16]
+        
+        # Structure: [row, col, row, col] to match rotate_half pattern
+        grid_emb = torch.cat([row_freqs, col_freqs, row_freqs, col_freqs], dim=-1)  # [grid, 64]
+        
+        # Combine prefix + grid
+        if self.prefix_len > 0:
+            full_emb = torch.cat([prefix_emb, grid_emb], dim=0)
+        else:
+            full_emb = grid_emb
+        
+        self.cos_cached = nn.Buffer(full_emb.cos(), persistent=False)
+        self.sin_cached = nn.Buffer(full_emb.sin(), persistent=False)
+    
+    def forward(self):
+        return self.cos_cached, self.sin_cached
+    
 def rotate_half(x: torch.Tensor):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]

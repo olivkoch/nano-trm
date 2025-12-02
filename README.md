@@ -18,6 +18,8 @@ To generate a Sudoku dataset: `./bash/generate_sudoku_data.sh`
 
 To test the data: `uv run tests/src/nn/data/test_sudoku_data.py <data_dir>`
 
+To generate a Sudoku Extreme dataset: 'uv run python scripts/data/build_sudoku_extreme_dataset.py --output-dir data/sudoku-extreme-10k  --subsample-size 10000`
+
 ## Training
 
 `uv run python src/nn/train.py experiment=trm_sudoku4x4` (takes a few mins on an A10)

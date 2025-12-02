@@ -49,6 +49,9 @@ class MLPModule(LightningModule):
         lr_min_ratio: float = 1.0,
         puzzle_emb_dim: int = 512,
         puzzle_emb_len: int = 16,
+        backbone_type: str = "mlp",  # "mlp" or "cnn"
+        cnn_channels: int = 128,     # channels for CNN layers
+        cnn_kernel_size: int = 3,    # kernel size (3 captures box interactions nicely)
         vocab_size: int = 0,  # Should be set from datamodule
         num_puzzles: int = 0,  # Should be set from datamodule
         batch_size: int = 0,  # Should be set from datamodule
@@ -184,28 +187,77 @@ class MLPModule(LightningModule):
         
         self.mlp = nn.Sequential(*layers)
 
+    def _build_cnn(self):
+        """Build 2D CNN architecture for grid-structured data."""
+        # Infer grid size from sequence length
+        self.grid_size = int(math.sqrt(self.hparams.seq_len))
+        assert self.grid_size ** 2 == self.hparams.seq_len, \
+            f"seq_len {self.hparams.seq_len} must be a perfect square for CNN"
+        
+        channels = self.hparams.cnn_channels
+        kernel = self.hparams.cnn_kernel_size
+        padding = kernel // 2  # Same padding
+        
+        layers = []
+        
+        # Initial projection from hidden_size to cnn_channels
+        layers.append(nn.Conv2d(self.hparams.hidden_size, channels, 1))
+        layers.append(nn.ReLU())
+        
+        # Stacked conv layers
+        for _ in range(self.hparams.num_layers - 1):
+            layers.append(nn.Conv2d(channels, channels, kernel, padding=padding))
+            layers.append(nn.BatchNorm2d(channels))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout2d(self.hparams.dropout))
+        
+        # Project back to hidden_size
+        layers.append(nn.Conv2d(channels, self.hparams.hidden_size, 1))
+        
+        self.cnn = nn.Sequential(*layers)
+
+    def _forward_cnn(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through CNN backbone.
+        
+        Args:
+            x: [batch, seq_len, hidden_size] embeddings (puzzle prefix already removed)
+        Returns:
+            [batch, seq_len, hidden_size] processed features
+        """
+        batch_size, seq_len, hidden_size = x.shape
+        
+        # Reshape to 2D grid: [batch, hidden, H, W]
+        x = x.permute(0, 2, 1)  # [batch, hidden, seq_len]
+        x = x.reshape(batch_size, hidden_size, self.grid_size, self.grid_size)
+        
+        # Apply CNN
+        x = self.cnn(x)
+        
+        # Reshape back to sequence
+        x = x.reshape(batch_size, hidden_size, seq_len)
+        x = x.permute(0, 2, 1)  # [batch, seq_len, hidden]
+        
+        return x
+
     def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         # Get embeddings [batch, total_seq_len, hidden]
         x = self._input_embeddings(batch["input"], batch["puzzle_identifiers"])
         
         batch_size, total_seq_len, hidden_size = x.shape
         
-        # Flatten to single vector per sample
-        x = x.reshape(batch_size, -1)  # [batch, total_seq_len * hidden]
-        
-        # Process through MLP (now sees all positions!)
-        x = self.mlp(x)  # [batch, total_seq_len * hidden]
-        
-        # Reshape back to sequence
-        x = x.reshape(batch_size, total_seq_len, hidden_size)
-        
-        # Project to vocabulary
-        logits = self.lm_head(x)
-        
-        # Remove puzzle embedding positions
-        if self.puzzle_emb_len > 0:
-            logits = logits[:, self.puzzle_emb_len:]
-        
+        if self.hparams.backbone_type == "mlp":
+            # Flatten to single vector per sample
+            x = x.reshape(batch_size, -1)  # [batch, total_seq_len * hidden]
+            x = self.mlp(x)  # [batch, total_seq_len * hidden]
+            x = x.reshape(batch_size, total_seq_len, hidden_size)
+            logits = self.lm_head(x)
+            if self.puzzle_emb_len > 0:
+                logits = logits[:, self.puzzle_emb_len:]
+        else:
+            x_grid = x[:, self.puzzle_emb_len:]
+            x_grid = self._forward_cnn(x_grid)
+            logits = self.lm_head(x_grid)
+
         return logits
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
@@ -241,9 +293,6 @@ class MLPModule(LightningModule):
         # print(f"Labels: {labels[0,:48]}")
         # print(f"Loss before assert: {loss.item() / batch_size}")
 
-        assert not torch.isnan(loss), "Loss is NaN"
-        assert not torch.isinf(loss), "Loss is Inf"
-
         # Compute metrics
         with torch.no_grad():
             preds = torch.argmax(logits, dim=-1)
@@ -266,6 +315,9 @@ class MLPModule(LightningModule):
         # Backward pass
         scaled_loss = loss / batch_size
         scaled_loss.backward()
+
+        assert not torch.isnan(scaled_loss), "Loss is NaN"
+        assert not torch.isinf(scaled_loss), "Loss is Inf"
 
         # Gradient monitoring
         with torch.no_grad():

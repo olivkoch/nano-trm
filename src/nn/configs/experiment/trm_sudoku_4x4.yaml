@@ -32,6 +32,7 @@ model_tuning:
   hidden_size: 64
   ffn_expansion: 2
   rope_theta: 10000
+  use_2d_rope: false
 
 
 trainer:

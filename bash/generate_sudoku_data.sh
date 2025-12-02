@@ -166,7 +166,7 @@ case $choice in
             --num-val 5000 \
             --num-test 5000 \
             --cross-size \
-            --output-dir ./data/sudoku_cross_6x6_to_9x9
+            --output-dir ./data/sudoku_cross_6x6_9x9
         ;;
     c|C)
         echo "Select mode:"

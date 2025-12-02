@@ -9,7 +9,7 @@ defaults:
 tags: ["sudoku", "trm"]
 
 timekeeping:
-  max_epochs: 750
+  max_epochs: 900
   batch_size: 768
   num_workers: 0
 
@@ -32,6 +32,7 @@ model_tuning:
   hidden_size: 256
   ffn_expansion: 2
   rope_theta: 10000
+  use_2d_rope: false
 
 trainer:
   check_val_every_n_epoch: 1

@@ -107,6 +107,34 @@ class SudokuDataset(Dataset):
             self.mode = "loading"
             self.load_from_files(data_dir, split)
 
+    def _remap_to_random_tokens(self, puzzle: np.ndarray, solution: np.ndarray):
+        """Use random subset of tokens 1-max_grid_size to represent values.
+        
+        Ensures all token embeddings get trained, even on smaller grids.
+        This is useful for e.g. training on 6x6 and validation on 9x9
+        """
+        n = self.grid_size
+        max_val = self.max_grid_size
+        
+        if n >= max_val:
+            return puzzle, solution  # No remapping needed
+        
+        rng = np.random.default_rng()
+        
+        # Pick n random tokens from {1, 2, ..., max_val}
+        chosen_tokens = rng.choice(max_val, size=n, replace=False) + 1
+        
+        puzzle_remapped = np.zeros_like(puzzle)
+        solution_remapped = np.zeros_like(solution)
+        
+        # Keep zeros (empty cells) as zeros
+        for orig_val in range(1, n + 1):
+            new_val = chosen_tokens[orig_val - 1]
+            puzzle_remapped[puzzle == orig_val] = new_val
+            solution_remapped[solution == orig_val] = new_val
+        
+        return puzzle_remapped, solution_remapped
+    
     def load_from_files(self, data_dir: str, split: str):
         """Load pre-generated dataset from .npy files."""
         split_dir = os.path.join(data_dir, split)
@@ -164,6 +192,9 @@ class SudokuDataset(Dataset):
             pool_idx = self.split_indices[idx]
             puzzle, solution = self.puzzle_pool[pool_idx]
 
+            if self.split == "train":
+                puzzle, solution = self._remap_to_random_tokens(puzzle, solution)
+                
             # Encode and pad
             input_flat, labels_flat = self.pad_and_encode(puzzle, solution)
 

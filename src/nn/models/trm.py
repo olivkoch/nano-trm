@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
+from sklearn import metrics
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +32,7 @@ from src.nn.modules.trm_block import (
     ReasoningBlockConfig,
     ReasoningModule,
     RotaryEmbedding,
+    RotaryEmbedding2D
 )
 from src.nn.modules.utils import stablemax_cross_entropy, trunc_normal_init_
 from src.nn.utils import RankedLogger
@@ -79,7 +81,9 @@ class TRMModule(LightningModule):
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
         rope_theta: int = 10000,
+        use_2d_rope: bool = False,
         lr_min_ratio: float = 1.0,
+        use_sigreg: bool = False,
         vocab_size: int = 0,  # Should be set from datamodule
         num_puzzles: int = 0,  # Should be set from datamodule
         batch_size: int = 0,  # Should be set from datamodule
@@ -99,16 +103,25 @@ class TRMModule(LightningModule):
         self.embed_scale = math.sqrt(hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
+        log.info(f"Creating TRM with vocab size={vocab_size}, seq_len={seq_len}, puzzle_emb_len={puzzle_emb_len} {use_2d_rope=}")
+
         self.input_embedding = CastedEmbedding(
             vocab_size, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
         )
 
-        # Positional embeddings with rotary embeddings
-        self.pos_embedding = RotaryEmbedding(
+        if use_2d_rope:
+            self.pos_embedding = RotaryEmbedding2D(
             dim=hidden_size // num_heads,
-            max_position_embeddings=seq_len + puzzle_emb_len,
+            prefix_len=puzzle_emb_len,
+            max_grid_size=int(math.sqrt(seq_len)),  # e.g., 9 for seq_len=81
             base=rope_theta,
         )
+        else:
+            self.pos_embedding = RotaryEmbedding(
+                dim=hidden_size // num_heads,
+                max_position_embeddings=seq_len + puzzle_emb_len,
+                base=rope_theta,
+            )
 
         # a single network (not two separate networks)
         reasoning_config = ReasoningBlockConfig(
@@ -127,12 +140,8 @@ class TRMModule(LightningModule):
         )
 
         self.lm_head = CastedLinear(hidden_size, vocab_size, bias=False)
-        self.q_head = CastedLinear(hidden_size, 2, bias=True)
+        self.q_head = CastedLinear(hidden_size, 1, bias=True) # learn to stop, not to continue
 
-        # Halting head for adaptive computation
-        # Only learn a halting probability through a Binary-Cross-Entropy loss of having
-        # reached the correct solution
-        #        self.Q_head = nn.Linear(hidden_size, 1)  # Q_head returns 1 value: q[0]
         with torch.no_grad():
             self.q_head.weight.zero_()
             if self.q_head.bias is not None:
@@ -149,8 +158,10 @@ class TRMModule(LightningModule):
             trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
         )
-        # self.register_buffer("z_H_init", trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        # self.register_buffer("z_L_init", trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+
+        if self.hparams.use_sigreg:
+            self.sigreg_beta = 1.0
+            self.sigreg_slices = 256
 
         # Add puzzle embeddings
         if puzzle_emb_dim > 0:
@@ -266,6 +277,73 @@ class TRMModule(LightningModule):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.z_L_init, carry.z_L),
         )
 
+    def sigreg(self,
+        x: torch.Tensor, 
+        global_step: int, 
+        num_slices: int = 256,
+        num_points: int = 17,
+    ) -> torch.Tensor:
+        """
+        SIGReg: Sliced Isotropic Gaussian Regularization.
+        
+        Projects embeddings onto random 1D directions and checks if 
+        each projection is Gaussian using Epps-Pulley characteristic function test.
+        
+        Args:
+            x: [N, K] tensor of embeddings (flattened batch*seq, hidden)
+            global_step: for synchronized random slice sampling
+            num_slices: number of random projection directions
+            num_points: integration points for characteristic function
+        
+        Returns:
+            Scalar loss measuring deviation from isotropic Gaussian
+        """
+        dev = dict(device=x.device)
+        
+        # Synchronized random projections
+        g = torch.Generator(**dev)
+        g.manual_seed(global_step)
+        
+        proj_shape = (x.size(1), num_slices)  # [hidden, num_slices]
+        A = torch.randn(proj_shape, generator=g, **dev)
+        A = A / A.norm(p=2, dim=0, keepdim=True)  # Normalize columns
+        
+        # Project x onto random directions: [N, num_slices]
+        x_proj = x @ A
+        
+        # Standardize each slice (so we compare to N(0,1))
+        x_proj = (x_proj - x_proj.mean(dim=0, keepdim=True)) / (x_proj.std(dim=0, keepdim=True) + 1e-8)
+        
+        # Epps-Pulley test using characteristic functions
+        t = torch.linspace(-5, 5, num_points, **dev)  # Integration points
+        
+        # Theoretical CF for N(0,1): exp(-t²/2)
+        exp_f = torch.exp(-0.5 * t ** 2)
+        
+        # Empirical CF: E[exp(i*t*x)] for each slice
+        x_t = x_proj.unsqueeze(2) * t  # [N, num_slices, num_points]
+        ecf = (1j * x_t).exp().mean(dim=0)  # [num_slices, num_points]
+        
+        # Weighted L2 distance between empirical and theoretical CF
+        # Weight by exp_f to focus on important region
+        err = (ecf - exp_f).abs().square() * exp_f
+        
+        # Integrate over t, average over slices
+        loss = torch.trapezoid(err, t, dim=1).mean()
+        
+        return loss
+    
+    def compute_sigreg_loss(self, z_H: torch.Tensor, z_L: torch.Tensor) -> torch.Tensor:
+        """Apply SIGReg to hidden states."""
+        # Flatten to [batch*seq, hidden]
+        z_H_flat = z_H.reshape(-1, z_H.shape[-1])
+        z_L_flat = z_L.reshape(-1, z_L.shape[-1])
+        
+        loss_H = self.sigreg(x=z_H_flat, global_step=self.global_step, num_slices=self.sigreg_slices)
+        loss_L = self.sigreg(x=z_L_flat, global_step=self.global_step, num_slices=self.sigreg_slices)
+        
+        return loss_H + loss_L
+    
     def inner_forward(
         self, carry: TRMInnerCarry, batch: Dict[str, torch.Tensor]
     ) -> Tuple[TRMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -290,13 +368,17 @@ class TRMModule(LightningModule):
             z_L = self.lenet(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.lenet(z_H, z_L, **seq_info)
 
+        if self.training and self.hparams.use_sigreg:
+            self._sigreg_loss = self.compute_sigreg_loss(z_H, z_L)
+    
         # LM Outputs
         new_carry = TRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
         output = self.lm_head(z_H)[:, self.puzzle_emb_len :]
         q_logits = self.q_head(z_H[:, 0]).to(
             torch.float32
         )  # Q-head; uses the first puzzle_emb position
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+
+        return new_carry, output, q_logits[..., 0]
 
     def forward(
         self, carry: TRMCarry, batch: Dict[str, torch.Tensor]
@@ -312,14 +394,13 @@ class TRMModule(LightningModule):
         }
 
         # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner_forward(
+        new_inner_carry, logits, q_halt_logits = self.inner_forward(
             new_inner_carry, new_current_data
         )
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits,
         }
 
         with torch.no_grad():
@@ -402,6 +483,10 @@ class TRMModule(LightningModule):
         )
 
         total_loss = lm_loss + 0.5 * q_halt_loss
+
+        if self.training and self.hparams.use_sigreg:
+            total_loss = total_loss + self.sigreg_beta * self._sigreg_loss
+            metrics.update({"sigreg_loss": self._sigreg_loss.detach()})
 
         return new_carry, total_loss, metrics, new_carry.halted.all()
 
@@ -486,7 +571,6 @@ class TRMModule(LightningModule):
             # Warning for problematic gradients
             if total_grad_norm < 1e-6 or total_grad_norm > 100:
                 log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
-        
 
         lr_this_step = None
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
@@ -560,6 +644,9 @@ class TRMModule(LightningModule):
                 avg_halt_steps = metrics.get("steps", 0) / metrics["count"]
                 early_halt_rate = avg_halt_steps < self.hparams.N_supervision
                 self.log("train/early_halt_rate", early_halt_rate, on_step=True)
+
+                if self.hparams.use_sigreg:
+                    self.log("train/sigreg_loss", metrics["sigreg_loss"], on_step=True)
 
         # Assert LM loss is not NaN
         assert not torch.isnan(metrics.get("lm_loss")), f"LM loss is NaN at step {self.manual_step}"

@@ -33,6 +33,7 @@ model_tuning:
   ffn_expansion: 2
   rope_theta: 10000
   use_2d_rope: false
+  use_sigreg: true
 
 trainer:
   check_val_every_n_epoch: 1

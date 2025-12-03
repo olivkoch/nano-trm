@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 import os
 import csv
 import json
@@ -43,27 +43,42 @@ def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
 
 
 def convert_subset(set_name: str, source_repo: str, output_dir: str, 
-                   subsample_size: Optional[int], min_difficulty: Optional[int], num_aug: int) -> int:
-    """Convert a subset and return the number of puzzles generated."""
-    # Read CSV
-    inputs = []
-    labels = []
-    
-    with open(hf_hub_download(source_repo, f"{set_name}.csv", repo_type="dataset"), newline="") as csvfile:
-        reader = csv.reader(csvfile)
-        next(reader)  # Skip header
-        for source, q, a, rating in reader:
-            if (min_difficulty is None) or (int(rating) >= min_difficulty):
-                assert len(q) == 81 and len(a) == 81
-                
-                inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
-                labels.append(np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
+                   subsample_size: Optional[int], min_difficulty: Optional[int], num_aug: int,
+                   preloaded_data: Optional[Tuple] = None) -> Tuple[int, Optional[Tuple]]:
+    """Convert a subset and return the number of puzzles generated and optionally the remaining data."""
+    # Read CSV or use preloaded data
+    if preloaded_data is not None:
+        inputs, labels = preloaded_data
+    else:
+        inputs = []
+        labels = []
+        
+        # Determine source file (val uses test.csv)
+        source_file = "test" if set_name == "val" else set_name
+        
+        with open(hf_hub_download(source_repo, f"{source_file}.csv", repo_type="dataset"), newline="") as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip header
+            for source, q, a, rating in reader:
+                if (min_difficulty is None) or (int(rating) >= min_difficulty):
+                    assert len(q) == 81 and len(a) == 81
+                    
+                    inputs.append(np.frombuffer(q.replace('.', '0').encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
+                    labels.append(np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord('0'))
 
     # If subsample_size is specified, randomly sample the desired number of examples.
+    remaining_data = None
     if subsample_size is not None:
         total_samples = len(inputs)
         if subsample_size < total_samples:
             indices = np.random.choice(total_samples, size=subsample_size, replace=False)
+            mask = np.ones(total_samples, dtype=bool)
+            mask[indices] = False
+            remaining_indices = np.where(mask)[0]
+            
+            # Keep remaining data for potential next split
+            remaining_data = ([inputs[i] for i in remaining_indices], [labels[i] for i in remaining_indices])
+            
             inputs = [inputs[i] for i in indices]
             labels = [labels[i] for i in indices]
 
@@ -88,7 +103,9 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
     def _seq_to_numpy(seq):
         arr = np.concatenate(seq).reshape(len(seq), -1)
         assert np.all((arr >= 0) & (arr <= 9))
-        return arr + 1
+        # Encoding: 0 (blank) -> 2, digits 1-9 -> 3-11
+        # (0=PAD, 1=separator, 2=blank, 3-11=digits 1-9)
+        return arr + 2
     
     inputs_arr = _seq_to_numpy(all_inputs)
     labels_arr = _seq_to_numpy(all_labels)
@@ -130,7 +147,7 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
     print(f"  - inputs: {inputs_arr.shape}")
     print(f"  - labels: {labels_arr.shape}")
     
-    return num_puzzles
+    return num_puzzles, remaining_data
 
 
 @click.command()
@@ -145,11 +162,18 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
                     min_difficulty: Optional[int], num_aug: int, test_ratio: float, seed: int):
     np.random.seed(seed)
     
-    num_train = convert_subset("train", source_repo, output_dir, subsample_size, min_difficulty, num_aug)
+    num_train, _ = convert_subset("train", source_repo, output_dir, subsample_size, min_difficulty, num_aug)
     
-    # Test set size is a percentage of training size
-    test_subsample_size = int(num_train * test_ratio)
-    num_test = convert_subset("test", source_repo, output_dir, test_subsample_size, min_difficulty, num_aug=0)
+    # Val and test sets are taken from test.csv (no leakage with training)
+    # Each is test_ratio * num_train in size
+    eval_subsample_size = int(num_train * test_ratio)
+    
+    # Generate val set, keeping remaining data for test
+    num_val, remaining_data = convert_subset("val", source_repo, output_dir, eval_subsample_size, min_difficulty, num_aug=0)
+    
+    # Generate test set from remaining pool
+    num_test, _ = convert_subset("test", source_repo, output_dir, eval_subsample_size, min_difficulty, num_aug=0, 
+                                  preloaded_data=remaining_data)
     
     # Save global metadata
     overall_meta = {
@@ -158,7 +182,7 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
         "vocab_size": 12,
         "seq_len": 81,
         "num_train": num_train,
-        "num_val": 0,
+        "num_val": num_val,
         "num_test": num_test,
         "seed": seed,
     }

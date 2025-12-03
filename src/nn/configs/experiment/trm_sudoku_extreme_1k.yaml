@@ -1,38 +1,38 @@
 # @package _global_
 
 defaults:
-  - override /data: sudoku_6x6_hybrid
+  - override /data: sudoku_extreme_1k
   - override /model: trm
   - override /callbacks: default
   - override /trainer: gpu
 
-tags: ["sudoku", "trm"]
+tags: ["sudoku", "trm", "extreme"]
 
 timekeeping:
-  max_epochs: 900
+  max_epochs: 50000
   batch_size: 768
   num_workers: 0
 
 model_tuning:
-  learning_rate: 1e-3
-  learning_rate_emb: 1e-2
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-4
   warmup_steps: 2000
-  weight_decay: 0.1
+  weight_decay: 1.0
   lr_min_ratio: 1.0
   num_heads: 8
   halt_exploration_prob: 0.1
-  N_supervision: 6
-  N_supervision_val: 16
+  N_supervision: 16
+  N_supervision_val: 128
   H_cycles: 3
-  L_cycles: 1
-  num_layers: 1
+  L_cycles: 6
+  num_layers: 2
   max_steps: 0
   puzzle_emb_dim: 0
   puzzle_emb_len: 0
-  hidden_size: 256
-  ffn_expansion: 2
+  hidden_size: 512
+  ffn_expansion: 4
   rope_theta: 10000
-  use_2d_rope: false
+  use_2d_rope: true
   use_sigreg: true
 
 trainer:

@@ -15,8 +15,6 @@ import torch.nn.functional as F
 
 from src.nn.modules.trm_block import (
     apply_rotary_pos_emb,
-    RotaryEmbedding,
-    RotaryEmbedding2D,
 )
 from src.nn.modules.utils import trunc_normal_init_
 
@@ -186,15 +184,13 @@ class KMEMLP(nn.Module):
         """Transform atoms through MLP with residual."""
         gate, up = self.gate_up(state.atoms).chunk(2, dim=-1)
         delta = self.down(F.silu(gate) * up)
+        new_atoms = state.atoms + delta
 
-        # NEW: Update weights based on atom features
-        atom_features = state.atoms.mean(dim=2)  # [B, S, d_base]
-        log_weight_delta = self.w_proj(atom_features)  # [B, S, num_atoms]
+        # Update weights based on atom features
+        atom_features = new_atoms.mean(dim=2)  # [B, S, d_base]
+        log_weight_delta = self.w_proj(atom_features)
         
-        return KMEState(
-            state.atoms + delta,
-            state.log_weights + log_weight_delta
-        )
+        return KMEState(new_atoms, state.log_weights + log_weight_delta)
 
 class KMEAttention(nn.Module):
     """
@@ -223,10 +219,10 @@ class KMEAttention(nn.Module):
         self.v_proj = nn.Linear(d_base, num_heads * d_base, bias=False)
         self.o_proj = nn.Linear(num_heads * d_base, d_base, bias=False)
         
-        n_freq = self.head_dim // 2
-        frequencies = torch.randn(num_heads, d_base, n_freq) / bandwidth
-        self.register_buffer('frequencies', frequencies)
-        self.rff_scale = 1.0 / math.sqrt(n_freq)
+        # n_freq = self.head_dim // 2
+        # frequencies = torch.randn(num_heads, d_base, n_freq) / bandwidth
+        # self.register_buffer('frequencies', frequencies)
+        # self.rff_scale = 1.0 / math.sqrt(n_freq)
         
         self.attn_scale = 1.0 / math.sqrt(self.head_dim)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -236,6 +232,17 @@ class KMEAttention(nn.Module):
         with torch.no_grad():
             self.w_proj.weight.mul_(0.1)  # Small init
     
+    def encode_batched(
+        self,
+        atoms: torch.Tensor,    # [B, S, M, num_heads, d_base]
+        weights: torch.Tensor,  # [B, S, M]
+    ) -> torch.Tensor:
+        """Direct weighted mean instead of RFF."""
+        # Weighted mean over atoms: [B, S, H, d_base]
+        z = torch.einsum('bsmhd,bsm->bshd', atoms, weights)
+        # Transpose to [B, H, S, d_base] for attention
+        return z.transpose(1, 2)
+
     def rff_encode_batched(
         self,
         atoms: torch.Tensor,    # [B, S, M, num_heads, d_base]
@@ -279,9 +286,11 @@ class KMEAttention(nn.Module):
         v_atoms = self.v_proj(value.atoms).view(B, S_kv, M, self.num_heads, self.d_base)
         
         # Batched RFF encode for Q and K: [B, num_heads, S, head_dim]
-        q_enc = self.rff_encode_batched(q_atoms, q_weights)
-        k_enc = self.rff_encode_batched(k_atoms, k_weights)
-        
+        # q_enc = self.rff_encode_batched(q_atoms, q_weights)
+        # k_enc = self.rff_encode_batched(k_atoms, k_weights)
+        q_enc = self.encode_batched(q_atoms, q_weights)
+        k_enc = self.encode_batched(k_atoms, k_weights)
+
         # Apply RoPE if provided
         if cos_sin is not None:
             cos, sin = cos_sin
@@ -301,10 +310,7 @@ class KMEAttention(nn.Module):
         attn_weights = self.dropout(attn_weights)
         
         # Aggregate value atoms weighted by attention
-        # v_atoms: [B, S_kv, M, H, d_base] -> [B, H, S_kv, M, d_base]
-        v_atoms_t = v_atoms.permute(0, 3, 1, 2, 4)
-        
-        # [B, H, S_q, S_kv] @ [B, H, S_kv, M, d_base] -> [B, H, S_q, M, d_base]
+        v_atoms_t = v_atoms.permute(0, 3, 1, 2, 4)  # [B, H, S_kv, M, d_base]
         out_atoms = torch.einsum('bhqk,bhkmd->bhqmd', attn_weights, v_atoms_t)
         
         # Transpose back: [B, S_q, M, H, d_base]
@@ -315,13 +321,36 @@ class KMEAttention(nn.Module):
         out_atoms = self.o_proj(out_atoms)
         
         # Compute weight updates from output atoms
-        # Average across atoms to get per-position features
-        out_features = out_atoms.mean(dim=2)  # [B, S_q, d_base]
-        log_weight_delta = self.w_proj(out_features)  # [B, S_q, num_atoms]
+        out_features = out_atoms.mean(dim=2)
+        log_weight_delta = self.w_proj(out_features)
         
         new_log_weights = query.log_weights + log_weight_delta
 
         return KMEState(out_atoms, new_log_weights)
+        # ============================================================
+        # # Original code with detached attention weights (commented out)
+        # # Aggregate value atoms weighted by attention
+        # # v_atoms: [B, S_kv, M, H, d_base] -> [B, H, S_kv, M, d_base]
+        # v_atoms_t = v_atoms.permute(0, 3, 1, 2, 4)
+        
+        # # [B, H, S_q, S_kv] @ [B, H, S_kv, M, d_base] -> [B, H, S_q, M, d_base]
+        # out_atoms = torch.einsum('bhqk,bhkmd->bhqmd', attn_weights, v_atoms_t)
+        
+        # # Transpose back: [B, S_q, M, H, d_base]
+        # out_atoms = out_atoms.permute(0, 2, 3, 1, 4)
+        
+        # # Merge heads: [B, S_q, M, num_heads * d_base] -> [B, S_q, M, d_base]
+        # out_atoms = out_atoms.reshape(B, S_q, M, self.num_heads * self.d_base)
+        # out_atoms = self.o_proj(out_atoms)
+        
+        # # Compute weight updates from output atoms
+        # # Average across atoms to get per-position features
+        # out_features = out_atoms.mean(dim=2)  # [B, S_q, d_base]
+        # log_weight_delta = self.w_proj(out_features)  # [B, S_q, num_atoms]
+        
+        # new_log_weights = query.log_weights + log_weight_delta
+
+        # return KMEState(out_atoms, new_log_weights)
 
 
 class KMEReasoningBlock(nn.Module):
@@ -404,14 +433,8 @@ class KMEReasoningModule(nn.Module):
         context: KMEState,
         cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> KMEState:
-        # Input injection: combine state with context
-        state = KMEState(
-            atoms=state.atoms + context.atoms,
-            log_weights=state.log_weights,
-        )
-        
         for layer in self.layers:
-            state = layer(state, cos_sin=cos_sin)
+            state = layer(state, context=context, cos_sin=cos_sin)
         
         return state
 
@@ -428,14 +451,20 @@ class KMEOutputHead(nn.Module):
         bandwidth: float = 1.0,
     ):
         super().__init__()
-        
-        self.encoder = RFFEncoder(d_base, hidden_size, bandwidth)
-        self.proj = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.atom_proj = nn.Linear(d_base, hidden_size, bias=False)
+        self.out_proj = nn.Linear(hidden_size, vocab_size, bias=False)
+        # self.encoder = RFFEncoder(d_base, hidden_size, bandwidth)
+        # self.proj = nn.Linear(hidden_size, vocab_size, bias=False)
     
     def forward(self, state: KMEState) -> torch.Tensor:
         """state → [B, S, vocab_size] logits"""
-        z = self.encoder(state)
-        return self.proj(z)
+        # [B, S, M, d_base] → [B, S, M, hidden]
+        atom_hidden = self.atom_proj(state.atoms)
+        # Weighted sum: [B, S, hidden]
+        z = torch.einsum('bsmh,bsm->bsh', atom_hidden, state.weights)
+        return self.out_proj(z)
+        # z = self.encoder(state)
+        # return self.proj(z)
 
 
 class KMEQHead(nn.Module):

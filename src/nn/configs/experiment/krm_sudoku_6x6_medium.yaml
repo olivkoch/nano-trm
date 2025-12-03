@@ -1,0 +1,51 @@
+# @package _global_
+
+defaults:
+  - override /data: sudoku_6x6_medium
+  - override /model: krm
+  - override /callbacks: default
+  - override /trainer: gpu
+
+tags: ["sudoku", "krm", "medium"]
+
+timekeeping:
+  max_epochs: 450
+  batch_size: 768
+  num_workers: 0
+
+model_tuning:
+  d_base: 32
+  num_atoms: 4
+  num_layers: 2
+  num_heads: 4
+  ffn_expansion: 4
+  hidden_size: 512
+
+  # TRM cycles
+  H_cycles: 3
+  L_cycles: 6
+  N_supervision: 6
+  N_supervision_val: 16
+
+  # Training
+  learning_rate: 1e-3
+  learning_rate_emb: 1e-2
+  weight_decay: 0.01
+  warmup_steps: 200
+  max_steps: 100000
+  halt_exploration_prob: 0.1
+  lr_min_ratio: 1.0
+
+  # Position encoding
+  rope_theta: 10000
+  use_2d_rope: false
+
+  # Puzzle embeddings
+  puzzle_emb_dim: 0
+  puzzle_emb_len: 0
+
+trainer:
+  check_val_every_n_epoch: 1
+
+save_dir: /tmp/ml-experiments
+append_wandb_name_to_save_dir: true

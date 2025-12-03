@@ -14,25 +14,26 @@ timekeeping:
   num_workers: 0
 
 model_tuning:
+  d_model: 256
   d_base: 32
-  num_atoms: 4
-  num_layers: 2
+  num_atoms: 8
+  num_layers: 4
   num_heads: 4
   ffn_expansion: 4
   hidden_size: 512
 
   # TRM cycles
   H_cycles: 3
-  L_cycles: 6
+  L_cycles: 5
   N_supervision: 6
   N_supervision_val: 16
 
   # Training
-  learning_rate: 1e-3
-  learning_rate_emb: 1e-2
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-4
   weight_decay: 0.01
   warmup_steps: 200
-  max_steps: 100000
+  max_steps: 0
   halt_exploration_prob: 0.1
   lr_min_ratio: 1.0
 

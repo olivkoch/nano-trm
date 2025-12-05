@@ -2,9 +2,9 @@
 
 This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1). 
 
-It provides a better setup for experimentation (uv, lightning, hydra) and simpler datasets allowing to train a TRM on Sudoku 6x6 in a few minutes on an A10.
+It provides a clean setup for experimentation (uv, lightning, hydra) and small datasets allowing to train a TRM on Sudoku 6x6 in a few minutes on an A10.
 
-All valuable implementation tricks of the original codebase have been kept.
+All valuable implementation tricks of the original codebase have been kept (sparse embeddings, carry, etc.)
 
 Reference [code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
 

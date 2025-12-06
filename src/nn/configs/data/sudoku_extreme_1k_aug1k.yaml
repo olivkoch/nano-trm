@@ -11,5 +11,5 @@ max_grid_size: 9
 min_givens: null
 max_givens: null
 seed: 42
-data_dir: ./data/sudoku_cross_6x6_9x9
+data_dir: ./data/sudoku-extreme-1k-aug-1k
 pad_value: 0

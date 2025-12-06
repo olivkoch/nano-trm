@@ -21,6 +21,7 @@ rope_theta: ${model_tuning.rope_theta}
 use_2d_rope: ${model_tuning.use_2d_rope}
 lr_min_ratio: ${model_tuning.lr_min_ratio}
 use_sigreg: ${model_tuning.use_sigreg}
+use_constant_lr: ${model_tuning.use_constant_lr}
 output_dir: None
 
 # Should be set from datamodule

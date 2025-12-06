@@ -97,50 +97,112 @@ class RFFEncoder(nn.Module):
         return torch.einsum('bsmh,bsm->bsh', phi_atoms, state.weights)
 
 
-class KMETokenEmbedding(nn.Module):
+class KMECategoricalEmbedding(nn.Module):
     """
-    Embed discrete tokens as KME distributions.
+    Embed tokens as KME distributions.
     
-    Each token has num_atoms learned atoms and weights in base space.
+    - Special tokens (pad, EOS, empty): learnable embeddings
+    - Digit tokens: orthogonal categorical embeddings for generalization
     """
     
     def __init__(
         self,
-        vocab_size: int,
         d_base: int,
         num_atoms: int,
-        init_std: float = 0.5,
+        vocab_size: int = 12,
+        pad_token: int = 0,
+        eos_token: int = 1,
+        empty_token: int = 2,
+        digit_token_start: int = 3,  # Token 3 = digit 1
     ):
         super().__init__()
-        self.vocab_size = vocab_size
         self.d_base = d_base
         self.num_atoms = num_atoms
+        self.vocab_size = vocab_size
+        self.pad_token = pad_token
+        self.eos_token = eos_token
+        self.empty_token = empty_token
+        self.digit_token_start = digit_token_start
         
-        # Store as 2D for F.embedding: [vocab, num_atoms * d_base]
-        self.atom_embeddings = nn.Parameter(
-            trunc_normal_init_(
-                torch.empty(vocab_size, num_atoms * d_base),
-                std=init_std
-            )
-        )
+        # Number of digit tokens (tokens 3-11 = digits 1-9)
+        self.num_digits = vocab_size - digit_token_start
         
-        # Weight embeddings: [vocab, num_atoms]
-        self.log_weight_embeddings = nn.Parameter(
-            torch.zeros(vocab_size, num_atoms)
-        )
+        # Orthogonal encodings for digits (equidistant, categorical)
+        digit_enc = self._create_orthogonal_encoding(self.num_digits, d_base)
+        self.register_buffer('digit_encoding', digit_enc)
+        
+        # Learnable embeddings for special tokens
+        self.pad_embedding = nn.Parameter(torch.zeros(d_base))  # Zero for padding
+        self.eos_embedding = nn.Parameter(torch.randn(d_base) * 0.5)
+        self.empty_embedding = nn.Parameter(torch.randn(d_base) * 0.5)
+        
+        # Shared learnable atom offsets: [num_atoms, d_base]
+        self.atom_offsets = nn.Parameter(torch.randn(num_atoms, d_base) * 1.0)
+        
+        # Per-token log weights: [vocab_size, num_atoms]
+        self.log_weights = nn.Parameter(torch.zeros(vocab_size, num_atoms))
+    
+    def _create_orthogonal_encoding(self, num_tokens: int, d_base: int) -> torch.Tensor:
+        """Create maximally separated encodings."""
+        generator = torch.Generator().manual_seed(42)
+        
+        if num_tokens <= d_base:
+            random_matrix = torch.randn(d_base, d_base, generator=generator)
+            Q, _ = torch.linalg.qr(random_matrix)
+            encoding = Q[:num_tokens]
+        else:
+            encoding = torch.randn(num_tokens, d_base, generator=generator)
+            encoding = F.normalize(encoding, dim=-1)
+        
+        return encoding
     
     def forward(self, token_ids: torch.Tensor) -> KMEState:
         """
-        token_ids: [batch, seq] of integers
-        Returns: KMEState with atoms [batch, seq, num_atoms, d_base]
+        token_ids: [B, S] integers in range [0, vocab_size)
+        Returns: KMEState with atoms [B, S, num_atoms, d_base]
         """
         B, S = token_ids.shape
+        device = token_ids.device
         
-        # Lookup and reshape: [B, S, num_atoms * d_base] -> [B, S, num_atoms, d_base]
-        atoms_flat = F.embedding(token_ids, self.atom_embeddings)
-        atoms = atoms_flat.view(B, S, self.num_atoms, self.d_base)
+        # Start with zeros
+        base = torch.zeros(B, S, self.d_base, device=device)
         
-        log_weights = F.embedding(token_ids, self.log_weight_embeddings)
+        # Pad token (0) - keep as zeros
+        # (no action needed, already zeros)
+        
+        # EOS token (1)
+        eos_mask = (token_ids == self.eos_token)
+        base = torch.where(
+            eos_mask.unsqueeze(-1),
+            self.eos_embedding.expand(B, S, -1),
+            base
+        )
+        
+        # Empty token (2)
+        empty_mask = (token_ids == self.empty_token)
+        base = torch.where(
+            empty_mask.unsqueeze(-1),
+            self.empty_embedding.expand(B, S, -1),
+            base
+        )
+        
+        # Digit tokens (3+)
+        digit_mask = (token_ids >= self.digit_token_start)
+        if digit_mask.any():
+            # Map token_id to digit index: token 3 -> index 0, token 4 -> index 1, etc.
+            digit_indices = (token_ids - self.digit_token_start).clamp(min=0, max=self.num_digits - 1)
+            digit_base = self.digit_encoding[digit_indices]  # [B, S, d_base]
+            base = torch.where(
+                digit_mask.unsqueeze(-1),
+                digit_base,
+                base
+            )
+        
+        # Atoms = base + shared offsets: [B, S, num_atoms, d_base]
+        atoms = base.unsqueeze(2) + self.atom_offsets.unsqueeze(0).unsqueeze(0)
+        
+        # Per-token weights: [B, S, num_atoms]
+        log_weights = F.embedding(token_ids, self.log_weights)
         
         return KMEState(atoms, log_weights)
 
@@ -494,3 +556,410 @@ class KMEQHead(nn.Module):
         """
         z = self.encoder(state)  # [B, S, hidden]
         return self.proj(z[:, position])
+    
+# Add to src/nn/modules/kme.py
+
+# class KernelKMEAttention(nn.Module):
+#     """
+#     True kernel-based KME attention.
+#     score(q, k) = ⟨μ_q, μ_k⟩_H = Σᵢⱼ wᵢ^q wⱼ^k k(aᵢ^q, aⱼ^k)
+#     """
+    
+#     def __init__(
+#         self,
+#         d_base: int,
+#         num_atoms: int,
+#         num_heads: int,
+#         init_bandwidth: float = 1.0,
+#         dropout: float = 0.0,
+#     ):
+#         super().__init__()
+#         self.d_base = d_base
+#         self.num_atoms = num_atoms
+#         self.num_heads = num_heads
+        
+#         self.q_proj = nn.Linear(d_base, num_heads * d_base, bias=False)
+#         self.k_proj = nn.Linear(d_base, num_heads * d_base, bias=False)
+#         self.v_proj = nn.Linear(d_base, num_heads * d_base, bias=False)
+#         self.o_proj = nn.Linear(num_heads * d_base, d_base, bias=False)
+        
+#         # Learnable bandwidth per head
+#         self.log_bandwidth = nn.Parameter(
+#             torch.full((num_heads,), math.log(init_bandwidth))
+#         )
+#         # self.log_kernel_scale = nn.Parameter(torch.zeros(num_heads))
+#         self.log_kernel_scale = nn.Parameter(
+#            torch.full((num_heads,), math.log(math.sqrt(d_base)))
+#         )
+        
+#         self.w_proj = nn.Linear(d_base, num_atoms, bias=False)
+#         with torch.no_grad():
+#             self.w_proj.weight.mul_(0.1)
+        
+#         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+    
+#     def kernel_inner_product_fast_approx(
+#         self,
+#         q_atoms: torch.Tensor,  # [B, H, S_q, M, D]
+#         k_atoms: torch.Tensor,  # [B, H, S_k, M, D]
+#         q_weights: torch.Tensor,  # [B, S_q, M]
+#         k_weights: torch.Tensor,  # [B, S_k, M]
+#     ) -> torch.Tensor:
+#         """
+#         Memory-efficient kernel inner product.
+#         Returns LOG kernel scores (not kernel values) for proper softmax behavior.
+#         """
+#         B, H, S_q, M, D = q_atoms.shape
+#         S_k = k_atoms.shape[2]
+        
+#         bandwidth_sq = (self.log_bandwidth.exp() ** 2).view(1, H, 1, 1)
+        
+#         # Weighted mean atoms
+#         q_w = q_weights.unsqueeze(1).unsqueeze(-1)
+#         k_w = k_weights.unsqueeze(1).unsqueeze(-1)
+        
+#         q_mean = (q_atoms * q_w).sum(dim=3)  # [B, H, S_q, D]
+#         k_mean = (k_atoms * k_w).sum(dim=3)  # [B, H, S_k, D]
+        
+#         # Weighted variance
+#         q_var = ((q_atoms - q_mean.unsqueeze(3)) ** 2 * q_w).sum(dim=(3, 4))
+#         k_var = ((k_atoms - k_mean.unsqueeze(3)) ** 2 * k_w).sum(dim=(3, 4))
+        
+#         # Squared distance between means
+#         q_sq = (q_mean ** 2).sum(dim=-1)
+#         k_sq = (k_mean ** 2).sum(dim=-1)
+#         cross = torch.einsum('bhqd,bhkd->bhqk', q_mean, k_mean)
+        
+#         sq_dist = q_sq.unsqueeze(-1) + k_sq.unsqueeze(-2) - 2 * cross
+#         total_var = q_var.unsqueeze(-1) + k_var.unsqueeze(-2)
+        
+#         # Return LOG kernel scores (negative values), NOT exp()!
+#         # log(exp(-x/2σ²)) = -x/2σ²
+#         log_scores = -(sq_dist + total_var) / (2 * bandwidth_sq)
+        
+#         return log_scores  # Pass these directly to softmax
+    
+#     def apply_rope_to_atoms(
+#         self,
+#         atoms: torch.Tensor,  # [B, H, S, M, D]
+#         cos: torch.Tensor,
+#         sin: torch.Tensor,
+#     ) -> torch.Tensor:
+#         """Apply RoPE to each atom."""
+#         B, H, S, M, D = atoms.shape
+        
+#         # Reshape for RoPE: [B, H, S, M, D] -> [B*M, S, H, D]
+#         atoms_r = atoms.permute(0, 3, 2, 1, 4).reshape(B * M, S, H, D)
+        
+#         # Apply standard RoPE
+#         cos = cos[:S].unsqueeze(0).unsqueeze(2)  # [1, S, 1, D]
+#         sin = sin[:S].unsqueeze(0).unsqueeze(2)
+        
+#         x1 = atoms_r[..., : D // 2]
+#         x2 = atoms_r[..., D // 2 :]
+#         rotated = torch.cat((-x2, x1), dim=-1)
+#         atoms_r = atoms_r * cos + rotated * sin
+        
+#         # Reshape back: [B*M, S, H, D] -> [B, H, S, M, D]
+#         return atoms_r.view(B, M, S, H, D).permute(0, 3, 2, 1, 4)
+    
+#     def forward(
+#         self,
+#         query: KMEState,
+#         key: KMEState,
+#         value: KMEState,
+#         cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+#     ) -> KMEState:
+#         B, S_q, M, D = query.atoms.shape
+#         S_kv = key.atoms.shape[1]
+#         H = self.num_heads
+        
+#         # Project atoms
+#         q_atoms = self.q_proj(query.atoms).view(B, S_q, M, H, D).permute(0, 3, 1, 2, 4)
+#         k_atoms = self.k_proj(key.atoms).view(B, S_kv, M, H, D).permute(0, 3, 1, 2, 4)
+#         v_atoms = self.v_proj(value.atoms).view(B, S_kv, M, H, D).permute(0, 3, 1, 2, 4)
+        
+#         # Apply RoPE to atoms
+#         if cos_sin is not None:
+#             cos, sin = cos_sin
+#             q_atoms = self.apply_rope_to_atoms(q_atoms, cos, sin)
+#             k_atoms = self.apply_rope_to_atoms(k_atoms, cos, sin)
+        
+#         # Get LOG kernel scores (not kernel values!)
+#         log_scores = self.kernel_inner_product_fast_approx(
+#             q_atoms, k_atoms, query.weights, key.weights
+#         )
+        
+#         # Scale like standard attention (optional temperature control)
+#         # log_kernel_scale acts as inverse temperature here
+#         log_scores = log_scores * self.log_kernel_scale.exp().view(1, -1, 1, 1)
+        
+#         # Softmax on log-scores gives proper attention distribution
+#         attn_weights = F.softmax(log_scores, dim=-1)
+#         attn_weights = self.dropout(attn_weights)
+        
+#         # Aggregate values
+#         out_atoms = torch.einsum('bhqk,bhkmd->bhqmd', attn_weights, v_atoms)
+#         out_atoms = out_atoms.permute(0, 2, 3, 1, 4).reshape(B, S_q, M, H * D)
+#         out_atoms = self.o_proj(out_atoms)
+        
+#         # Weight updates
+#         log_weight_delta = self.w_proj(out_atoms.mean(dim=2))
+        
+#         return KMEState(out_atoms, query.log_weights + log_weight_delta)
+
+class KernelKMEAttention(nn.Module):
+    """
+    True MMD attention via Random Fourier Features.
+    
+    ⟨μ_q, μ_k⟩_H ≈ φ̄_qᵀ φ̄_k  where φ̄ = Σᵢ wᵢ φ(aᵢ)
+    """
+    
+    def __init__(
+        self,
+        d_base: int,
+        num_atoms: int,
+        num_heads: int,
+        n_rff_features: int = 64,  # Number of RFF features per head
+        init_bandwidth: float = 1.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_base = d_base
+        self.num_atoms = num_atoms
+        self.num_heads = num_heads
+        self.n_rff = n_rff_features
+        
+        self.q_proj = nn.Linear(d_base, num_heads * d_base, bias=False)
+        self.k_proj = nn.Linear(d_base, num_heads * d_base, bias=False)
+        self.v_proj = nn.Linear(d_base, num_heads * d_base, bias=False)
+        self.o_proj = nn.Linear(num_heads * d_base, d_base, bias=False)
+        
+        # Learnable bandwidth per head
+        self.log_bandwidth = nn.Parameter(
+            torch.full((num_heads,), math.log(init_bandwidth))
+        )
+        
+        # RFF frequencies: ω ~ N(0, I/σ²)
+        # We'll scale by bandwidth at runtime
+        # Shape: [num_heads, d_base, n_rff]
+        self.register_buffer(
+            'rff_freq_base',
+            torch.randn(num_heads, d_base, n_rff_features)
+        )
+        
+        self.rff_scale = 1.0 / math.sqrt(n_rff_features)
+        
+        # Standard attention scale
+        self.attn_scale = 1.0 / math.sqrt(n_rff_features * 2)  # *2 for cos+sin
+        
+        self.w_proj = nn.Linear(d_base, num_atoms, bias=False)
+        with torch.no_grad():
+            self.w_proj.weight.mul_(0.1)
+        
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+    
+    def rff_encode(
+        self,
+        atoms: torch.Tensor,    # [B, H, S, M, D]
+        weights: torch.Tensor,  # [B, S, M]
+    ) -> torch.Tensor:
+        """
+        Encode weighted atoms to RFF mean embedding.
+        
+        Returns: [B, H, S, 2*n_rff] (cos and sin features)
+        """
+        B, H, S, M, D = atoms.shape
+        
+        # Scale frequencies by bandwidth: ω/σ
+        bandwidth = self.log_bandwidth.exp().view(H, 1, 1)  # [H, 1, 1]
+        rff_freq = self.rff_freq_base / bandwidth  # [H, D, n_rff]
+        
+        # Project atoms: [B, H, S, M, D] @ [H, D, n_rff] -> [B, H, S, M, n_rff]
+        proj = torch.einsum('bhsmd,hdf->bhsmf', atoms, rff_freq)
+        
+        # RFF features: φ(x) = [cos(ωᵀx), sin(ωᵀx)]
+        phi = torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)  # [B, H, S, M, 2*n_rff]
+        phi = phi * self.rff_scale
+        
+        # Weighted mean in RFF space: φ̄ = Σᵢ wᵢ φ(aᵢ)
+        # weights: [B, S, M] -> [B, 1, S, M, 1]
+        w = weights.unsqueeze(1).unsqueeze(-1)
+        rff_mean = (phi * w).sum(dim=3)  # [B, H, S, 2*n_rff]
+        
+        return rff_mean
+    
+    def apply_rope_to_rff(
+        self,
+        rff: torch.Tensor,  # [B, H, S, 2*n_rff]
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply RoPE to RFF embeddings."""
+        B, H, S, F = rff.shape
+        
+        # RoPE expects [B, S, H, D]
+        rff = rff.permute(0, 2, 1, 3)  # [B, S, H, F]
+        
+        # Standard RoPE (only on first d_base dimensions, or adapt)
+        # For simplicity, apply to all features
+        cos = cos[:S].unsqueeze(0).unsqueeze(2)  # [1, S, 1, D]
+        sin = sin[:S].unsqueeze(0).unsqueeze(2)
+        
+        # Pad cos/sin to match F if needed
+        if cos.shape[-1] < F:
+            repeats = (F + cos.shape[-1] - 1) // cos.shape[-1]
+            cos = cos.repeat(1, 1, 1, repeats)[..., :F]
+            sin = sin.repeat(1, 1, 1, repeats)[..., :F]
+        
+        x1 = rff[..., :F // 2]
+        x2 = rff[..., F // 2:]
+        rotated = torch.cat((-x2, x1), dim=-1)
+        rff = rff * cos + rotated * sin
+        
+        return rff.permute(0, 2, 1, 3)  # [B, H, S, F]
+    
+    def forward(
+        self,
+        query: KMEState,
+        key: KMEState,
+        value: KMEState,
+        cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> KMEState:
+        B, S_q, M, D = query.atoms.shape
+        S_kv = key.atoms.shape[1]
+        H = self.num_heads
+        
+        # Project atoms
+        q_atoms = self.q_proj(query.atoms).view(B, S_q, M, H, D).permute(0, 3, 1, 2, 4)
+        k_atoms = self.k_proj(key.atoms).view(B, S_kv, M, H, D).permute(0, 3, 1, 2, 4)
+        v_atoms = self.v_proj(value.atoms).view(B, S_kv, M, H, D).permute(0, 3, 1, 2, 4)
+        
+        # Apply RoPE to atoms BEFORE RFF encoding
+        if cos_sin is not None:
+            cos, sin = cos_sin
+            q_atoms = self.apply_rope_to_atoms(q_atoms, cos, sin)
+            k_atoms = self.apply_rope_to_atoms(k_atoms, cos, sin)
+        
+        # Encode to RFF space (position is now baked into atoms)
+        q_rff = self.rff_encode(q_atoms, query.weights)
+        k_rff = self.rff_encode(k_atoms, key.weights)
+        
+        # NO RoPE here - already applied to atoms
+        
+        # Attention scores
+        scores = torch.einsum('bhqf,bhkf->bhqk', q_rff, k_rff)
+        
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Aggregate values
+        out_atoms = torch.einsum('bhqk,bhkmd->bhqmd', attn_weights, v_atoms)
+        out_atoms = out_atoms.permute(0, 2, 3, 1, 4).reshape(B, S_q, M, H * D)
+        out_atoms = self.o_proj(out_atoms)
+        
+        log_weight_delta = self.w_proj(out_atoms.mean(dim=2))
+        
+        return KMEState(out_atoms, query.log_weights + log_weight_delta)
+
+    def apply_rope_to_atoms(
+        self,
+        atoms: torch.Tensor,  # [B, H, S, M, D]
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply RoPE to each atom."""
+        B, H, S, M, D = atoms.shape
+        
+        # Reshape: [B, H, S, M, D] -> [B*M, S, H, D]
+        atoms_r = atoms.permute(0, 3, 2, 1, 4).reshape(B * M, S, H, D)
+        
+        cos = cos[:S].unsqueeze(0).unsqueeze(2)  # [1, S, 1, D]
+        sin = sin[:S].unsqueeze(0).unsqueeze(2)
+        
+        x1 = atoms_r[..., :D // 2]
+        x2 = atoms_r[..., D // 2:]
+        rotated = torch.cat((-x2, x1), dim=-1)
+        atoms_r = atoms_r * cos + rotated * sin
+        
+        # Reshape back: [B*M, S, H, D] -> [B, H, S, M, D]
+        return atoms_r.view(B, M, S, H, D).permute(0, 3, 2, 1, 4)
+    
+class KernelKMEReasoningBlock(nn.Module):
+    """Reasoning block with true kernel attention."""
+    
+    def __init__(
+        self,
+        d_base: int,
+        num_atoms: int,
+        num_heads: int,
+        ffn_expansion: int = 4,
+        init_bandwidth: float = 1.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        
+        self.attn = KernelKMEAttention(
+            d_base=d_base,
+            num_atoms=num_atoms,
+            num_heads=num_heads,
+            init_bandwidth=init_bandwidth,
+            dropout=dropout,
+        )
+        self.mlp = KMEMLP(d_base=d_base, num_atoms=num_atoms, expansion=ffn_expansion)
+        self.norm1 = KMERMSNorm(d_base)
+        self.norm2 = KMERMSNorm(d_base)
+    
+    def forward(
+        self,
+        state: KMEState,
+        context: Optional[KMEState] = None,
+        cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> KMEState:
+        if context is None:
+            context = state
+        
+        attn_out = self.attn(query=state, key=context, value=context, cos_sin=cos_sin)
+        state = KMEState(state.atoms + attn_out.atoms, attn_out.log_weights)
+        state = self.norm1(state)
+        state = self.mlp(state)
+        state = self.norm2(state)
+        return state
+
+
+class KernelKMEReasoningModule(nn.Module):
+    """Stack of kernel reasoning blocks."""
+    
+    def __init__(
+        self,
+        num_layers: int,
+        d_base: int,
+        num_atoms: int,
+        num_heads: int,
+        ffn_expansion: int = 4,
+        init_bandwidth: float = 1.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        
+        self.layers = nn.ModuleList([
+            KernelKMEReasoningBlock(
+                d_base=d_base,
+                num_atoms=num_atoms,
+                num_heads=num_heads,
+                ffn_expansion=ffn_expansion,
+                init_bandwidth=init_bandwidth,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+    
+    def forward(
+        self,
+        state: KMEState,
+        context: KMEState,
+        cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> KMEState:
+        for layer in self.layers:
+            state = layer(state, context=context, cos_sin=cos_sin)
+        return state

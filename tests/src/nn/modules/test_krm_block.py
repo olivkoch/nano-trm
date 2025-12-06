@@ -14,7 +14,7 @@ import math
 from src.nn.modules.krm_block import (
     KMEState,
     RFFEncoder,
-    KMETokenEmbedding,
+    KMECategoricalEmbedding,
     KMERMSNorm,
     KMEMLP,
     KMEAttention,
@@ -61,7 +61,7 @@ def num_heads():
 
 @pytest.fixture
 def vocab_size():
-    return 100
+    return 12  # Default for Sudoku: pad, eos, empty, digits 1-9
 
 
 @pytest.fixture
@@ -129,28 +129,34 @@ class TestKMEStateMathematical:
         assert (weights >= 0).all()
         assert torch.allclose(weights.sum(dim=-1), torch.ones_like(weights.sum(dim=-1)), atol=1e-5)
 
+
 # =============================================================================
-# KMETokenEmbedding Mathematical Properties
+# KMECategoricalEmbedding Mathematical Properties
 # =============================================================================
 
-class TestKMETokenEmbeddingMathematical:
+class TestKMECategoricalEmbeddingMathematical:
     """
-    Test mathematical properties of KME token embeddings.
+    Test mathematical properties of KME categorical embeddings.
     
     Each token is embedded as a distribution in base space:
     - Token i → μᵢ = Σⱼ wᵢⱼ δ(aᵢⱼ)
-    - aᵢⱼ ∈ ℝ^d_base are the atoms
+    - aᵢⱼ ∈ ℝ^d_base are the atoms (base + shared offsets)
     - wᵢⱼ form a probability simplex (non-negative, sum to 1)
+    
+    Key properties:
+    - Special tokens (pad, eos, empty) have learnable base embeddings
+    - Digit tokens have fixed orthogonal base encodings for generalization
+    - All tokens share the same atom offsets
     """
     
     def test_each_token_is_valid_distribution(
         self, vocab_size, d_base, num_atoms, batch_size, seq_len, device
     ):
         """Each token should map to a valid probability distribution."""
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
+            vocab_size=vocab_size,
         ).to(device)
         
         # Embed all tokens
@@ -171,13 +177,13 @@ class TestKMETokenEmbeddingMathematical:
         self, vocab_size, d_base, num_atoms, device
     ):
         """Same token should always produce identical embedding."""
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
+            vocab_size=vocab_size,
         ).to(device)
         
-        token_id = 42
+        token_id = 5  # A digit token
         tokens1 = torch.tensor([[token_id, token_id, token_id]], device=device)
         tokens2 = torch.tensor([[token_id]], device=device)
         
@@ -192,100 +198,201 @@ class TestKMETokenEmbeddingMathematical:
         assert torch.allclose(state1.atoms[0, 0], state2.atoms[0, 0])
         assert torch.allclose(state1.log_weights[0, 0], state2.log_weights[0, 0])
     
-    def test_different_tokens_span_space(
+    def test_different_tokens_have_different_embeddings(
         self, vocab_size, d_base, num_atoms, device
     ):
-        """Different tokens should (generally) map to different distributions."""
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        """Different tokens should map to different distributions."""
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
+            vocab_size=vocab_size,
         ).to(device)
         
-        # Sample random pairs of tokens
-        n_pairs = 50
-        tokens1 = torch.randint(0, vocab_size, (n_pairs,), device=device)
-        tokens2 = torch.randint(0, vocab_size, (n_pairs,), device=device)
+        # Test pairs: (pad, eos), (empty, digit), (digit1, digit2)
+        test_pairs = [
+            (0, 1),   # pad vs eos
+            (2, 3),   # empty vs digit 1
+            (3, 4),   # digit 1 vs digit 2
+            (5, 9),   # digit 3 vs digit 7
+        ]
         
-        # Ensure they're different
-        mask = tokens1 != tokens2
-        tokens1 = tokens1[mask][:20]
-        tokens2 = tokens2[mask][:20]
-        
-        state1 = embedding(tokens1.unsqueeze(0))
-        state2 = embedding(tokens2.unsqueeze(0))
-        
-        # Count how many pairs have different embeddings
-        different_count = 0
-        for i in range(len(tokens1)):
-            if not torch.allclose(state1.atoms[0, i], state2.atoms[0, i], atol=1e-5):
-                different_count += 1
-        
-        # Most pairs should be different (all, with random init)
-        assert different_count == len(tokens1), \
-            f"Only {different_count}/{len(tokens1)} token pairs have different embeddings"
+        for t1, t2 in test_pairs:
+            if t1 >= vocab_size or t2 >= vocab_size:
+                continue
+            tokens = torch.tensor([[t1, t2]], device=device)
+            state = embedding(tokens)
+            
+            # Atoms should be different (different base encodings)
+            assert not torch.allclose(state.atoms[0, 0], state.atoms[0, 1], atol=1e-5), \
+                f"Tokens {t1} and {t2} should have different embeddings"
     
-    def test_embedding_atoms_are_learnable(
-        self, vocab_size, d_base, num_atoms, device
+    def test_digit_encodings_are_orthogonal(
+        self, d_base, num_atoms, device
     ):
-        """Atom embeddings should receive gradients."""
-        embedding = KMETokenEmbedding(
+        """Digit token base encodings should be orthogonal (equidistant)."""
+        vocab_size = 12
+        embedding = KMECategoricalEmbedding(
+            d_base=d_base,
+            num_atoms=num_atoms,
             vocab_size=vocab_size,
+        ).to(device)
+        
+        # Get digit encodings from buffer
+        digit_enc = embedding.digit_encoding  # [num_digits, d_base]
+        num_digits = digit_enc.shape[0]
+        
+        # Normalize for cosine similarity
+        digit_enc_norm = F.normalize(digit_enc, dim=-1)
+        
+        # Compute pairwise similarities
+        similarities = digit_enc_norm @ digit_enc_norm.T
+        
+        # Diagonal should be 1 (self-similarity)
+        assert torch.allclose(similarities.diag(), torch.ones(num_digits, device=device), atol=1e-5)
+        
+        # Off-diagonal should be ~0 for orthogonal vectors (if d_base >= num_digits)
+        if d_base >= num_digits:
+            mask = ~torch.eye(num_digits, dtype=torch.bool, device=device)
+            off_diag = similarities[mask]
+            assert off_diag.abs().max() < 0.1, \
+                f"Digit encodings should be orthogonal, max similarity: {off_diag.abs().max():.3f}"
+    
+    def test_digit_encodings_are_deterministic_across_instances(
+        self, d_base, num_atoms, device
+    ):
+        """Digit encodings should be identical across different embedding instances (fixed seed)."""
+        emb1 = KMECategoricalEmbedding(d_base=d_base, num_atoms=num_atoms).to(device)
+        emb2 = KMECategoricalEmbedding(d_base=d_base, num_atoms=num_atoms).to(device)
+        
+        # Digit encodings should be identical (fixed seed=42)
+        assert torch.allclose(emb1.digit_encoding, emb2.digit_encoding), \
+            "Digit encodings should be deterministic across instances"
+    
+    def test_pad_token_produces_zero_base(
+        self, d_base, num_atoms, device
+    ):
+        """Pad token (0) should have zero base embedding."""
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
         ).to(device)
         
-        tokens = torch.tensor([[0, 1, 2]], device=device)
+        # Pad embedding should be zeros
+        assert torch.allclose(embedding.pad_embedding, torch.zeros(d_base, device=device)), \
+            "Pad embedding should be zero"
+        
+        # When embedded, atoms should equal just the offsets
+        pad_tokens = torch.tensor([[0]], device=device)
+        state = embedding(pad_tokens)
+        
+        expected_atoms = embedding.atom_offsets.unsqueeze(0).unsqueeze(0)  # [1, 1, M, d_base]
+        assert torch.allclose(state.atoms, expected_atoms), \
+            "Pad token atoms should equal just the atom offsets"
+    
+    def test_shared_atom_offsets(
+        self, vocab_size, d_base, num_atoms, device
+    ):
+        """All tokens should share the same atom offsets structure."""
+        embedding = KMECategoricalEmbedding(
+            d_base=d_base,
+            num_atoms=num_atoms,
+            vocab_size=vocab_size,
+        ).to(device)
+        
+        # Embed multiple tokens
+        tokens = torch.tensor([[1, 3, 5, 7]], device=device)  # eos, digit1, digit3, digit5
+        state = embedding(tokens)
+        
+        # For each pair of tokens, the difference in atoms should be constant across atom indices
+        # Because atoms = base + offsets, and offsets are shared
+        for i in range(state.atoms.shape[1]):
+            for j in range(i + 1, state.atoms.shape[1]):
+                diff = state.atoms[0, i] - state.atoms[0, j]  # [num_atoms, d_base]
+                # All atoms should have same diff (since offsets are shared)
+                diff_var = diff.var(dim=0).mean()
+                assert diff_var < 1e-10, \
+                    f"Atom differences should be constant, variance: {diff_var:.2e}"
+    
+    def test_atom_offsets_are_learnable(
+        self, vocab_size, d_base, num_atoms, device
+    ):
+        """Atom offsets should receive gradients."""
+        embedding = KMECategoricalEmbedding(
+            d_base=d_base,
+            num_atoms=num_atoms,
+            vocab_size=vocab_size,
+        ).to(device)
+        
+        tokens = torch.tensor([[0, 1, 5]], device=device)  # pad, eos, digit3
         state = embedding(tokens)
         
         loss = state.atoms.sum()
         loss.backward()
         
-        # Check gradients exist for accessed tokens
-        assert embedding.atom_embeddings.grad is not None
-        
-        # Gradient should be non-zero for accessed tokens
-        # The embedding is stored as [vocab, num_atoms * d_base]
-        grad_reshaped = embedding.atom_embeddings.grad.view(vocab_size, num_atoms, d_base)
-        
-        for token_id in [0, 1, 2]:
-            assert grad_reshaped[token_id].abs().sum() > 0, \
-                f"Token {token_id} should have non-zero gradient"
+        # Atom offsets should have gradients
+        assert embedding.atom_offsets.grad is not None
+        assert embedding.atom_offsets.grad.abs().sum() > 0, \
+            "Atom offsets should have non-zero gradient"
     
-    def test_embedding_weights_are_learnable(
-        self, vocab_size, d_base, num_atoms, device
+    def test_special_token_embeddings_are_learnable(
+        self, d_base, num_atoms, device
     ):
-        """Log-weight embeddings should receive gradients."""
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        """Special token embeddings (eos, empty) should receive gradients."""
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
         ).to(device)
+        
+        # Use eos and empty tokens
+        tokens = torch.tensor([[1, 2]], device=device)  # eos, empty
+        state = embedding(tokens)
+        
+        loss = state.atoms.sum()
+        loss.backward()
+        
+        # Check eos embedding has gradient
+        assert embedding.eos_embedding.grad is not None
+        assert embedding.eos_embedding.grad.abs().sum() > 0, \
+            "EOS embedding should have non-zero gradient"
+        
+        # Check empty embedding has gradient
+        assert embedding.empty_embedding.grad is not None
+        assert embedding.empty_embedding.grad.abs().sum() > 0, \
+            "Empty embedding should have non-zero gradient"
+    
+    def test_log_weights_are_learnable(
+        self, vocab_size, d_base, num_atoms, device
+    ):
+        """Log-weight embeddings should receive gradients."""
+        embedding = KMECategoricalEmbedding(
+            d_base=d_base,
+            num_atoms=num_atoms,
+            vocab_size=vocab_size,
+        ).to(device)
 
-        tokens = torch.tensor([[5, 10, 15]], device=device)
+        tokens = torch.tensor([[3, 5, 7]], device=device)  # digit tokens
         state = embedding(tokens)
 
-        # Loss that actually depends on weight distribution
-        # Weighted sum of atom norms - this creates gradient through weights
+        # Loss that depends on weight distribution
         atom_norms = state.atoms.norm(dim=-1)  # [1, 3, num_atoms]
         loss = (state.weights * atom_norms).sum()
         loss.backward()
 
-        assert embedding.log_weight_embeddings.grad is not None
+        assert embedding.log_weights.grad is not None
 
         # Check accessed tokens have gradients
-        for token_id in [5, 10, 15]:
-            assert embedding.log_weight_embeddings.grad[token_id].abs().sum() > 0, \
+        for token_id in [3, 5, 7]:
+            assert embedding.log_weights.grad[token_id].abs().sum() > 0, \
                 f"Token {token_id} log_weights should have non-zero gradient"
     
-    def test_unused_tokens_no_gradient(
+    def test_unused_tokens_no_weight_gradient(
         self, vocab_size, d_base, num_atoms, device
     ):
-        """Tokens not in batch should not receive gradients (sparse update)."""
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        """Tokens not in batch should not receive weight gradients."""
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
+            vocab_size=vocab_size,
         ).to(device)
         
         # Only use tokens 0, 1, 2
@@ -295,30 +402,28 @@ class TestKMETokenEmbeddingMathematical:
         loss = state.atoms.sum() + state.log_weights.sum()
         loss.backward()
         
-        # Tokens not used should have zero gradient
-        grad_atoms = embedding.atom_embeddings.grad.view(vocab_size, num_atoms * d_base)
-        grad_weights = embedding.log_weight_embeddings.grad
-        
-        for token_id in [3, 10, 50, vocab_size - 1]:
-            assert torch.allclose(grad_atoms[token_id], torch.zeros_like(grad_atoms[token_id])), \
-                f"Unused token {token_id} should have zero atom gradient"
-            assert torch.allclose(grad_weights[token_id], torch.zeros_like(grad_weights[token_id])), \
-                f"Unused token {token_id} should have zero weight gradient"
+        # Tokens not used should have zero weight gradient
+        for token_id in [3, 5, 8, vocab_size - 1]:
+            if token_id < vocab_size:
+                assert torch.allclose(
+                    embedding.log_weights.grad[token_id], 
+                    torch.zeros_like(embedding.log_weights.grad[token_id])
+                ), f"Unused token {token_id} should have zero weight gradient"
     
-    def test_initial_weights_near_uniform(
+    def test_initial_weights_are_uniform(
         self, vocab_size, d_base, num_atoms, device
     ):
-        """Initial log_weights should be near zero (uniform distribution)."""
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        """Initial log_weights should be zero (uniform distribution)."""
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
+            vocab_size=vocab_size,
         ).to(device)
         
-        # Check raw log_weight_embeddings
+        # Check raw log_weights
         assert torch.allclose(
-            embedding.log_weight_embeddings,
-            torch.zeros_like(embedding.log_weight_embeddings),
+            embedding.log_weights,
+            torch.zeros_like(embedding.log_weights),
             atol=1e-5
         ), "Initial log_weights should be zero (uniform)"
         
@@ -333,53 +438,6 @@ class TestKMETokenEmbeddingMathematical:
             atol=1e-5
         ), "Initial weights should be uniform"
     
-    def test_embedding_kme_encodes_differently(
-        self, vocab_size, d_base, num_atoms, hidden_size, device
-    ):
-        """
-        Different tokens should have different KME encodings.
-        This tests that the distributional structure is meaningful.
-        """
-        # Use larger init_std so tokens are distinguishable
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
-            d_base=d_base,
-            num_atoms=num_atoms,
-            init_std=0.5,  # Larger to spread atoms
-        ).to(device)
-
-        # Use bandwidth scaled for the atom distribution
-        bandwidth = math.sqrt(d_base) * 0.5
-        encoder = RFFEncoder(d_base=d_base, d_out=hidden_size, bandwidth=bandwidth).to(device)
-
-        # Embed all tokens
-        all_tokens = torch.arange(vocab_size, device=device).unsqueeze(0)
-        state = embedding(all_tokens)
-
-        # Encode to KME vectors
-        z = encoder(state)  # [1, vocab_size, hidden_size]
-
-        # Compute pairwise cosine similarities
-        z_norm = F.normalize(z[0], dim=-1)  # [vocab_size, hidden_size]
-        similarities = z_norm @ z_norm.T  # [vocab_size, vocab_size]
-
-        # Diagonal should be 1 (self-similarity)
-        assert torch.allclose(similarities.diag(), torch.ones(vocab_size, device=device), atol=1e-5)
-
-        # Off-diagonal: most pairs should have similarity < 1
-        # With random init, some pairs may be close by chance, so check statistics
-        mask = ~torch.eye(vocab_size, dtype=torch.bool, device=device)
-        off_diag = similarities[mask]
-        
-        # Mean similarity should be significantly less than 1
-        assert off_diag.mean() < 0.9, \
-            f"Mean pairwise similarity too high: {off_diag.mean():.3f}"
-        
-        # Most pairs should be distinguishable
-        distinguishable_fraction = (off_diag < 0.95).float().mean()
-        assert distinguishable_fraction > 0.9, \
-            f"Only {distinguishable_fraction:.1%} of token pairs are distinguishable"
-    
     def test_embedding_represents_mixture_of_diracs(
         self, vocab_size, d_base, num_atoms, device
     ):
@@ -389,16 +447,16 @@ class TestKMETokenEmbeddingMathematical:
         
         Test that the encoding matches this formula.
         """
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
+            vocab_size=vocab_size,
         ).to(device)
         
         encoder = RFFEncoder(d_base=d_base, d_out=64, bandwidth=1.0).to(device)
         
         # Single token
-        token = torch.tensor([[7]], device=device)
+        token = torch.tensor([[5]], device=device)  # digit 3
         state = embedding(token)
         
         # Method 1: Use encoder directly
@@ -418,24 +476,23 @@ class TestKMETokenEmbeddingMathematical:
         self, vocab_size, d_base, num_atoms, device
     ):
         """
-        Atoms for each token should provide reasonable coverage of base space.
+        Atoms for each token should provide reasonable coverage.
         Test that atoms are not degenerate (all same point).
         """
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
-            init_std=0.02,
+            vocab_size=vocab_size,
         ).to(device)
         
         # Check a few tokens
-        tokens = torch.tensor([[0, 10, 50]], device=device)
+        tokens = torch.tensor([[0, 3, 7]], device=device)  # pad, digit1, digit5
         state = embedding(tokens)
         
         for pos in range(3):
             atoms = state.atoms[0, pos]  # [num_atoms, d_base]
             
-            # Atoms should not all be identical
+            # Atoms should not all be identical (due to offsets)
             atom_var = atoms.var(dim=0).mean()
             assert atom_var > 1e-10, \
                 f"Atoms for token at pos {pos} are degenerate (variance={atom_var:.2e})"
@@ -451,10 +508,10 @@ class TestKMETokenEmbeddingMathematical:
         self, vocab_size, d_base, num_atoms, device
     ):
         """Embedding should process each batch element independently."""
-        embedding = KMETokenEmbedding(
-            vocab_size=vocab_size,
+        embedding = KMECategoricalEmbedding(
             d_base=d_base,
             num_atoms=num_atoms,
+            vocab_size=vocab_size,
         ).to(device)
         
         # Two batch elements
@@ -472,6 +529,7 @@ class TestKMETokenEmbeddingMathematical:
         assert torch.allclose(state.atoms[1], state2.atoms[0])
         assert torch.allclose(state.log_weights[0], state1.log_weights[0])
         assert torch.allclose(state.log_weights[1], state2.log_weights[0])
+
 
 # =============================================================================
 # RFFEncoder Mathematical Properties
@@ -671,8 +729,7 @@ class TestKMEAttentionMathematical:
     
     Key properties:
     1. Attention weights form valid probability distributions (sum to 1, non-negative)
-    2. Attention scores approximate kernel inner products: score ≈ ⟨μ_Q, μ_K⟩_H
-    3. Output is a valid weighted combination of value distributions
+    2. Output is a valid weighted combination of value distributions
     """
     
     def test_attention_weights_are_valid_probabilities(
@@ -690,15 +747,7 @@ class TestKMEAttentionMathematical:
             torch.randn(batch_size, seq_len, num_atoms, device=device),
         )
         
-        # Hook to capture attention weights
-        attention_weights = []
-        
-        def hook(module, input, output):
-            # Recompute attention weights for inspection
-            pass
-        
-        # We need to manually compute attention weights to verify
-        # Extract Q, K encoding from the forward pass
+        # Manually compute attention weights to verify
         B, S, M, _ = state.atoms.shape
         q_atoms = attn.q_proj(state.atoms).view(B, S, M, attn.num_heads, attn.d_base)
         k_atoms = attn.k_proj(state.atoms).view(B, S, M, attn.num_heads, attn.d_base)
@@ -706,9 +755,9 @@ class TestKMEAttentionMathematical:
         q_weights = state.weights
         k_weights = state.weights
         
-        # Compute Q and K encodings
-        q_enc = attn.rff_encode_batched(q_atoms, q_weights)  # [B, H, S, head_dim]
-        k_enc = attn.rff_encode_batched(k_atoms, k_weights)
+        # Compute Q and K encodings using direct weighted mean
+        q_enc = attn.encode_batched(q_atoms, q_weights)  # [B, H, S, d_base]
+        k_enc = attn.encode_batched(k_atoms, k_weights)
         
         # Compute attention weights
         scores = torch.matmul(q_enc, k_enc.transpose(-2, -1)) * attn.attn_scale
@@ -721,88 +770,11 @@ class TestKMEAttentionMathematical:
         assert torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1e-5), \
             "Attention weights must sum to 1"
     
-    def test_attention_score_is_kernel_inner_product(
-        self, batch_size, num_atoms, d_base, num_heads, device
-    ):
-        """
-        Attention score between positions should approximate kernel inner product.
-        
-        We test that the RFF-based score computed by the attention module
-        matches manual computation using the SAME RFF frequencies.
-        """
-        seq_len = 2  # Just two positions for easy verification
-        
-        # Use more frequencies for better approximation quality testing
-        d_base_test = 32
-        n_freq = 128  # More frequencies for better approximation
-        
-        attn = KMEAttention(
-            d_base=d_base_test,
-            num_atoms=num_atoms,
-            num_heads=1,  # Single head for clarity
-            bandwidth=1.0,
-        ).to(device)
-        
-        # Override frequencies with more for better approximation
-        new_frequencies = torch.randn(1, d_base_test, n_freq, device=device) / 1.0  # bandwidth=1
-        attn.frequencies = new_frequencies
-        attn.head_dim = n_freq * 2  # Update head_dim to match
-        attn.rff_scale = 1.0 / math.sqrt(n_freq)
-        
-        # Create states with known atoms
-        atoms = torch.randn(batch_size, seq_len, num_atoms, d_base_test, device=device)
-        log_weights = torch.zeros(batch_size, seq_len, num_atoms, device=device)  # Uniform
-        state = KMEState(atoms, log_weights)
-        
-        weights = state.weights  # [B, S, M]
-        
-        # Get projected atoms - use identity projection for this test
-        with torch.no_grad():
-            attn.q_proj.weight.copy_(torch.eye(d_base_test, device=device))
-            attn.k_proj.weight.copy_(torch.eye(d_base_test, device=device))
-        
-        q_proj_atoms = atoms.unsqueeze(3)  # [B, S, M, 1, d_base]
-        k_proj_atoms = atoms.unsqueeze(3)
-        
-        # Compute RFF-approximated score using attention's method
-        q_enc = attn.rff_encode_batched(q_proj_atoms, weights)  # [B, 1, S, head_dim]
-        k_enc = attn.rff_encode_batched(k_proj_atoms, weights)
-        
-        rff_score = (q_enc[:, 0, 0, :] * k_enc[:, 0, 1, :]).sum(dim=-1)  # Score between pos 0 and 1
-        
-        # Compute true kernel inner product using the SAME RFF approximation
-        # ⟨μ₀, μ₁⟩ ≈ Σᵢⱼ wᵢ wⱼ φ(aᵢ)ᵀφ(aⱼ)
-        # where φ uses the same frequencies as the attention module
-        
-        def rff_phi(x, frequencies, scale):
-            """Manual RFF computation"""
-            proj = torch.einsum('...d,df->...f', x, frequencies[0])  # [B, M, n_freq]
-            return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1) * scale
-        
-        true_scores = []
-        for b in range(batch_size):
-            score = 0.0
-            for i in range(num_atoms):
-                for j in range(num_atoms):
-                    phi_i = rff_phi(atoms[b, 0, i], attn.frequencies, attn.rff_scale)
-                    phi_j = rff_phi(atoms[b, 1, j], attn.frequencies, attn.rff_scale)
-                    k_ij = (phi_i * phi_j).sum()
-                    score += weights[b, 0, i] * weights[b, 1, j] * k_ij
-            true_scores.append(score)
-        true_score = torch.stack(true_scores)
-        
-        # These should match exactly (same computation, just different order)
-        assert torch.allclose(rff_score, true_score, atol=1e-4), \
-            f"RFF scores don't match: rff={rff_score}, true={true_score}"
-
-    
     def test_output_atoms_are_weighted_combination(
         self, batch_size, num_atoms, d_base, num_heads, device
     ):
         """
         Output atoms should be attention-weighted combination of value atoms.
-        
-        out_atoms[q, m] = Σ_k attn[q, k] * v_atoms[k, m]
         """
         seq_len = 4
         
@@ -820,18 +792,8 @@ class TestKMEAttentionMathematical:
         
         output = attn(query=state, key=state, value=state)
         
-        # Verify output atoms are in the convex hull of value atoms
-        # (They should be linear combinations with attention weights)
-        
         # Output should have same shape
         assert output.atoms.shape == state.atoms.shape
-        
-        # Output atoms should not be identical to any single input position
-        # (unless attention is perfectly concentrated)
-        for pos in range(seq_len):
-            # Check that output is not exactly equal to any single value position
-            # (it should be a mixture)
-            pass  # This is hard to test exactly, but shape verification is key
     
     def test_self_attention_permutation_equivariance_without_rope(
         self, batch_size, num_atoms, d_base, num_heads, device
@@ -986,9 +948,9 @@ class TestKMERMSNormMathematical:
 class TestKMEMLPMathematical:
     """Test mathematical properties of KME MLP."""
     
-    def test_residual_connection_structure(self, sample_kme_state, d_base, device):
+    def test_residual_connection_structure(self, sample_kme_state, d_base, num_atoms, device):
         """MLP should have residual: output = input + f(input)."""
-        mlp = KMEMLP(d_base=d_base).to(device)
+        mlp = KMEMLP(d_base=d_base, num_atoms=num_atoms).to(device)
         
         output = mlp(sample_kme_state)
         
@@ -1007,7 +969,7 @@ class TestKMEMLPMathematical:
     
     def test_swiglu_nonlinearity(self, batch_size, seq_len, num_atoms, d_base, device):
         """SwiGLU should produce nonlinear transformation."""
-        mlp = KMEMLP(d_base=d_base).to(device)
+        mlp = KMEMLP(d_base=d_base, num_atoms=num_atoms).to(device)
         
         # Override small initialization for this test
         with torch.no_grad():
@@ -1041,7 +1003,7 @@ class TestKMEMLPMathematical:
     
     def test_position_independence(self, batch_size, seq_len, num_atoms, d_base, device):
         """MLP should process each position independently."""
-        mlp = KMEMLP(d_base=d_base).to(device)
+        mlp = KMEMLP(d_base=d_base, num_atoms=num_atoms).to(device)
         
         atoms = torch.randn(batch_size, seq_len, num_atoms, d_base, device=device)
         log_weights = torch.randn(batch_size, seq_len, num_atoms, device=device)

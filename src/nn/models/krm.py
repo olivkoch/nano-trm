@@ -6,7 +6,7 @@ Full integration with training infrastructure.
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,14 @@ from src.nn.modules.krm_block import (
     KMEReasoningModule,
     KMEOutputHead,
     KMEQHead,
+    KMECategoricalEmbedding,
+    KernelKMEReasoningModule,
 )
+from src.nn.modules.kme_embeddings import GeneralKMEEmbedding
+from src.nn.modules.kme_attention import (
+    GeneralKMEReasoningModule,
+)
+
 from src.nn.modules.trm_block import RotaryEmbedding, RotaryEmbedding2D
 from src.nn.modules.sparse_embeddings import (
     CastedSparseEmbedding,
@@ -37,16 +44,16 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 
 @dataclass
-class KMETRMInnerCarry:
+class GeneralKMETRMInnerCarry:
     """KME-based carry for H and L states."""
     z_H: KMEState
     z_L: KMEState
 
 
 @dataclass
-class KMETRMCarry:
+class GeneralKMETRMCarry:
     """Full carry structure for KME-TRM."""
-    inner_carry: KMETRMInnerCarry
+    inner_carry: GeneralKMETRMInnerCarry
     steps: torch.Tensor
     halted: torch.Tensor
     current_data: Dict[str, torch.Tensor]
@@ -71,6 +78,11 @@ class KMETRMModule(LightningModule):
         ffn_expansion: int = 4,
         hidden_size: int = 512,  # For output projection
         max_grid_size: int = 9,
+        # Position encoding
+        position_encoder: str = 'fourier',  # 'fourier' or 'discrete'
+        max_coord: int = 16,
+        num_frequencies: int = 8,
+        init_bandwidth: float = 1.0,
         # TRM cycles
         H_cycles: int = 3,
         L_cycles: int = 6,
@@ -84,12 +96,14 @@ class KMETRMModule(LightningModule):
         max_steps: int = 100000,
         halt_exploration_prob: float = 0.1,
         lr_min_ratio: float = 1.0,
+        use_constant_lr: bool = False,
         # Puzzle embeddings
         puzzle_emb_dim: int = 512,
         puzzle_emb_len: int = 16,
         # Position encoding
         rope_theta: int = 10000,
         use_2d_rope: bool = False,
+        use_kernel_attention: bool = False,
         # Data config (from datamodule)
         vocab_size: int = 0,
         num_puzzles: int = 0,
@@ -116,36 +130,77 @@ class KMETRMModule(LightningModule):
         #     d_base=d_base,
         #     num_atoms=num_atoms,
         # )
-        self.token_emb = nn.Embedding(vocab_size, d_model)
+        # self.token_emb = nn.Embedding(vocab_size, d_model)
 
         # Project to base space for injection into KME states
-        self.input_proj = nn.Linear(d_model, d_base, bias=False)
+        # self.input_proj = nn.Linear(d_model, d_base, bias=False)
 
-        # RoPE - operates on head_dim = d_base (after RFF encoding)
-        total_seq_len = seq_len + puzzle_emb_len
-        if use_2d_rope:
-            self.pos_embedding = RotaryEmbedding2D(
-                dim=d_base,  # RFF output dim = d_base
-                prefix_len=puzzle_emb_len,
-                max_grid_size=int(math.sqrt(seq_len)),
-                base=rope_theta,
-            )
-        else:
-            self.pos_embedding = RotaryEmbedding(
-                dim=d_base,
-                max_position_embeddings=total_seq_len,
-                base=rope_theta,
-            )
+        # Categorical KME embedding for digits
+        # self.token_emb = KMECategoricalEmbedding(
+        #     d_base=d_base,
+        #     num_atoms=num_atoms,
+        #     vocab_size=vocab_size,
+        #     pad_token=0,
+        #     eos_token=1,
+        #     empty_token=2,
+        #     digit_token_start=3,
+        # )
         
-        # Reasoning module
-        self.lenet = KMEReasoningModule(
+        # # RoPE - operates on head_dim = d_base (after RFF encoding)
+        # total_seq_len = seq_len + puzzle_emb_len
+        # if use_2d_rope:
+        #     self.pos_embedding = RotaryEmbedding2D(
+        #         dim=d_base,  # RFF output dim = d_base
+        #         prefix_len=puzzle_emb_len,
+        #         max_grid_size=int(math.sqrt(seq_len)),
+        #         base=rope_theta,
+        #     )
+        # else:
+        #     self.pos_embedding = RotaryEmbedding(
+        #         dim=d_base,
+        #         max_position_embeddings=total_seq_len,
+        #         base=rope_theta,
+        #     )
+        # General embedding with coordinates
+        self.token_emb = GeneralKMEEmbedding(
+            d_base=d_base,
+            num_atoms=num_atoms,
+            vocab_size=vocab_size,
+            position_encoder=position_encoder,
+            max_coord=max_coord,
+            num_frequencies=num_frequencies,
+            special_tokens={'pad': 0, 'eos': 1, 'empty': 2},
+        )
+        
+        # Reasoning module - NO RoPE
+        self.lenet = GeneralKMEReasoningModule(
             num_layers=num_layers,
             d_base=d_base,
             num_atoms=num_atoms,
             num_heads=num_heads,
             ffn_expansion=ffn_expansion,
-            bandwidth=math.sqrt(d_base),
+            init_bandwidth=init_bandwidth,
         )
+
+        # # Reasoning module
+        # if use_kernel_attention:
+        #     self.lenet = KernelKMEReasoningModule(
+        #     num_layers=num_layers,
+        #     d_base=d_base,
+        #     num_atoms=num_atoms,
+        #     num_heads=num_heads,
+        #     ffn_expansion=ffn_expansion,
+        #     init_bandwidth=init_bandwidth,
+        # )
+        # else:
+        #     self.lenet = KMEReasoningModule(
+        #         num_layers=num_layers,
+        #         d_base=d_base,
+        #         num_atoms=num_atoms,
+        #         num_heads=num_heads,
+        #         ffn_expansion=ffn_expansion,
+        #         bandwidth=math.sqrt(d_base),
+        #     )
         
         # Output heads
         self.lm_head = KMEOutputHead(
@@ -225,127 +280,118 @@ class KMETRMModule(LightningModule):
         
         return KMEState(atoms, log_weights)
     
+    def inject_input(self, state: KMEState, input_state: KMEState) -> KMEState:
+        """Additive injection of input into reasoning state."""
+        return KMEState(
+            atoms=state.atoms + input_state.atoms,
+            log_weights=state.log_weights,
+        )
+
     def embed_input(
         self,
         input_ids: torch.Tensor,
-        puzzle_identifiers: torch.Tensor,
-    ) -> torch.Tensor:
+        coords: torch.Tensor,
+        grid_size: Tuple[int, int],
+        puzzle_identifiers: Optional[torch.Tensor] = None,
+    ) -> KMEState:
         """
-        Embed input tokens to vectors (NOT KME).
+        Embed input with coordinates.
         
-        Returns: [B, seq_len (+ puzzle_emb_len if enabled), d_base] tensor
+        Args:
+            input_ids: [B, S] token ids
+            coords: [B, S, 2] (row, col) coordinates
+            grid_size: (H, W) for normalization
+            puzzle_identifiers: [B] puzzle ids (optional)
+        
+        Returns:
+            KMEState with atoms [B, S (+ prefix), num_atoms, d_base]
         """
-        # Standard embedding → project to base space
-        token_emb = self.token_emb(input_ids)  # [B, S, d_model]
-        input_emb = self.input_proj(token_emb)  # [B, S, d_base]
+        input_state = self.token_emb(input_ids, coords, grid_size)
         
-        if self.puzzle_emb is not None and self.puzzle_emb_len > 0:
-            B = input_emb.shape[0]
+        if self.puzzle_emb is not None and self.puzzle_emb_len > 0 and puzzle_identifiers is not None:
+            B = input_ids.shape[0]
+            device = input_ids.device
             
-            # Get puzzle embedding and project to d_base
-            puzzle_emb = self.puzzle_emb(puzzle_identifiers)  # [B, puzzle_emb_dim]
-            puzzle_proj = self.puzzle_to_base(puzzle_emb)  # [B, d_base]
+            # Puzzle embedding → project to d_base
+            puzzle_emb = self.puzzle_emb(puzzle_identifiers)
+            puzzle_proj = self.puzzle_to_base(puzzle_emb)
             
-            # Expand to puzzle_emb_len positions: [B, puzzle_emb_len, d_base]
-            puzzle_input = puzzle_proj.unsqueeze(1).expand(-1, self.puzzle_emb_len, -1)
+            # Create prefix state
+            puzzle_atoms = puzzle_proj.unsqueeze(1).unsqueeze(2).expand(
+                -1, self.puzzle_emb_len, self.hparams.num_atoms, -1
+            ).clone()
+            puzzle_log_weights = torch.zeros(
+                B, self.puzzle_emb_len, self.hparams.num_atoms, device=device
+            )
             
-            # Concatenate: [B, puzzle_emb_len + seq_len, d_base]
-            return torch.cat([puzzle_input, input_emb], dim=1)
-        else:
-            return input_emb
+            return KMEState(
+                atoms=torch.cat([puzzle_atoms, input_state.atoms], dim=1),
+                log_weights=torch.cat([puzzle_log_weights, input_state.log_weights], dim=1),
+            )
+        
+        return input_state
     
-    def inject_input(self, state: KMEState, input_emb: torch.Tensor) -> KMEState:
-        """
-        Inject input evidence into KME state by shifting all atoms.
-        
-        state: KMEState with atoms [B, S, M, d_base]
-        input_emb: [B, S, d_base] standard vectors
-        
-        Returns: KMEState with shifted atoms
-        """
-        # Broadcast input across all atoms: [B, S, 1, d_base] + [B, S, M, d_base]
-        shifted_atoms = state.atoms + input_emb.unsqueeze(2)
-        return KMEState(shifted_atoms, state.log_weights)
-
-    def initial_carry(self, batch: Dict[str, torch.Tensor]) -> KMETRMCarry:
+    def initial_carry(self, batch: Dict[str, torch.Tensor]) -> GeneralKMETRMCarry:
         """Create initial carry for a batch."""
         batch_size = batch["input"].shape[0]
+        seq_len = batch["input"].shape[1]
         device = batch["input"].device
         
-        return KMETRMCarry(
-            inner_carry=self.empty_carry(batch_size, device),
+        total_seq_len = seq_len + self.puzzle_emb_len
+        
+        return GeneralKMETRMCarry(
+            inner_carry=GeneralKMETRMInnerCarry(
+                z_H=self.initial_state(batch_size, total_seq_len, device),
+                z_L=self.initial_state(batch_size, total_seq_len, device),
+            ),
             steps=torch.zeros((batch_size,), dtype=torch.int32, device=device),
             halted=torch.ones((batch_size,), dtype=torch.bool, device=device),
-            current_data={k: torch.empty_like(v, device=device) for k, v in batch.items()},
-        )
-    
-    def empty_carry(self, batch_size: int, device: torch.device) -> KMETRMInnerCarry:
-        """Create empty inner carry."""
-        seq_len = self.hparams.seq_len + self.puzzle_emb_len
-        return KMETRMInnerCarry(
-            z_H=self.initial_state(batch_size, seq_len, device),
-            z_L=self.initial_state(batch_size, seq_len, device),
+            current_data={k: torch.empty_like(v) for k, v in batch.items()},
         )
     
     def reset_carry(
         self,
         reset_flag: torch.Tensor,
-        carry: KMETRMInnerCarry,
-    ) -> KMETRMInnerCarry:
-        """Reset carry for sequences that have halted."""
+        carry: GeneralKMETRMInnerCarry,
+        seq_len: int,
+    ) -> GeneralKMETRMInnerCarry:
+        """Reset carry for halted sequences."""
         batch_size = reset_flag.shape[0]
         device = reset_flag.device
-        seq_len = self.hparams.seq_len + self.puzzle_emb_len
         
-        init_state = self.initial_state(batch_size, seq_len, device)
+        init_state = self.initial_state(batch_size, seq_len + self.puzzle_emb_len, device)
         
-        return KMETRMInnerCarry(
+        return GeneralKMETRMInnerCarry(
             z_H=KMEState.where(reset_flag, init_state, carry.z_H),
             z_L=KMEState.where(reset_flag, init_state, carry.z_L),
         )
     
+    def _get_coords(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """Generate coords from input shape, assuming square grid."""
+        B, S = input_ids.shape
+        device = input_ids.device
+        
+        grid_dim = int(math.sqrt(S))
+        assert grid_dim * grid_dim == S, f"Sequence length {S} is not a perfect square"
+        
+        rows = torch.arange(grid_dim, device=device).unsqueeze(1).expand(grid_dim, grid_dim).reshape(-1)
+        cols = torch.arange(grid_dim, device=device).unsqueeze(0).expand(grid_dim, grid_dim).reshape(-1)
+        coords = torch.stack([rows, cols], dim=-1).unsqueeze(0).expand(B, -1, -1)
+        
+        return coords, (grid_dim, grid_dim)
+
     def inner_forward(
         self,
-        carry: KMETRMInnerCarry,
+        carry: GeneralKMETRMInnerCarry,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[KMETRMInnerCarry, torch.Tensor, torch.Tensor]:
-        """
-        Core reasoning forward pass - DEBUGGING VERSION.
-        """
-        input_emb = self.embed_input(batch["input"], batch["puzzle_identifiers"])
+    ) -> Tuple[GeneralKMETRMInnerCarry, torch.Tensor, torch.Tensor, Dict]:
+        """Core reasoning forward pass."""
+        input_ids = batch["input"]
+        puzzle_identifiers = batch.get("puzzle_identifiers")        
+
+        coords, grid_size = self._get_coords(input_ids)
         
-        # ============================================================
-        # BYPASS TEST: Skip all reasoning, test embedding → output
-        # ============================================================
-        # B, S, D = input_emb.shape
-        
-        # # Create KME state directly from input (identical atoms per position)
-        # dummy_atoms = input_emb.unsqueeze(2).expand(-1, -1, self.hparams.num_atoms, -1).clone()
-        # dummy_state = KMEState(
-        #     atoms=dummy_atoms,  # [B, S, M, d_base]
-        #     log_weights=torch.zeros(B, S, self.hparams.num_atoms, device=input_emb.device)
-        # )
-        
-        # # Skip puzzle prefix for output
-        # output_state = KMEState(
-        #     atoms=dummy_state.atoms[:, self.puzzle_emb_len:],
-        #     log_weights=dummy_state.log_weights[:, self.puzzle_emb_len:],
-        # )
-        
-        # logits = self.lm_head(output_state)
-        # q_logits = self.q_head(dummy_state, position=0).to(torch.float32)
-        
-        # intermediates = {"z_H": dummy_state, "z_L": dummy_state}
-        # new_carry = KMETRMInnerCarry(z_H=dummy_state.detach(), z_L=dummy_state.detach())
-        
-        # return new_carry, logits, q_logits[..., 0], intermediates
-        # ============================================================
-        # END BYPASS TEST
-        # ============================================================
-        
-        # Original code below (commented out for bypass test)
-        
-        cos_sin = self.pos_embedding()
+        input_emb = self.embed_input(input_ids, coords, grid_size, puzzle_identifiers)
         
         z_H, z_L = carry.z_H, carry.z_L
         
@@ -354,64 +400,53 @@ class KMETRMModule(LightningModule):
             for _ in range(self.hparams.H_cycles - 1):
                 for _ in range(self.hparams.L_cycles):
                     z_H_with_input = self.inject_input(z_H, input_emb)
-                    z_L = self.lenet(z_L, z_H_with_input, cos_sin=cos_sin)
+                    z_L = self.lenet(z_L, z_H_with_input)
                 
-                z_H = self.lenet(z_H, z_L, cos_sin=cos_sin)
+                z_H = self.lenet(z_H, z_L)
                 z_H = self.inject_input(z_H, input_emb)
         
         # Final H-cycle with grad
         for _ in range(self.hparams.L_cycles):
             z_H_with_input = self.inject_input(z_H, input_emb)
-            z_L = self.lenet(z_L, z_H_with_input, cos_sin=cos_sin)
+            z_L = self.lenet(z_L, z_H_with_input)
         
-        z_H = self.lenet(z_H, z_L, cos_sin=cos_sin)
+        z_H = self.lenet(z_H, z_L)
         z_H = self.inject_input(z_H, input_emb)
-
-        # Output heads - skip puzzle prefix positions
+        
+        # Output heads - skip prefix
         output_state = KMEState(
             atoms=z_H.atoms[:, self.puzzle_emb_len:],
             log_weights=z_H.log_weights[:, self.puzzle_emb_len:],
         )
-        # DEBUGGING
-        # z_H_output = self.inject_input(z_H, input_emb)
-    
-        # output_state = KMEState(
-        #     atoms=z_H_output.atoms[:, self.puzzle_emb_len:],
-        #     log_weights=z_H_output.log_weights[:, self.puzzle_emb_len:],
-        # )
-        # ##
-
-        logits = self.lm_head(output_state)
         
+        logits = self.lm_head(output_state)
         q_logits = self.q_head(z_H, position=0).to(torch.float32)
         
         intermediates = {"z_H": z_H, "z_L": z_L}
-        new_carry = KMETRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        new_carry = GeneralKMETRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         
         return new_carry, logits, q_logits[..., 0], intermediates
-        
     
     def forward(
         self,
-        carry: KMETRMCarry,
+        carry: GeneralKMETRMCarry,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[KMETRMCarry, Dict[str, torch.Tensor]]:
+    ) -> Tuple[GeneralKMETRMCarry, Dict[str, torch.Tensor], Dict]:
         """Full forward pass with carry management."""
-        # Reset carry for halted sequences
-        new_inner_carry = self.reset_carry(carry.halted, carry.inner_carry)
+        seq_len = batch["input"].shape[1]
+        
+        new_inner_carry = self.reset_carry(carry.halted, carry.inner_carry, seq_len)
         new_steps = torch.where(carry.halted, 0, carry.steps)
         
-        # Update current data for halted sequences
         new_current_data = {
             k: torch.where(
                 carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)),
                 batch[k],
-                v
+                v if v.shape == batch[k].shape else batch[k]
             )
             for k, v in carry.current_data.items()
         }
         
-        # Forward
         new_inner_carry, logits, q_halt_logits, intermediates = self.inner_forward(
             new_inner_carry, new_current_data
         )
@@ -438,7 +473,7 @@ class KMETRMModule(LightningModule):
                 ) * torch.randint_like(new_steps, low=2, high=self.hparams.N_supervision + 1)
                 halted = halted & (new_steps >= min_halt_steps)
         
-        return KMETRMCarry(new_inner_carry, new_steps, halted, new_current_data), outputs, intermediates
+        return GeneralKMETRMCarry(new_inner_carry, new_steps, halted, new_current_data), outputs, intermediates
     
     def atom_diversity_loss(self, state: KMEState) -> torch.Tensor:
         """Prevent atoms from collapsing to same values."""
@@ -461,7 +496,7 @@ class KMETRMModule(LightningModule):
 
     def compute_loss_and_metrics(
         self,
-        carry: KMETRMCarry,
+        carry: GeneralKMETRMCarry,
         batch: Dict[str, torch.Tensor],
     ):
         """Compute loss and metrics."""
@@ -533,7 +568,6 @@ class KMETRMModule(LightningModule):
     
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """Training step."""
-        t_start = time.time()
 
         batch_size = batch["input"].shape[0]
 
@@ -546,18 +580,13 @@ class KMETRMModule(LightningModule):
                 raise RuntimeError("No optimizer available.")
             opts = self._optimizers
         
-        if self.carry is None:
+        if self.carry is None or batch["input"].shape[1] != self.carry.current_data.get("input", torch.empty(0)).shape[-1]:
             self.carry = self.initial_carry(batch)
         
-
-        t0_compute = time.time()
         self.carry, loss, metrics, all_halted = self.compute_loss_and_metrics(self.carry, batch)
-        t_end_compute = time.time()
 
-        t0_backward = time.time()
         scaled_loss = loss / batch_size
         scaled_loss.backward()
-        t_end_backward = time.time()
 
         # Gradient monitoring
         with torch.no_grad():
@@ -577,7 +606,7 @@ class KMETRMModule(LightningModule):
             base_lrs.append(self.hparams.learning_rate_emb)
         
         for opt, base_lr in zip(opts, base_lrs):
-            if current_step < self.hparams.warmup_steps:
+            if current_step < self.hparams.warmup_steps or not self.hparams.use_constant_lr:
                 lr = compute_lr(
                     base_lr=base_lr,
                     lr_warmup_steps=self.hparams.warmup_steps,
@@ -616,11 +645,9 @@ class KMETRMModule(LightningModule):
 
         self.manual_step += 1
         
-        t_end = time.time()
-
         return loss
     
-    def log_debugging_metrics(self, carry: KMETRMCarry, outputs, labels, metrics):
+    def log_debugging_metrics(self, carry: GeneralKMETRMCarry, outputs, labels, metrics):
         with torch.no_grad():
             z_H = carry.inner_carry.z_H
             z_L = carry.inner_carry.z_L

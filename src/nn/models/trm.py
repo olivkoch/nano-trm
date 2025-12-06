@@ -84,6 +84,7 @@ class TRMModule(LightningModule):
         use_2d_rope: bool = False,
         lr_min_ratio: float = 1.0,
         use_sigreg: bool = False,
+        use_constant_lr: bool = False,
         vocab_size: int = 0,  # Should be set from datamodule
         num_puzzles: int = 0,  # Should be set from datamodule
         batch_size: int = 0,  # Should be set from datamodule
@@ -586,7 +587,7 @@ class TRMModule(LightningModule):
 
         # Compute learning rate for this step
         for opt, base_lr in zip(opts, base_lrs):
-            if current_step < self.hparams.warmup_steps:
+            if current_step < self.hparams.warmup_steps or not self.hparams.use_constant_lr:
                 lr_this_step = compute_lr(
                     base_lr=base_lr,
                     lr_warmup_steps=self.hparams.warmup_steps,

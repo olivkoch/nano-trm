@@ -69,6 +69,7 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
     # If subsample_size is specified, randomly sample the desired number of examples.
     remaining_data = None
     if subsample_size is not None:
+        print(f"Subsampling {subsample_size} examples from {set_name} set of size {len(inputs)}")
         total_samples = len(inputs)
         if subsample_size < total_samples:
             indices = np.random.choice(total_samples, size=subsample_size, replace=False)
@@ -114,7 +115,7 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
     num_puzzles = len(all_inputs)
     grid_size = 9
     seq_len = 81
-    vocab_size = 3 + grid_size  # PAD + BLANK + 1-9
+    vocab_size = 3 + grid_size  # PAD + EOS + BLANK + 1-9
 
     # Calculate min/max givens from the data (count non-zero cells in inputs)
     givens_counts = [np.count_nonzero(inp) for inp in all_inputs]
@@ -156,17 +157,17 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 @click.option("--subsample-size", type=int, default=None, help="Subsample size for training set")
 @click.option("--min-difficulty", type=int, default=None, help="Minimum difficulty rating")
 @click.option("--num-aug", type=int, default=0, help="Number of augmentations per puzzle")
-@click.option("--test-ratio", type=float, default=0.1, help="Test set size as ratio of training size")
+@click.option("--test-ratio", type=float, default=None, help="Test set size as ratio of training size")
 @click.option("--seed", type=int, default=42, help="Random seed")
 def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[int], 
-                    min_difficulty: Optional[int], num_aug: int, test_ratio: float, seed: int):
+                    min_difficulty: Optional[int], num_aug: int, test_ratio: Optional[float], seed: int):
     np.random.seed(seed)
     
     num_train, _ = convert_subset("train", source_repo, output_dir, subsample_size, min_difficulty, num_aug)
     
     # Val and test sets are taken from test.csv (no leakage with training)
     # Each is test_ratio * num_train in size
-    eval_subsample_size = int(num_train * test_ratio)
+    eval_subsample_size = int(num_train * test_ratio) if test_ratio is not None else None
     
     # Generate val set, keeping remaining data for test
     num_val, remaining_data = convert_subset("val", source_repo, output_dir, eval_subsample_size, min_difficulty, num_aug=0)

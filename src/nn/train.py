@@ -24,6 +24,8 @@ log = RankedLogger(__name__, rank_zero_only=True)
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+import os
+os.environ["WANDB_CONSOLE"] = "wrap" # too see logs in the wandb console
 
 def flatten_config(cfg, parent_key="", sep="."):
     """Flatten a nested config to avoid W&B duplication."""

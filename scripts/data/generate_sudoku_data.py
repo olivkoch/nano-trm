@@ -739,7 +739,7 @@ def main(
     if cross_size:
         train_grid_size = 6
         eval_grid_size = 9
-        max_grid_size = 10
+        max_grid_size = 9
         vocab_size = 3 + eval_grid_size  # 12
         
         train_cells = train_grid_size * train_grid_size

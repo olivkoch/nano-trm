@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /data: sudoku_6x6_medium
+  - override /data: sudoku_cross_6x6_9x9
   - override /model: krm
   - override /callbacks: default
   - override /trainer: gpu
@@ -10,7 +10,7 @@ tags: ["sudoku", "krm", "medium"]
 
 timekeeping:
   max_epochs: 450
-  batch_size: 768
+  batch_size: 64
   num_workers: 0
 
 model_tuning:
@@ -26,7 +26,7 @@ model_tuning:
   H_cycles: 3
   L_cycles: 5
   N_supervision: 6
-  N_supervision_val: 16
+  N_supervision_val: 6
 
   # Position encoding
   position_encoder: 'fourier'  # 'fourier' or 'discrete'
@@ -37,18 +37,18 @@ model_tuning:
   # Training
   learning_rate: 1e-4
   learning_rate_emb: 1e-4
-  weight_decay: 0.01
-  warmup_steps: 2000
-  lr_min_ratio: 0.2
+  weight_decay: 1.0
+  warmup_steps: 20000
+  lr_min_ratio: 0.1
   use_constant_lr: false
   max_steps: 0
   halt_exploration_prob: 0.1
-  use_kernel_attention: true
-  init_bandwidth: 3.0
 
   # Position encoding
   rope_theta: 10000
-  use_2d_rope: false
+  use_2d_rope: true
+  use_kernel_attention: true
+  init_bandwidth: 3.0
 
   # Puzzle embeddings
   puzzle_emb_dim: 0

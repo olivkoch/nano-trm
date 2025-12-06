@@ -9,7 +9,7 @@ defaults:
 tags: ["sudoku", "trm", "extreme"]
 
 timekeeping:
-  max_epochs: 50000
+  max_epochs: 40000
   batch_size: 768
   num_workers: 0
 
@@ -18,11 +18,12 @@ model_tuning:
   learning_rate_emb: 1e-4
   warmup_steps: 2000
   weight_decay: 1.0
-  lr_min_ratio: 1.0
+  lr_min_ratio: 0.01
+  use_constant_lr: false
   num_heads: 8
   halt_exploration_prob: 0.1
   N_supervision: 16
-  N_supervision_val: 128
+  N_supervision_val: 16
   H_cycles: 3
   L_cycles: 6
   num_layers: 2
@@ -32,11 +33,11 @@ model_tuning:
   hidden_size: 512
   ffn_expansion: 4
   rope_theta: 10000
-  use_2d_rope: true
-  use_sigreg: true
+  use_2d_rope: false
+  use_sigreg: false
 
 trainer:
-  check_val_every_n_epoch: 1
+  check_val_every_n_epoch: 10
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

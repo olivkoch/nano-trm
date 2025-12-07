@@ -140,8 +140,8 @@ class SudokuDataset(Dataset):
         split_dir = os.path.join(data_dir, split)
 
         # Load arrays
-        self.inputs = np.load(os.path.join(split_dir, "all__inputs.npy"))
-        self.labels = np.load(os.path.join(split_dir, "all__labels.npy"))
+        self.inputs = np.load(os.path.join(split_dir, "all__inputs.npy"), mmap_mode="r")
+        self.labels = np.load(os.path.join(split_dir, "all__labels.npy"), mmap_mode="r")
         self.puzzle_identifiers = np.load(os.path.join(split_dir, "all__puzzle_identifiers.npy"))
 
         # Load metadata

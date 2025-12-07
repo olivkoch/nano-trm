@@ -9,7 +9,7 @@ defaults:
 tags: ["sudoku", "trm", "extreme"]
 
 timekeeping:
-  max_epochs: 50000
+  max_epochs: 5000
   batch_size: 768
   num_workers: 0
 
@@ -38,6 +38,7 @@ model_tuning:
 
 trainer:
   check_val_every_n_epoch: 10
+  limit_train_batches: 10
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

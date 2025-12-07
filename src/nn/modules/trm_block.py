@@ -191,7 +191,7 @@ class SwiGLU(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, gate_type=None):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -207,6 +207,19 @@ class Attention(nn.Module):
             bias=False,
         )
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+
+        self.gate_type = gate_type
+        self.gate_proj = None
+
+        if self.gate_type is not None:
+            if self.gate_type == "headwise":
+                self.gate_proj = CastedLinear(hidden_size, num_heads, bias=True)
+            else:
+                self.gate_proj = CastedLinear(hidden_size, self.output_size, bias=True)
+
+            if self.gate_proj.bias is not None:
+                nn.init.constant_(self.gate_proj.bias, 0.0)
+
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -231,10 +244,21 @@ class Attention(nn.Module):
         query, key, value = map(
             lambda t: einops.rearrange(t, "B S H D -> B H S D"), (query, key, value)
         )  # needed for scaled_dot_product_attention but not flash_attn_func
+        
         attn_output = scaled_dot_product_attention(
             query=query, key=key, value=value, is_causal=self.causal
         )
         attn_output = einops.rearrange(attn_output, "B H S D -> B S H D")
+
+        # Optional gating
+        if self.gate_proj is not None:
+            gate_scores = torch.sigmoid(self.gate_proj(hidden_states))
+            if self.gate_type == "headwise":
+                gate_scores = gate_scores.unsqueeze(-1)  # [B, S, H, 1]
+            else:
+                gate_scores = gate_scores.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            attn_output = attn_output * gate_scores
+
         attn_output = attn_output.contiguous().view(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
@@ -250,6 +274,7 @@ class ReasoningBlockConfig:
         seq_len: int = 0,
         puzzle_emb_ndim: int = 0,
         puzzle_emb_len: int = 0,
+        attn_gate_type: str = None,
     ) -> None:
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -259,6 +284,7 @@ class ReasoningBlockConfig:
         self.puzzle_emb_ndim = puzzle_emb_ndim
         self.puzzle_emb_len = puzzle_emb_len
         self.seq_len = seq_len
+        self.attn_gate_type = attn_gate_type
 
 
 class ReasoningBlock(nn.Module):
@@ -283,6 +309,7 @@ class ReasoningBlock(nn.Module):
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
                 causal=False,
+                gate_type=config.attn_gate_type
             )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,

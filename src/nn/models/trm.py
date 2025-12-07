@@ -76,7 +76,6 @@ class TRMModule(LightningModule):
         learning_rate_emb: float = 1e-2,
         weight_decay: float = 0.01,
         warmup_steps: int = 2000,
-        max_steps: int = 100000,
         halt_exploration_prob: float = 0.1,
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
@@ -84,7 +83,7 @@ class TRMModule(LightningModule):
         use_2d_rope: bool = False,
         lr_min_ratio: float = 1.0,
         use_sigreg: bool = False,
-        use_constant_lr: bool = False,
+        attn_gate_type: str = None,  # None, "headwise", "elementwise"
         vocab_size: int = 0,  # Should be set from datamodule
         num_puzzles: int = 0,  # Should be set from datamodule
         batch_size: int = 0,  # Should be set from datamodule
@@ -134,6 +133,7 @@ class TRMModule(LightningModule):
             mlp_t=False,
             puzzle_emb_ndim=puzzle_emb_dim,
             puzzle_emb_len=puzzle_emb_len,
+            attn_gate_type=attn_gate_type,
         )
 
         self.lenet = ReasoningModule(
@@ -204,17 +204,12 @@ class TRMModule(LightningModule):
                 computed_total_steps = float("inf")
 
             # Take minimum of max_steps and computed steps
-            if self.trainer.max_steps > 0:
-                self.total_steps = min(self.trainer.max_steps, computed_total_steps)
-            else:
-                self.total_steps = computed_total_steps
+            self.total_steps = computed_total_steps
 
             log.info("Training configuration:")
             log.info(f"  Steps per epoch: {steps_per_epoch}")
             log.info(f"  Max epochs: {self.trainer.max_epochs}")
             log.info(f"  Computed total steps: {computed_total_steps}")
-            log.info(f"  Max steps limit: {self.trainer.max_steps}")
-            log.info(f"  Actual total steps: {self.total_steps}")
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -578,7 +573,6 @@ class TRMModule(LightningModule):
 
         # Learning rate scheduling with warmup
         current_step = self.manual_step
-        total_steps = getattr(self, "total_steps", self.hparams.max_steps)
 
         # Base learning rates for each optimizer
         base_lrs = [self.hparams.learning_rate]
@@ -587,13 +581,13 @@ class TRMModule(LightningModule):
 
         # Compute learning rate for this step
         for opt, base_lr in zip(opts, base_lrs):
-            if current_step < self.hparams.warmup_steps or not self.hparams.use_constant_lr:
+            if current_step < self.hparams.warmup_steps:
                 lr_this_step = compute_lr(
                     base_lr=base_lr,
                     lr_warmup_steps=self.hparams.warmup_steps,
                     lr_min_ratio=self.hparams.lr_min_ratio,
                     current_step=current_step,
-                    total_steps=total_steps,
+                    total_steps=self.total_steps,
                 )
             else:
                 # Constant LR after warmup (you can add decay here if needed)

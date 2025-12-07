@@ -6,10 +6,10 @@ num_workers: ${timekeeping.num_workers}
 num_train_puzzles: 0
 num_val_puzzles: 0
 num_test_puzzles: 0
-grid_size: 9
-max_grid_size: 9
+grid_size: 30
+max_grid_size: 30
 min_givens: null
 max_givens: null
 seed: 42
-data_dir: ./data/sudoku_extreme_1k_aug_1k
+data_dir: ./data/maze_30x30
 pad_value: 0

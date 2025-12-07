@@ -189,27 +189,26 @@ class TRMModule(LightningModule):
         """Called by Lightning when setting up the model."""
         if stage == "fit":
             # Calculate steps from dataset and epochs
-            if hasattr(self.trainer, "datamodule") and self.trainer.datamodule is not None:
-                train_loader = self.trainer.datamodule.train_dataloader()
-                steps_per_epoch = len(train_loader)
+            dm = self.trainer.datamodule
+        
+            # Use num_groups for steps calculation (not total puzzles)
+            if hasattr(dm, 'num_train_groups'):
+                samples_per_epoch = dm.num_train_groups
             else:
-                # Fallback: estimate from limit_train_batches if datamodule not available
-                steps_per_epoch = self.trainer.num_training_batches
-
-            # Compute total steps from epochs
+                samples_per_epoch = len(dm.train_dataset)
+            
+            steps_per_epoch = samples_per_epoch // dm.batch_size
+            
             if self.trainer.max_epochs > 0:
-                computed_total_steps = steps_per_epoch * self.trainer.max_epochs
+                self.total_steps = steps_per_epoch * self.trainer.max_epochs
             else:
-                # If max_epochs not set, use a large number
-                computed_total_steps = float("inf")
-
-            # Take minimum of max_steps and computed steps
-            self.total_steps = computed_total_steps
+                self.total_steps = float("inf")
 
             log.info("Training configuration:")
+            log.info(f"  Groups (unique puzzles): {getattr(dm, 'num_train_groups', 'N/A')}")
+            log.info(f"  Total puzzles (with aug): {len(dm.train_dataset)}")
             log.info(f"  Steps per epoch: {steps_per_epoch}")
-            log.info(f"  Max epochs: {self.trainer.max_epochs}")
-            log.info(f"  Computed total steps: {computed_total_steps}")
+            log.info(f"  Total steps: {self.total_steps}")
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -734,8 +733,12 @@ class TRMModule(LightningModule):
         pass
 
     def on_train_epoch_start(self):
-        pass
-
+        # Update sampler epoch for proper shuffling
+        if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule is not None:
+            dm = self.trainer.datamodule
+            if hasattr(dm, 'on_train_epoch_start'):
+                dm.on_train_epoch_start(self.current_epoch)
+    
     def configure_optimizers(self):
         """Configure optimizer with different learning rates for different parameter groups."""
 

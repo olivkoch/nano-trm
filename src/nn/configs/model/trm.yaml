@@ -13,7 +13,6 @@ learning_rate_emb: ${model_tuning.learning_rate_emb}
 weight_decay: ${model_tuning.weight_decay}
 halt_exploration_prob: ${model_tuning.halt_exploration_prob}
 warmup_steps: ${model_tuning.warmup_steps}
-max_steps: ${model_tuning.max_steps}
 num_heads: ${model_tuning.num_heads}
 puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
 puzzle_emb_len: ${model_tuning.puzzle_emb_len}
@@ -21,7 +20,7 @@ rope_theta: ${model_tuning.rope_theta}
 use_2d_rope: ${model_tuning.use_2d_rope}
 lr_min_ratio: ${model_tuning.lr_min_ratio}
 use_sigreg: ${model_tuning.use_sigreg}
-use_constant_lr: ${model_tuning.use_constant_lr}
+attn_gate_type: ${model_tuning.attn_gate_type}
 output_dir: None
 
 # Should be set from datamodule

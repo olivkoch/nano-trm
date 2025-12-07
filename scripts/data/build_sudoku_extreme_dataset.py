@@ -157,17 +157,25 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 @click.option("--subsample-size", type=int, default=None, help="Subsample size for training set")
 @click.option("--min-difficulty", type=int, default=None, help="Minimum difficulty rating")
 @click.option("--num-aug", type=int, default=0, help="Number of augmentations per puzzle")
-@click.option("--test-ratio", type=float, default=None, help="Test set size as ratio of training size")
+@click.option("--eval-ratio", type=float, default=None, help="Test set size as ratio of training size")
 @click.option("--seed", type=int, default=42, help="Random seed")
 def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[int], 
-                    min_difficulty: Optional[int], num_aug: int, test_ratio: Optional[float], seed: int):
+                    min_difficulty: Optional[int], num_aug: int, eval_ratio: Optional[float], seed: int):
     np.random.seed(seed)
     
     num_train, _ = convert_subset("train", source_repo, output_dir, subsample_size, min_difficulty, num_aug)
     
     # Val and test sets are taken from test.csv (no leakage with training)
-    # Each is test_ratio * num_train in size
-    eval_subsample_size = int(num_train * test_ratio) if test_ratio is not None else None
+    # Calculate eval subsample size from original test.csv size
+    eval_subsample_size = None
+    if eval_ratio is not None:
+        # Count original test.csv size
+        with open(hf_hub_download(source_repo, "test.csv", repo_type="dataset"), newline="") as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip header
+            original_test_size = sum(1 for _ in reader)
+        eval_subsample_size = int(original_test_size * eval_ratio)
+        print(f"Original test.csv has {original_test_size} samples, using {eval_subsample_size} for each eval split")
     
     # Generate val set, keeping remaining data for test
     num_val, remaining_data = convert_subset("val", source_repo, output_dir, eval_subsample_size, min_difficulty, num_aug=0)

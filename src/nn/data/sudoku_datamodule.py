@@ -27,6 +27,75 @@ from src.nn.utils.constants import IGNORE_LABEL_ID
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
+class GroupedBatchSampler:
+    """
+    Sampler that yields batches where each sample comes from a different group.
+    
+    This ensures augmented versions of the same base puzzle don't appear
+    in the same batch, maximizing diversity.
+    """
+    
+    def __init__(
+        self, 
+        group_indices: np.ndarray,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = True,
+        seed: int = 42,
+    ):
+        """
+        Args:
+            group_indices: Array of shape (num_groups + 1,) with boundaries
+            batch_size: Number of samples per batch
+            shuffle: Whether to shuffle groups each epoch
+            drop_last: Whether to drop the last incomplete batch
+            seed: Random seed
+        """
+        self.group_indices = group_indices
+        self.num_groups = len(group_indices) - 1
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+        
+    def set_epoch(self, epoch: int):
+        """Set epoch for deterministic shuffling across workers."""
+        self.epoch = epoch
+        
+    def __iter__(self):
+        rng = np.random.RandomState(self.seed + self.epoch)
+        
+        # Shuffle group order
+        if self.shuffle:
+            group_order = rng.permutation(self.num_groups)
+        else:
+            group_order = np.arange(self.num_groups)
+        
+        # Build batches
+        batch = []
+        for group_id in group_order:
+            # Sample one random puzzle from this group
+            start = self.group_indices[group_id]
+            end = self.group_indices[group_id + 1]
+            puzzle_idx = rng.randint(start, end)
+            
+            batch.append(puzzle_idx)
+            
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        
+        # Handle last batch
+        if len(batch) > 0 and not self.drop_last:
+            yield batch
+    
+    def __len__(self):
+        if self.drop_last:
+            return self.num_groups // self.batch_size
+        else:
+            return (self.num_groups + self.batch_size - 1) // self.batch_size
+        
 def puzzle_hash(grid: np.ndarray) -> str:
     """Create a unique hash for a grid to detect duplicates."""
     return hashlib.md5(grid.tobytes()).hexdigest()
@@ -143,6 +212,19 @@ class SudokuDataset(Dataset):
         self.inputs = np.load(os.path.join(split_dir, "all__inputs.npy"), mmap_mode="r")
         self.labels = np.load(os.path.join(split_dir, "all__labels.npy"), mmap_mode="r")
         self.puzzle_identifiers = np.load(os.path.join(split_dir, "all__puzzle_identifiers.npy"))
+
+        group_path = os.path.join(split_dir, "all__group_indices.npy")
+        puzzle_idx_path = os.path.join(split_dir, "all__puzzle_indices.npy")
+    
+        if os.path.exists(group_path):
+            self.group_indices = np.load(group_path)
+            self.puzzle_indices = np.load(puzzle_idx_path)
+            self.num_groups = len(self.group_indices) - 1
+        else:
+            # Fallback: each puzzle is its own group
+            self.group_indices = np.arange(len(self.inputs) + 1, dtype=np.int32)
+            self.puzzle_indices = np.arange(len(self.inputs) + 1, dtype=np.int32)
+            self.num_groups = len(self.inputs)
 
         # Load metadata
         with open(os.path.join(split_dir, "dataset.json")) as f:
@@ -566,6 +648,8 @@ class SudokuDataModule(LightningDataModule):
         self.pad_value = pad_value
         self.base_grids = base_grids
 
+        self._train_sampler = None
+
         self.mode = "loading" if data_dir is not None else "generation"
 
         if self.mode == "loading":
@@ -576,18 +660,21 @@ class SudokuDataModule(LightningDataModule):
                 self.max_grid_size = metadata["max_grid_size"]
                 self.vocab_size = metadata["vocab_size"]
                 self.seq_len = metadata["seq_len"]
+                
+                # Total puzzles (for reference)
                 self.num_train_puzzles = metadata.get("num_train", num_train_puzzles)
                 self.num_val_puzzles = metadata.get("num_val", num_val_puzzles)
                 self.num_test_puzzles = metadata.get("num_test", num_test_puzzles)
                 
-                # For compatibility - grid_size from largest possible
+                # Groups (for steps per epoch calculation)
+                self.num_train_groups = metadata.get("num_train_groups", self.num_train_puzzles)
+                self.num_val_groups = metadata.get("num_val_groups", self.num_val_puzzles)
+                self.num_test_groups = metadata.get("num_test_groups", self.num_test_puzzles)
+                
                 self.grid_size = self.vocab_size - 3
 
                 log.info(f"✓ Loaded metadata from {data_dir}/metadata.json")
-                log.info(f"  Mode: {metadata.get('mode', 'unknown')}")
-                log.info(f"  Max grid size: {self.max_grid_size}x{self.max_grid_size}")
-                log.info(f"  Vocab size: {self.vocab_size}")
-                log.info(f"  Sequence length: {self.seq_len}")
+                log.info(f"  Train: {self.num_train_groups} groups, {self.num_train_puzzles} total puzzles")
             else:
                 log.warning(f"⚠ Could not load metadata, using provided parameters")
                 self._use_provided_params(grid_size, max_grid_size, min_givens, max_givens,
@@ -707,13 +794,38 @@ class SudokuDataModule(LightningDataModule):
                 self.test_dataset = SudokuDataset(split="test", data_dir=self.data_dir)
 
     def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset, batch_size=self.batch_size, shuffle=True,
-            num_workers=self.num_workers, collate_fn=collate_fn_sudoku,
-            pin_memory=True, drop_last=True,
-            persistent_workers=self.num_workers > 0,
-            multiprocessing_context="spawn" if self.num_workers > 0 else None,
-        )
+        if self.mode == "loading" and hasattr(self.train_dataset, 'group_indices'):
+            # Use group-aware sampling
+            self._train_sampler = GroupedBatchSampler(
+                group_indices=self.train_dataset.group_indices,
+                batch_size=self.batch_size,
+                shuffle=True,
+                drop_last=True,
+                seed=self.seed,
+            )
+            
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=self._train_sampler,
+                num_workers=self.num_workers,
+                collate_fn=collate_fn_sudoku,
+                pin_memory=True,
+                persistent_workers=self.num_workers > 0,
+                multiprocessing_context="spawn" if self.num_workers > 0 else None,
+            )
+        else:
+            # Fallback to standard shuffled sampling
+            return DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers,
+                collate_fn=collate_fn_sudoku,
+                pin_memory=True,
+                drop_last=True,
+                persistent_workers=self.num_workers > 0,
+                multiprocessing_context="spawn" if self.num_workers > 0 else None,
+            )
 
     def val_dataloader(self):
         return DataLoader(
@@ -733,6 +845,10 @@ class SudokuDataModule(LightningDataModule):
             multiprocessing_context="spawn" if self.num_workers > 0 else None,
         )
 
+    def on_train_epoch_start(self, current_epoch: int):
+        """Update sampler epoch for proper shuffling. Call from LightningModule."""
+        if self._train_sampler is not None:
+            self._train_sampler.set_epoch(current_epoch)
 
 if __name__ == "__main__":
     # Test the datamodule

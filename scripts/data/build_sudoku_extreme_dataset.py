@@ -44,7 +44,7 @@ def shuffle_sudoku(board: np.ndarray, solution: np.ndarray):
 
 def convert_subset(set_name: str, source_repo: str, output_dir: str, 
                    subsample_size: Optional[int], min_difficulty: Optional[int], num_aug: int,
-                   preloaded_data: Optional[Tuple] = None) -> Tuple[int, Optional[Tuple]]:
+                   preloaded_data: Optional[Tuple] = None) -> Tuple[int, int, Optional[Tuple]]:
     """Convert a subset and return the number of puzzles generated and optionally the remaining data."""
     # Read CSV or use preloaded data
     if preloaded_data is not None:
@@ -88,7 +88,11 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 
     all_inputs = []
     all_labels = []
-    
+    puzzle_identifiers = []
+    puzzle_indices = [0]  # Start at 0
+    group_indices = [0]   # Start at 0
+    puzzle_id = 0
+
     for orig_inp, orig_out in zip(tqdm(inputs), labels):
         for aug_idx in range(1 + num_augments):
             # First index is not augmented
@@ -99,7 +103,16 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 
             all_inputs.append(inp)
             all_labels.append(out)
-        
+
+            puzzle_identifiers.append(0)
+            
+            puzzle_id += 1
+            puzzle_indices.append(puzzle_id)
+        group_indices.append(puzzle_id)
+
+    num_groups = len(group_indices) - 1
+    num_puzzles = len(all_inputs)
+
     # To Numpy
     def _seq_to_numpy(seq):
         arr = np.concatenate(seq).reshape(len(seq), -1)
@@ -124,7 +137,10 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 
     # Metadata matching the other generator's format
     metadata = {
-        "num_puzzles": num_puzzles,
+        "num_puzzles": num_puzzles,           # Total including augmentations
+        "num_groups": num_groups,              # Unique base puzzles
+        "num_augmentations": num_aug,          # Augmentations per puzzle
+        "mean_puzzles_per_group": num_puzzles / num_groups if num_groups > 0 else 1,
         "grid_size": grid_size,
         "max_grid_size": grid_size,
         "min_givens": min_givens,
@@ -143,13 +159,12 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
     np.save(os.path.join(save_dir, "all__inputs.npy"), inputs_arr)
     np.save(os.path.join(save_dir, "all__labels.npy"), labels_arr)
     np.save(os.path.join(save_dir, "all__puzzle_identifiers.npy"), puzzle_identifiers)
+    np.save(os.path.join(save_dir, "all__puzzle_indices.npy"), 
+            np.array(puzzle_indices, dtype=np.int32))
+    np.save(os.path.join(save_dir, "all__group_indices.npy"), 
+            np.array(group_indices, dtype=np.int32))
         
-    print(f"✓ Saved {set_name} split:")
-    print(f"  - inputs: {inputs_arr.shape}")
-    print(f"  - labels: {labels_arr.shape}")
-    
-    return num_puzzles, remaining_data
-
+    return num_groups, num_puzzles, remaining_data
 
 @click.command()
 @click.option("--source-repo", default="sapientinc/sudoku-extreme", help="Source HuggingFace repository")
@@ -163,26 +178,25 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
                     min_difficulty: Optional[int], num_aug: int, eval_ratio: Optional[float], seed: int):
     np.random.seed(seed)
     
-    num_train, _ = convert_subset("train", source_repo, output_dir, subsample_size, min_difficulty, num_aug)
+    num_train_groups, num_train, _ = convert_subset("train", source_repo, output_dir, 
+                                                      subsample_size, min_difficulty, num_aug)
     
-    # Val and test sets are taken from test.csv (no leakage with training)
-    # Calculate eval subsample size from original test.csv size
+    # Val and test (no augmentation, so groups = puzzles)
     eval_subsample_size = None
     if eval_ratio is not None:
-        # Count original test.csv size
         with open(hf_hub_download(source_repo, "test.csv", repo_type="dataset"), newline="") as csvfile:
             reader = csv.reader(csvfile)
-            next(reader)  # Skip header
+            next(reader)
             original_test_size = sum(1 for _ in reader)
         eval_subsample_size = int(original_test_size * eval_ratio)
         print(f"Original test.csv has {original_test_size} samples, using {eval_subsample_size} for each eval split")
     
-    # Generate val set, keeping remaining data for test
-    num_val, remaining_data = convert_subset("val", source_repo, output_dir, eval_subsample_size, min_difficulty, num_aug=0)
+    num_val_groups, num_val, remaining_data = convert_subset("val", source_repo, output_dir, 
+                                                               eval_subsample_size, min_difficulty, num_aug=0)
     
-    # Generate test set from remaining pool
-    num_test, _ = convert_subset("test", source_repo, output_dir, eval_subsample_size, min_difficulty, num_aug=0, 
-                                  preloaded_data=remaining_data)
+    num_test_groups, num_test, _ = convert_subset("test", source_repo, output_dir, 
+                                                    eval_subsample_size, min_difficulty, num_aug=0,
+                                                    preloaded_data=remaining_data)
     
     # Save global metadata
     overall_meta = {
@@ -190,16 +204,26 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
         "max_grid_size": 9,
         "vocab_size": 12,
         "seq_len": 81,
+        # Puzzle counts (including augmentations)
         "num_train": num_train,
         "num_val": num_val,
         "num_test": num_test,
+        # Group counts (unique base puzzles) - USE THIS FOR STEPS/EPOCH
+        "num_train_groups": num_train_groups,
+        "num_val_groups": num_val_groups,
+        "num_test_groups": num_test_groups,
+        # Augmentation info
+        "num_augmentations": num_aug,
         "seed": seed,
     }
     
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(overall_meta, f, indent=2)
     
-    print(f"\n✓ Saved to {output_dir}")
+    print(f"\n✓ Dataset saved to {output_dir}")
+    print(f"  Train: {num_train_groups} groups × {1 + num_aug} = {num_train} puzzles")
+    print(f"  Val:   {num_val_groups} groups = {num_val} puzzles")
+    print(f"  Test:  {num_test_groups} groups = {num_test} puzzles")
 
 
 if __name__ == "__main__":

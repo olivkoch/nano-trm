@@ -40,8 +40,8 @@ def dihedral_transform(arr: np.ndarray, idx: int) -> np.ndarray:
 
 def convert_subset(set_name: str, source_repo: str, output_dir: str,
                    subsample_size: Optional[int], num_aug: int,
-                   preloaded_data: Optional[Tuple] = None) -> Tuple[int, Optional[Tuple]]:
-    """Convert a subset and return the number of puzzles generated and optionally the remaining data."""
+                   preloaded_data: Optional[Tuple] = None) -> Tuple[int, int, Optional[Tuple]]:
+    """Convert a subset and return (num_groups, num_puzzles, remaining_data)."""
     
     # Read CSV or use preloaded data
     if preloaded_data is not None:
@@ -88,6 +88,10 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 
     all_inputs = []
     all_labels = []
+    puzzle_identifiers = []
+    puzzle_indices = [0]  # Start at 0
+    group_indices = [0]   # Start at 0
+    puzzle_id = 0
     
     for orig_inp, orig_out in zip(tqdm(inputs, desc=f"Processing {set_name}"), labels):
         for aug_idx in range(1 + num_augments):
@@ -102,6 +106,16 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 
             all_inputs.append(inp)
             all_labels.append(out)
+            puzzle_identifiers.append(0)
+            
+            puzzle_id += 1
+            puzzle_indices.append(puzzle_id)
+        
+        # Close the group after all augmentations of this puzzle
+        group_indices.append(puzzle_id)
+
+    num_groups = len(group_indices) - 1
+    num_puzzles = len(all_inputs)
 
     # Build char to id mapping
     char2id = np.zeros(256, dtype=np.uint8)
@@ -115,15 +129,17 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
     
     inputs_arr = _seq_to_numpy(all_inputs)
     labels_arr = _seq_to_numpy(all_labels)
-    puzzle_identifiers = np.zeros(len(all_inputs), dtype=np.int32)
+    puzzle_identifiers = np.array(puzzle_identifiers, dtype=np.int32)
 
-    num_puzzles = len(all_inputs)
     seq_len = grid_size * grid_size
     vocab_size = len(CHARSET) + 1  # PAD + charset
 
     # Metadata matching Sudoku format
     metadata = {
-        "num_puzzles": num_puzzles,
+        "num_puzzles": num_puzzles,           # Total including augmentations
+        "num_groups": num_groups,              # Unique base puzzles
+        "num_augmentations": num_aug if set_name == "train" else 0,
+        "mean_puzzles_per_group": num_puzzles / num_groups if num_groups > 0 else 1,
         "grid_size": grid_size,
         "max_grid_size": grid_size,
         "seq_len": seq_len,
@@ -140,12 +156,17 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
     np.save(os.path.join(save_dir, "all__inputs.npy"), inputs_arr)
     np.save(os.path.join(save_dir, "all__labels.npy"), labels_arr)
     np.save(os.path.join(save_dir, "all__puzzle_identifiers.npy"), puzzle_identifiers)
+    np.save(os.path.join(save_dir, "all__puzzle_indices.npy"), 
+            np.array(puzzle_indices, dtype=np.int32))
+    np.save(os.path.join(save_dir, "all__group_indices.npy"), 
+            np.array(group_indices, dtype=np.int32))
         
     print(f"✓ Saved {set_name} split:")
+    print(f"  - {num_groups} groups × {1 + (num_aug if set_name == 'train' else 0)} = {num_puzzles} puzzles")
     print(f"  - inputs: {inputs_arr.shape}")
     print(f"  - labels: {labels_arr.shape}")
     
-    return num_puzzles, remaining_data
+    return num_groups, num_puzzles, remaining_data
 
 
 @click.command()
@@ -160,12 +181,12 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
     np.random.seed(seed)
     
     # Dihedral group has 8 elements (indices 0-7), so max meaningful num_aug is 7
-    # (original + 7 augmented = 8 total, matching ref code's `range(8)`)
     if num_aug > 7:
         print(f"Warning: num_aug={num_aug} clamped to 7 (dihedral group has 8 unique transforms)")
         num_aug = 7
     
-    num_train, _ = convert_subset("train", source_repo, output_dir, subsample_size, num_aug)
+    num_train_groups, num_train, _ = convert_subset("train", source_repo, output_dir, 
+                                                     subsample_size, num_aug)
     
     # Val and test sets are taken from test.csv (no leakage with training)
     eval_subsample_size = None
@@ -178,11 +199,13 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
         print(f"Original test.csv has {original_test_size} samples, using {eval_subsample_size} for each eval split")
     
     # Generate val set, keeping remaining data for test
-    num_val, remaining_data = convert_subset("val", source_repo, output_dir, eval_subsample_size, num_aug=0)
+    num_val_groups, num_val, remaining_data = convert_subset("val", source_repo, output_dir, 
+                                                              eval_subsample_size, num_aug=0)
     
     # Generate test set from remaining pool
-    num_test, _ = convert_subset("test", source_repo, output_dir, eval_subsample_size, num_aug=0,
-                                  preloaded_data=remaining_data)
+    num_test_groups, num_test, _ = convert_subset("test", source_repo, output_dir, 
+                                                   eval_subsample_size, num_aug=0,
+                                                   preloaded_data=remaining_data)
     
     # Infer grid size from first training file
     train_meta_path = os.path.join(output_dir, "train", "dataset.json")
@@ -196,16 +219,26 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
         "max_grid_size": grid_size,
         "vocab_size": len(CHARSET) + 1,
         "seq_len": grid_size * grid_size,
+        # Puzzle counts (including augmentations)
         "num_train": num_train,
         "num_val": num_val,
         "num_test": num_test,
+        # Group counts (unique base puzzles) - USE THIS FOR STEPS/EPOCH
+        "num_train_groups": num_train_groups,
+        "num_val_groups": num_val_groups,
+        "num_test_groups": num_test_groups,
+        # Augmentation info
+        "num_augmentations": num_aug,
         "seed": seed,
     }
     
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(overall_meta, f, indent=2)
     
-    print(f"\n✓ Saved to {output_dir}")
+    print(f"\n✓ Dataset saved to {output_dir}")
+    print(f"  Train: {num_train_groups} groups × {1 + num_aug} = {num_train} puzzles")
+    print(f"  Val:   {num_val_groups} groups = {num_val} puzzles")
+    print(f"  Test:  {num_test_groups} groups = {num_test} puzzles")
 
 
 if __name__ == "__main__":

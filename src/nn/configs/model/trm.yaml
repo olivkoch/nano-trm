@@ -17,9 +17,10 @@ num_heads: ${model_tuning.num_heads}
 puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
 puzzle_emb_len: ${model_tuning.puzzle_emb_len}
 rope_theta: ${model_tuning.rope_theta}
-use_2d_rope: ${model_tuning.use_2d_rope}
+pos_emb_type: ${model_tuning.pos_emb_type}
 lr_min_ratio: ${model_tuning.lr_min_ratio}
 use_sigreg: ${model_tuning.use_sigreg}
+use_mlp: ${model_tuning.use_mlp}
 attn_gate_type: ${model_tuning.attn_gate_type}
 output_dir: None
 

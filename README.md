@@ -4,35 +4,42 @@ This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/
 
 Reference [code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
 
+Train a TRM in a few minutes on an A10! Or reproduce the official TRM results and push the envelope.
+
 # Data
 
 ARC-AGI: You need to download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
 
 Other datasets are generated locally.
 
-# Sudoku
+# Sudoku Extreme
 
-## Data
+## Reproduce the results of the TRM paper
+
+Generate data: `uv run python scripts/data/build_sudoku_extreme_dataset.py --output-dir ./data/sudoku_extreme_1k_aug_1k --subsample-size 1000 --num-aug 1000 --eval-ratio 0.01`
+
+Run a training: `uv run python src/nn/train.py experiment=trm_sudoku_extreme_1k_aug_1k`
+
+Training time ~10h on an H100. You should get to ~85% exact accuracy on validation.
+
+# Maze Hard
+
+Generate data: `uv run python scripts/data/build_maze_dataset.py --output-dir ./data/maze_30x30 --num-aug 7 --eval-ratio 0.5`
+
+Run a training: `uv run python src/nn/train.py experiment=trm_maze`
+
+
+# Iterate on smaller Sudoku datasets
 
 To generate a Sudoku dataset: `./bash/generate_sudoku_data.sh`
 
 To test the data: `uv run tests/src/nn/data/test_sudoku_data.py <data_dir>`
 
-To generate a Sudoku Extreme dataset: 'uv run python scripts/data/build_sudoku_extreme_dataset.py --output-dir data/sudoku-extreme-10k  --subsample-size 10000`
+Run a training: `uv run python src/nn/train.py experiment=trm_sudoku4x4` (takes a few mins on an A10)
 
-## Training
+Independant evaluation with visualizations: `uv run python src/nn/evaluate.py +checkpoint=/tmp/ml-experiments/lunar-pine-174/checkpoints/last.ckpt +data_dir=./data/sudoku_4x4_small`
 
-`uv run python src/nn/train.py experiment=trm_sudoku4x4` (takes a few mins on an A10)
-
-## Evaluation
-
-`uv run python src/nn/evaluate.py +checkpoint=/tmp/ml-experiments/lunar-pine-174/checkpoints/last.ckpt +data_dir=./data/sudoku_4x4_small`
-
-## Visualization
-
-To visualize the results of a model, use `notebooks/neural_viewer.ipynb`
-
-# Self-Play (Connect Four)
+# Self-Play (WIP)
 
 Generate curriculum training data by pitching two minimax players against each other: `uv run python scripts/data/generate_c4_curriculum_data.py --n-games 50000 --temp-player1 0.1 --temp-player2 0.3 --depth 4 --to-file minimax_games_.pkl`
 

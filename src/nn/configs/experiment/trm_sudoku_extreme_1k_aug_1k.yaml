@@ -31,13 +31,20 @@ model_tuning:
   hidden_size: 512
   ffn_expansion: 4
   rope_theta: 10000
-  use_2d_rope: true
+  pos_emb_type: null
+  use_mlp: true
   use_sigreg: false
-  attn_gate_type: "headwise"
+  attn_gate_type: null
 
 trainer:
-  check_val_every_n_epoch: 10
-  limit_train_batches: 10
+  check_val_every_n_epoch: 100
+
+callbacks:
+  ema:
+    _target_: src.nn.callbacks.ema.EMACallback
+    decay: 0.999
+    use_ema_for_validation: true
+    use_ema_for_test: true
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

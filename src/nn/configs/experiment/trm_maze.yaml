@@ -10,7 +10,7 @@ tags: ["maze", "trm", "30x30"]
 
 timekeeping:
   max_epochs: 50000
-  batch_size: 768
+  batch_size: 128
   num_workers: 0
 
 model_tuning:
@@ -18,7 +18,7 @@ model_tuning:
   learning_rate_emb: 1e-4
   warmup_steps: 2000
   weight_decay: 1.0
-  lr_min_ratio: 0.01
+  lr_min_ratio: 1.0
   num_heads: 8
   halt_exploration_prob: 0.1
   N_supervision: 16
@@ -31,13 +31,20 @@ model_tuning:
   hidden_size: 512
   ffn_expansion: 4
   rope_theta: 10000
-  use_2d_rope: true
+  pos_emb_type: "1d"
+  use_mlp: false
   use_sigreg: false
-  attn_gate_type: "headwise"
+  attn_gate_type: null
 
 trainer:
   check_val_every_n_epoch: 10
-  limit_train_batches: 10
+
+callbacks:
+  ema:
+    _target_: src.nn.callbacks.ema.EMACallback
+    decay: 0.999
+    use_ema_for_validation: true
+    use_ema_for_test: true
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

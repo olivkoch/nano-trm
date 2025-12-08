@@ -32,8 +32,9 @@ from src.nn.modules.trm_block import (
     ReasoningBlockConfig,
     ReasoningModule,
     RotaryEmbedding,
-    RotaryEmbedding2D
+    RotaryEmbedding2D,
 )
+from src.nn.modules.sigreg import compute_sigreg_loss
 from src.nn.modules.utils import stablemax_cross_entropy, trunc_normal_init_
 from src.nn.utils import RankedLogger
 
@@ -42,8 +43,8 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 @dataclass
 class TRMInnerCarry:
-    z_H: torch.Tensor  # High-level state (y in your code)
-    z_L: torch.Tensor  # Low-level state (z in your code)
+    z_H: torch.Tensor  # High-level state (y = the solution representation)
+    z_L: torch.Tensor  # Low-level state (z = the problem representation)
 
 
 @dataclass
@@ -80,9 +81,10 @@ class TRMModule(LightningModule):
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
         rope_theta: int = 10000,
-        use_2d_rope: bool = False,
+        pos_emb_type: str = None,
         lr_min_ratio: float = 1.0,
         use_sigreg: bool = False,
+        use_mlp: bool = False,
         attn_gate_type: str = None,  # None, "headwise", "elementwise"
         vocab_size: int = 0,  # Should be set from datamodule
         num_puzzles: int = 0,  # Should be set from datamodule
@@ -103,25 +105,29 @@ class TRMModule(LightningModule):
         self.embed_scale = math.sqrt(hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        log.info(f"Creating TRM with vocab size={vocab_size}, seq_len={seq_len}, puzzle_emb_len={puzzle_emb_len} {use_2d_rope=}")
+        log.info(f"Creating TRM with vocab size={vocab_size}, seq_len={seq_len}, puzzle_emb_len={puzzle_emb_len} {pos_emb_type=}")
 
         self.input_embedding = CastedEmbedding(
             vocab_size, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
         )
 
-        if use_2d_rope:
+        if pos_emb_type == "2d":
+            log.info("Using 2D Rotary Embeddings")
             self.pos_embedding = RotaryEmbedding2D(
             dim=hidden_size // num_heads,
             prefix_len=puzzle_emb_len,
             max_grid_size=int(math.sqrt(seq_len)),  # e.g., 9 for seq_len=81
             base=rope_theta,
         )
-        else:
+        elif pos_emb_type == "1d":
+            log.info("Using 1D Rotary Embeddings")
             self.pos_embedding = RotaryEmbedding(
                 dim=hidden_size // num_heads,
                 max_position_embeddings=seq_len + puzzle_emb_len,
                 base=rope_theta,
             )
+        else:
+            log.info("Not using Rotary Embeddings")
 
         # a single network (not two separate networks)
         reasoning_config = ReasoningBlockConfig(
@@ -130,7 +136,7 @@ class TRMModule(LightningModule):
             expansion=ffn_expansion,
             rms_norm_eps=1e-5,
             seq_len=seq_len,
-            mlp_t=False,
+            mlp_t=use_mlp,
             puzzle_emb_ndim=puzzle_emb_dim,
             puzzle_emb_len=puzzle_emb_len,
             attn_gate_type=attn_gate_type,
@@ -182,7 +188,6 @@ class TRMModule(LightningModule):
             self.puzzle_emb = None
             self.puzzle_emb_len = 0
 
-        self.last_step_time = None
         self.manual_step = 0
 
     def setup(self, stage: str):
@@ -223,7 +228,6 @@ class TRMModule(LightningModule):
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
-            # print(f"Catting {puzzle_embedding.view(-1, self.puzzle_emb_len, self.hparams.hidden_size).shape=} and {embedding.shape=}")
             embedding = torch.cat(
                 (
                     puzzle_embedding.view(-1, self.puzzle_emb_len, self.hparams.hidden_size),
@@ -271,73 +275,6 @@ class TRMModule(LightningModule):
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.z_H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.z_L_init, carry.z_L),
         )
-
-    def sigreg(self,
-        x: torch.Tensor, 
-        global_step: int, 
-        num_slices: int = 256,
-        num_points: int = 17,
-    ) -> torch.Tensor:
-        """
-        SIGReg: Sliced Isotropic Gaussian Regularization.
-        
-        Projects embeddings onto random 1D directions and checks if 
-        each projection is Gaussian using Epps-Pulley characteristic function test.
-        
-        Args:
-            x: [N, K] tensor of embeddings (flattened batch*seq, hidden)
-            global_step: for synchronized random slice sampling
-            num_slices: number of random projection directions
-            num_points: integration points for characteristic function
-        
-        Returns:
-            Scalar loss measuring deviation from isotropic Gaussian
-        """
-        dev = dict(device=x.device)
-        
-        # Synchronized random projections
-        g = torch.Generator(**dev)
-        g.manual_seed(global_step)
-        
-        proj_shape = (x.size(1), num_slices)  # [hidden, num_slices]
-        A = torch.randn(proj_shape, generator=g, **dev)
-        A = A / A.norm(p=2, dim=0, keepdim=True)  # Normalize columns
-        
-        # Project x onto random directions: [N, num_slices]
-        x_proj = x @ A
-        
-        # Standardize each slice (so we compare to N(0,1))
-        x_proj = (x_proj - x_proj.mean(dim=0, keepdim=True)) / (x_proj.std(dim=0, keepdim=True) + 1e-8)
-        
-        # Epps-Pulley test using characteristic functions
-        t = torch.linspace(-5, 5, num_points, **dev)  # Integration points
-        
-        # Theoretical CF for N(0,1): exp(-t²/2)
-        exp_f = torch.exp(-0.5 * t ** 2)
-        
-        # Empirical CF: E[exp(i*t*x)] for each slice
-        x_t = x_proj.unsqueeze(2) * t  # [N, num_slices, num_points]
-        ecf = (1j * x_t).exp().mean(dim=0)  # [num_slices, num_points]
-        
-        # Weighted L2 distance between empirical and theoretical CF
-        # Weight by exp_f to focus on important region
-        err = (ecf - exp_f).abs().square() * exp_f
-        
-        # Integrate over t, average over slices
-        loss = torch.trapezoid(err, t, dim=1).mean()
-        
-        return loss
-    
-    def compute_sigreg_loss(self, z_H: torch.Tensor, z_L: torch.Tensor) -> torch.Tensor:
-        """Apply SIGReg to hidden states."""
-        # Flatten to [batch*seq, hidden]
-        z_H_flat = z_H.reshape(-1, z_H.shape[-1])
-        z_L_flat = z_L.reshape(-1, z_L.shape[-1])
-        
-        loss_H = self.sigreg(x=z_H_flat, global_step=self.global_step, num_slices=self.sigreg_slices)
-        loss_L = self.sigreg(x=z_L_flat, global_step=self.global_step, num_slices=self.sigreg_slices)
-        
-        return loss_H + loss_L
     
     def inner_forward(
         self, carry: TRMInnerCarry, batch: Dict[str, torch.Tensor]
@@ -350,7 +287,6 @@ class TRMModule(LightningModule):
         input_embeddings = self._input_embeddings(batch["input"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
         # H_cycles-1 without grad
         with torch.no_grad():
@@ -364,7 +300,7 @@ class TRMModule(LightningModule):
         z_H = self.lenet(z_H, z_L, **seq_info)
 
         if self.training and self.hparams.use_sigreg:
-            self._sigreg_loss = self.compute_sigreg_loss(z_H, z_L)
+            self._sigreg_loss = compute_sigreg_loss(z_H, z_L, global_step=self.manual_step, num_slices=self.sigreg_slices)
     
         # LM Outputs
         new_carry = TRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
@@ -490,19 +426,7 @@ class TRMModule(LightningModule):
         Training step that implements supervision through multiple forward passes.
         Each sequence can run up to N_supervision (halt_max_steps) times.
         """
-        import time
-
-        t0 = time.time()
-
-        # monitor time since last step, this could be high if a validation occurred
-        # if self.last_step_time is not None:
-        #     delta = time.time() - self.last_step_time
-        #     if delta > 0.2:
-        #         print(f"WARNING: Time since last training step is long: {delta:.4f} s")
-
         batch_size = batch["input"].shape[0]
-
-        # log.info(f"Batch data samples: input: {batch['input'][:25]} \n output: {batch['output'][:25]} \n puzzle_identifiers: {batch['puzzle_identifiers'][:25]}")
 
         # Handle case when not attached to trainer (for testing)
         try:
@@ -520,52 +444,12 @@ class TRMModule(LightningModule):
             self.carry = self.initial_carry(batch)
 
         # Forward with loss computation
-        self.carry, loss, metrics, all_halted = self.compute_loss_and_metrics(self.carry, batch)
+        self.carry, loss, metrics, _ = self.compute_loss_and_metrics(self.carry, batch)
 
         scaled_loss = loss / batch_size
         scaled_loss.backward()
 
-        # ADD GRADIENT MONITORING HERE
-        with torch.no_grad():
-            # 1. Total gradient norm
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.parameters(), 
-                max_norm=float('inf')  # Don't actually clip, just compute norm
-            ).item()
-            
-            # 2. Key component gradient norms
-            grad_metrics = {}
-            
-            # First attention layer
-            if self.lenet.layers[0].self_attn.qkv_proj.weight.grad is not None:
-                grad_metrics['first_attn'] = self.lenet.layers[0].self_attn.qkv_proj.weight.grad.norm().item()
-            
-            # Last MLP layer
-            if self.lenet.layers[-1].mlp.down_proj.weight.grad is not None:
-                grad_metrics['last_mlp'] = self.lenet.layers[-1].mlp.down_proj.weight.grad.norm().item()
-            
-            # Output heads
-            if self.lm_head.weight.grad is not None:
-                grad_metrics['lm_head'] = self.lm_head.weight.grad.norm().item()
-            
-            if self.q_head.weight.grad is not None:
-                grad_metrics['q_head'] = self.q_head.weight.grad.norm().item()
-            
-            # Log main metric
-            self.log('grad/total_norm', total_grad_norm, on_step=True, prog_bar=True)
-            
-            # Log gradient flow ratio (first vs last layer)
-            if 'first_attn' in grad_metrics and 'last_mlp' in grad_metrics:
-                ratio = grad_metrics['first_attn'] / (grad_metrics['last_mlp'] + 1e-8)
-                self.log('grad/flow_ratio', ratio, on_step=True, prog_bar=True)
-            
-            # Optional: log individual components
-            for name, value in grad_metrics.items():
-                self.log(f'grad/{name}', value, on_step=True)
-            
-            # Warning for problematic gradients
-            if total_grad_norm < 1e-6 or total_grad_norm > 100:
-                log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
+        self.grad_monitoring()
 
         lr_this_step = None
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
@@ -589,7 +473,7 @@ class TRMModule(LightningModule):
                     total_steps=self.total_steps,
                 )
             else:
-                # Constant LR after warmup (you can add decay here if needed)
+                # Constant LR after warmup
                 lr_this_step = base_lr
 
             # Update learning rate
@@ -604,51 +488,11 @@ class TRMModule(LightningModule):
                 opt.step()
                 opt.zero_grad()
 
-        # Log learning rate (will log the last optimizer's LR)
-        self.log("train/lr", lr_this_step, on_step=True)
-
-        # Log metrics
-        if metrics.get("count", 0) > 0:
-            with torch.no_grad():
-                count = metrics["count"]
-                self.log("train/accuracy", metrics.get("accuracy", 0) / count, on_step=True)
-                self.log(
-                    "train/exact_accuracy",
-                    metrics.get("exact_accuracy", 0) / count,
-                    prog_bar=True,
-                    on_step=True,
-                )
-                self.log(
-                    "train/q_halt_accuracy",
-                    metrics.get("q_halt_accuracy", 0) / count,
-                    on_step=True,
-                )
-                self.log(
-                    "train/steps",
-                    metrics.get("steps", 0) / count,
-                    prog_bar=True,
-                    on_step=True,
-                )
-
-                self.log("train/lm_loss", metrics.get("lm_loss", 0) / batch_size, on_step=True)
-                self.log(
-                    "train/q_halt_loss", metrics.get("q_halt_loss", 0) / batch_size, on_step=True
-                )
-
-                avg_halt_steps = metrics.get("steps", 0) / metrics["count"]
-                early_halt_rate = avg_halt_steps < self.hparams.N_supervision
-                self.log("train/early_halt_rate", early_halt_rate, on_step=True)
-
-                if self.hparams.use_sigreg:
-                    self.log("train/sigreg_loss", metrics["sigreg_loss"], on_step=True)
+        self.log_metrics(metrics, lr_this_step=lr_this_step, batch_size=batch_size)
 
         # Assert LM loss is not NaN
         assert not torch.isnan(metrics.get("lm_loss")), f"LM loss is NaN at step {self.manual_step}"
 
-        t1 = time.time()
-        # print(f"Training step time: {t1 - t0:.4f} s")
-
-        self.last_step_time = t1
         self.manual_step += 1
 
         return loss
@@ -719,6 +563,89 @@ class TRMModule(LightningModule):
                     sync_dist=True,
                 )
             return avg_metrics
+
+    def grad_monitoring(self):
+        with torch.no_grad():
+            # 1. Total gradient norm
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.parameters(), 
+                max_norm=float('inf')  # Don't actually clip, just compute norm
+            ).item()
+            
+            # 2. Key component gradient norms
+            grad_metrics = {}
+            
+            # First attention layer
+            if hasattr(self.lenet.layers[0], 'self_attn') and \
+                self.lenet.layers[0].self_attn.qkv_proj.weight.grad is not None:
+                    grad_metrics['first_attn'] = self.lenet.layers[0].self_attn.qkv_proj.weight.grad.norm().item()
+            
+            # Last MLP layer
+            if self.lenet.layers[-1].mlp.down_proj.weight.grad is not None:
+                grad_metrics['last_mlp'] = self.lenet.layers[-1].mlp.down_proj.weight.grad.norm().item()
+            
+            # Output heads
+            if self.lm_head.weight.grad is not None:
+                grad_metrics['lm_head'] = self.lm_head.weight.grad.norm().item()
+            
+            if self.q_head.weight.grad is not None:
+                grad_metrics['q_head'] = self.q_head.weight.grad.norm().item()
+            
+            # Log main metric
+            self.log('grad/total_norm', total_grad_norm, on_step=True, prog_bar=True)
+            
+            # Log gradient flow ratio (first vs last layer)
+            if 'first_attn' in grad_metrics and 'last_mlp' in grad_metrics:
+                ratio = grad_metrics['first_attn'] / (grad_metrics['last_mlp'] + 1e-8)
+                self.log('grad/flow_ratio', ratio, on_step=True, prog_bar=True)
+            
+            # Optional: log individual components
+            for name, value in grad_metrics.items():
+                self.log(f'grad/{name}', value, on_step=True)
+            
+            # Warning for problematic gradients
+            if total_grad_norm < 1e-6 or total_grad_norm > 100:
+                log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
+
+    def log_metrics(self, metrics: dict, lr_this_step: float = None, batch_size: int = None):
+
+        # Log learning rate (will log the last optimizer's LR)
+        self.log("train/lr", lr_this_step, on_step=True)
+
+        # Log metrics
+        if metrics.get("count", 0) > 0:
+            with torch.no_grad():
+                count = metrics["count"]
+                self.log("train/accuracy", metrics.get("accuracy", 0) / count, on_step=True)
+                self.log(
+                    "train/exact_accuracy",
+                    metrics.get("exact_accuracy", 0) / count,
+                    prog_bar=True,
+                    on_step=True,
+                )
+                self.log(
+                    "train/q_halt_accuracy",
+                    metrics.get("q_halt_accuracy", 0) / count,
+                    on_step=True,
+                )
+                self.log(
+                    "train/steps",
+                    metrics.get("steps", 0) / count,
+                    prog_bar=True,
+                    on_step=True,
+                )
+
+                self.log("train/lm_loss", metrics.get("lm_loss", 0) / batch_size, on_step=True)
+                self.log(
+                    "train/q_halt_loss", metrics.get("q_halt_loss", 0) / batch_size, on_step=True
+                )
+
+                avg_halt_steps = metrics.get("steps", 0) / metrics["count"]
+                early_halt_rate = avg_halt_steps < self.hparams.N_supervision
+                self.log("train/early_halt_rate", early_halt_rate, on_step=True)
+
+                if self.hparams.use_sigreg:
+                    self.log("train/sigreg_loss", metrics["sigreg_loss"], on_step=True)
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Test step - same as validation."""

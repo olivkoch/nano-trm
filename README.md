@@ -85,13 +85,15 @@ Follow me on [X](https://x.com/olivkoch)
 # Sweeps
 
 ## 1. Create sweep
-```uv run python scripts/create_sweep.py \
+```
+uv run python scripts/create_sweep.py \
     --sweep-file src/nn/configs/sweeps/trm_sweep.yaml \
     --project trm-sudoku
 ```
 
 ## 2. Run agent
-```uv run python src/nn/train_sweep.py \
+```
+uv run python src/nn/train_sweep.py \
     --sweep-id <sweep_id> \
     --project trm-sudoku \
     --experiment trm_sudoku6x6 \

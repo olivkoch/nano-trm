@@ -2,9 +2,11 @@
 
 This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1). Reference [code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
 
-Train a TRM in a few minutes on an A10! Or reproduce the official TRM results and push the envelope.
+Watch the [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M)!
 
-Watch the [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M)! Reproduce the Sudoku Extreme results!
+Train a TRM in a few minutes on an A10. Reproduce the official TRM results. Push the envelope.
+
+Reproducing the results on Sudoku Extreme:
 
 ![Evalution on Sudoku extreme](assets/pics/extreme-val.png)
 

@@ -4,6 +4,8 @@ This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/
 
 Train a TRM in a few minutes on an A10! Or reproduce the official TRM results and push the envelope.
 
+Watch the [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M)!
+
 # Installation
 
 This repo comes with `uv`. You just need to run `uv run python ...` commands and everything will be installed automagically on the first run.

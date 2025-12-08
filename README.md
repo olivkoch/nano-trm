@@ -10,8 +10,6 @@ This repo comes with `uv`. You just need to run `uv run python ...` commands and
 
 # Sudoku Extreme
 
-## Reproduce the results of the TRM paper
-
 Generate data: 
 
 `uv run python scripts/data/build_sudoku_extreme_dataset.py --output-dir ./data/sudoku_extreme_1k_aug_1k --subsample-size 1000 --num-aug 1000 --eval-ratio 0.01`
@@ -20,7 +18,7 @@ Run a training:
 
 `uv run python src/nn/train.py experiment=trm_sudoku_extreme_1k_aug_1k`
 
-Training time ~10h on an H100 SXM5. You should get to ~85% exact accuracy on validation.
+Training time ~10h on an H100 SXM5. You should get to ~87% exact accuracy on validation (same as the reference implementation)
 
 # Maze Hard
 
@@ -32,11 +30,11 @@ Run a training:
 
 `uv run python src/nn/train.py experiment=trm_maze`
 
-Training time ~20h on an H100 SXM5.
+Training time ~20h on an H100 SXM5. You should get to ~85% exact accuracy on validation (same as the reference implementation)
 
 # ARC-AGI
 
-You need to download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
+Download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
 
 Experiments in progress.
 

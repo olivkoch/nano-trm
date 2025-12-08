@@ -1,10 +1,12 @@
 # An implementation of TRM
 
-This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1)
-
-Reference [code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
+This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1). Reference [code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
 
 Train a TRM in a few minutes on an A10! Or reproduce the official TRM results and push the envelope.
+
+# Installation
+
+This repo comes with `uv`. You just need to run `uv run python ...` commands and everything will be installed automagically on the first run.
 
 # Sudoku Extreme
 

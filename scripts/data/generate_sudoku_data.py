@@ -19,6 +19,83 @@ from src.nn.data.sudoku_datamodule import SudokuDataModule, SudokuDataset, Puzzl
 from src.nn.utils.constants import IGNORE_LABEL_ID
 
 
+def shuffle_sudoku(board: np.ndarray, solution: np.ndarray, grid_size: int):
+    """Apply Sudoku-preserving transformations (digit relabeling + band/stack shuffles).
+    
+    Works for any grid size with appropriate box dimensions.
+    """
+    # Determine box dimensions
+    if grid_size == 4:
+        box_rows, box_cols = 2, 2
+        num_bands, num_stacks = 2, 2
+    elif grid_size == 6:
+        box_rows, box_cols = 2, 3
+        num_bands, num_stacks = 3, 2
+    elif grid_size == 9:
+        box_rows, box_cols = 3, 3
+        num_bands, num_stacks = 3, 3
+    else:
+        # Fallback: just do digit relabeling
+        digit_map = np.pad(np.random.permutation(np.arange(1, grid_size + 1)), (1, 0))
+        return digit_map[board], digit_map[solution]
+    
+    # Create a random digit mapping: a permutation of 1..grid_size, with zero (blank) unchanged
+    digit_map = np.pad(np.random.permutation(np.arange(1, grid_size + 1)), (1, 0))
+    
+    # Randomly decide whether to transpose
+    transpose_flag = np.random.rand() < 0.5
+
+    # Generate a valid row permutation:
+    # Shuffle bands and within each band, shuffle rows
+    bands = np.random.permutation(num_bands)
+    row_perm = np.concatenate([b * box_rows + np.random.permutation(box_rows) for b in bands])
+
+    # Similarly for columns (stacks)
+    stacks = np.random.permutation(num_stacks)
+    col_perm = np.concatenate([s * box_cols + np.random.permutation(box_cols) for s in stacks])
+
+    # Build position mapping
+    mapping = np.array([row_perm[i // grid_size] * grid_size + col_perm[i % grid_size] 
+                        for i in range(grid_size * grid_size)])
+
+    def apply_transformation(x: np.ndarray) -> np.ndarray:
+        # Apply transpose flag
+        if transpose_flag:
+            x = x.T.copy()
+        # Apply the position mapping
+        new_board = x.flatten()[mapping].reshape(grid_size, grid_size).copy()
+        # Apply digit mapping
+        return digit_map[new_board]
+
+    return apply_transformation(board), apply_transformation(solution)
+
+
+def dihedral_transform(arr: np.ndarray, idx: int) -> np.ndarray:
+    """Apply one of 8 dihedral group transformations (D4).
+    
+    idx 0-3: rotations (0°, 90°, 180°, 270°)
+    idx 4-7: reflections (horizontal, vertical, diagonal, anti-diagonal)
+    """
+    if idx == 0:
+        return arr
+    elif idx == 1:
+        return np.rot90(arr, 1)
+    elif idx == 2:
+        return np.rot90(arr, 2)
+    elif idx == 3:
+        return np.rot90(arr, 3)
+    elif idx == 4:
+        return np.fliplr(arr)
+    elif idx == 5:
+        return np.flipud(arr)
+    elif idx == 6:
+        return np.rot90(arr, 1).T  # diagonal flip
+    elif idx == 7:
+        return np.rot90(arr, 3).T  # anti-diagonal flip
+    else:
+        raise ValueError(f"Invalid dihedral index: {idx}")
+
+
 def save_split_to_disk(
     output_dir: Path,
     split: str,
@@ -28,19 +105,15 @@ def save_split_to_disk(
     max_grid_size: int,
     min_givens: int,
     max_givens: int,
-    vocab_size: int,  # Added - use global vocab_size
+    vocab_size: int,
+    num_aug: int = 0,
 ):
-    """Save a split (train/val/test) to disk."""
+    """Save a split (train/val/test) to disk with group tracking."""
     split_dir = output_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
 
-    num_puzzles = len(split_indices)
     seq_len = max_grid_size * max_grid_size
-
-    # Pre-allocate arrays
-    inputs = np.zeros((num_puzzles, seq_len), dtype=np.int32)
-    labels = np.zeros((num_puzzles, seq_len), dtype=np.int32)
-    puzzle_identifiers = np.zeros(num_puzzles, dtype=np.int32)
+    num_augments = num_aug if split == "train" else 0
 
     # Create a temporary dataset to access pad_and_encode
     temp_ds = SudokuDataset(
@@ -53,38 +126,73 @@ def save_split_to_disk(
         split_indices=split_indices,
     )
 
-    print(f"Encoding {split} split ({num_puzzles} puzzles)...")
-    for i in tqdm(range(num_puzzles), desc=f"Encoding {split}"):
-        pool_idx = split_indices[i]
-        puzzle, solution = puzzle_pool[pool_idx]
+    # Generate with augmentations
+    all_inputs = []
+    all_labels = []
+    puzzle_identifiers = []
+    puzzle_indices = [0]
+    group_indices = [0]
+    puzzle_id = 0
 
-        inp, lbl = temp_ds.pad_and_encode(puzzle, solution)
-        inputs[i] = inp
-        labels[i] = lbl
-        puzzle_identifiers[i] = 0
+    print(f"Encoding {split} split ({len(split_indices)} base puzzles, {1 + num_augments} variants each)...")
+    for i in tqdm(range(len(split_indices)), desc=f"Encoding {split}"):
+        pool_idx = split_indices[i]
+        orig_puzzle, orig_solution = puzzle_pool[pool_idx]
+
+        for aug_idx in range(1 + num_augments):
+            if aug_idx == 0:
+                puzzle, solution = orig_puzzle, orig_solution
+            else:
+                puzzle, solution = shuffle_sudoku(orig_puzzle, orig_solution, grid_size)
+
+            inp, lbl = temp_ds.pad_and_encode(puzzle, solution)
+            all_inputs.append(inp)
+            all_labels.append(lbl)
+            puzzle_identifiers.append(0)
+
+            puzzle_id += 1
+            puzzle_indices.append(puzzle_id)
+        
+        group_indices.append(puzzle_id)
+
+    num_groups = len(group_indices) - 1
+    num_puzzles = len(all_inputs)
+
+    # Convert to numpy arrays
+    inputs = np.array(all_inputs, dtype=np.int32)
+    labels = np.array(all_labels, dtype=np.int32)
+    puzzle_identifiers = np.array(puzzle_identifiers, dtype=np.int32)
 
     print(f"Saving to {split_dir}...")
     np.save(split_dir / "all__inputs.npy", inputs)
     np.save(split_dir / "all__labels.npy", labels)
     np.save(split_dir / "all__puzzle_identifiers.npy", puzzle_identifiers)
+    np.save(split_dir / "all__puzzle_indices.npy", np.array(puzzle_indices, dtype=np.int32))
+    np.save(split_dir / "all__group_indices.npy", np.array(group_indices, dtype=np.int32))
 
-    # Save split metadata - each split knows its own grid_size
+    # Save split metadata
     metadata = {
         "num_puzzles": num_puzzles,
+        "num_groups": num_groups,
+        "num_augmentations": num_augments,
+        "mean_puzzles_per_group": num_puzzles / num_groups if num_groups > 0 else 1,
         "grid_size": grid_size,
         "max_grid_size": max_grid_size,
         "min_givens": min_givens,
         "max_givens": max_givens,
         "seq_len": seq_len,
-        "vocab_size": vocab_size,  # Same across all splits
+        "vocab_size": vocab_size,
     }
 
     with open(split_dir / "dataset.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
     print(f"✓ Saved {split} split ({grid_size}x{grid_size}):")
+    print(f"  - {num_groups} groups × {1 + num_augments} = {num_puzzles} puzzles")
     print(f"  - inputs: {inputs.shape}")
     print(f"  - labels: {labels.shape}")
+    
+    return num_groups, num_puzzles
 
 
 def save_mixed_split_to_disk(
@@ -94,45 +202,72 @@ def save_mixed_split_to_disk(
     split_indices: list,
     max_grid_size: int,
     vocab_size: int,
+    num_aug: int = 0,
 ):
     """Save a split with mixed grid sizes to disk."""
     split_dir = output_dir / split
     split_dir.mkdir(parents=True, exist_ok=True)
 
-    num_puzzles = len(split_indices)
     seq_len = max_grid_size * max_grid_size
+    num_augments = num_aug if split == "train" else 0
 
-    inputs = np.zeros((num_puzzles, seq_len), dtype=np.int32)
-    labels = np.zeros((num_puzzles, seq_len), dtype=np.int32)
-    puzzle_identifiers = np.zeros(num_puzzles, dtype=np.int32)
-    grid_sizes = np.zeros(num_puzzles, dtype=np.int32)
+    all_inputs = []
+    all_labels = []
+    all_grid_sizes = []
+    puzzle_identifiers = []
+    puzzle_indices = [0]
+    group_indices = [0]
+    puzzle_id = 0
 
-    print(f"Encoding {split} split ({num_puzzles} puzzles)...")
+    print(f"Encoding {split} split ({len(split_indices)} base puzzles)...")
     
-    for i in tqdm(range(num_puzzles), desc=f"Encoding {split}"):
+    for i in tqdm(range(len(split_indices)), desc=f"Encoding {split}"):
         pool_idx = split_indices[i]
-        puzzle, solution, grid_size = puzzle_pool[pool_idx]
+        orig_puzzle, orig_solution, grid_size = puzzle_pool[pool_idx]
 
-        inp, lbl = pad_and_encode_mixed(puzzle, solution, grid_size, max_grid_size)
-        inputs[i] = inp
-        labels[i] = lbl
-        puzzle_identifiers[i] = 0
-        grid_sizes[i] = grid_size
+        for aug_idx in range(1 + num_augments):
+            if aug_idx == 0:
+                puzzle, solution = orig_puzzle, orig_solution
+            else:
+                puzzle, solution = shuffle_sudoku(orig_puzzle, orig_solution, grid_size)
+
+            inp, lbl = pad_and_encode_mixed(puzzle, solution, grid_size, max_grid_size)
+            all_inputs.append(inp)
+            all_labels.append(lbl)
+            all_grid_sizes.append(grid_size)
+            puzzle_identifiers.append(0)
+
+            puzzle_id += 1
+            puzzle_indices.append(puzzle_id)
+        
+        group_indices.append(puzzle_id)
+
+    num_groups = len(group_indices) - 1
+    num_puzzles = len(all_inputs)
+
+    inputs = np.array(all_inputs, dtype=np.int32)
+    labels = np.array(all_labels, dtype=np.int32)
+    grid_sizes = np.array(all_grid_sizes, dtype=np.int32)
+    puzzle_identifiers = np.array(puzzle_identifiers, dtype=np.int32)
 
     print(f"Saving to {split_dir}...")
     np.save(split_dir / "all__inputs.npy", inputs)
     np.save(split_dir / "all__labels.npy", labels)
     np.save(split_dir / "all__puzzle_identifiers.npy", puzzle_identifiers)
     np.save(split_dir / "all__grid_sizes.npy", grid_sizes)
+    np.save(split_dir / "all__puzzle_indices.npy", np.array(puzzle_indices, dtype=np.int32))
+    np.save(split_dir / "all__group_indices.npy", np.array(group_indices, dtype=np.int32))
 
     # Count by grid size
     size_counts = {}
-    for idx in split_indices:
-        _, _, gs = puzzle_pool[idx]
+    for gs in all_grid_sizes:
         size_counts[int(gs)] = size_counts.get(int(gs), 0) + 1
 
     metadata = {
         "num_puzzles": int(num_puzzles),
+        "num_groups": int(num_groups),
+        "num_augmentations": int(num_augments),
+        "mean_puzzles_per_group": num_puzzles / num_groups if num_groups > 0 else 1,
         "mixed_size": True,
         "grid_sizes": [int(gs) for gs in sorted(size_counts.keys())],
         "grid_size_counts": {str(k): int(v) for k, v in size_counts.items()},
@@ -145,8 +280,11 @@ def save_mixed_split_to_disk(
         json.dump(metadata, f, indent=2)
 
     print(f"✓ Saved {split} split:")
+    print(f"  - {num_groups} groups × {1 + num_augments} = {num_puzzles} puzzles")
     for gs, count in sorted(size_counts.items()):
         print(f"  - {gs}x{gs}: {count} puzzles ({100*count/num_puzzles:.1f}%)")
+    
+    return num_groups, num_puzzles
 
 
 def pad_and_encode_mixed(
@@ -643,6 +781,7 @@ def generate_ood_pool(
 @click.option("--num-test", default=1000, type=int)
 @click.option("--min-givens", default=None, type=int)
 @click.option("--max-givens", default=None, type=int)
+@click.option("--num-aug", default=0, type=int, help="Number of augmentations per training puzzle")
 @click.option("--seed", default=42, type=int)
 @click.option("--full", is_flag=True, default=False)
 @click.option("--hybrid", is_flag=True, default=False)
@@ -651,10 +790,12 @@ def generate_ood_pool(
 @click.option("--cache-dir", default="./data/sudoku_cache", type=click.Path())
 def main(
     output_dir, grid_size, max_grid_size, num_train, num_val, num_test,
-    min_givens, max_givens, seed, full, hybrid, mixed_size, cross_size, cache_dir,
+    min_givens, max_givens, num_aug, seed, full, hybrid, mixed_size, cross_size, cache_dir,
 ):
     output_dir = Path(output_dir)
     cache_dir = Path(cache_dir)
+    
+    np.random.seed(seed)
 
     mode_flags = sum([full, hybrid, mixed_size, cross_size])
     if mode_flags > 1:
@@ -709,21 +850,30 @@ def main(
         # Save
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        stats = {}
         for split_name in ["train", "val", "test"]:
-            save_mixed_split_to_disk(
+            num_groups, num_puzzles = save_mixed_split_to_disk(
                 output_dir, split_name, puzzle_pool, 
-                split_indices[split_name], max_grid_size, vocab_size
+                split_indices[split_name], max_grid_size, vocab_size, 
+                num_aug if split_name == "train" else 0
             )
+            stats[split_name] = (num_groups, num_puzzles)
         
-        # Global metadata - simple!
+        # Global metadata
         overall_meta = {
             "mode": "mixed-size",
             "max_grid_size": max_grid_size,
             "vocab_size": vocab_size,
             "seq_len": max_grid_size * max_grid_size,
-            "num_train": num_train,
-            "num_val": num_val,
-            "num_test": num_test,
+            # Puzzle counts (including augmentations)
+            "num_train": stats["train"][1],
+            "num_val": stats["val"][1],
+            "num_test": stats["test"][1],
+            # Group counts (unique base puzzles)
+            "num_train_groups": stats["train"][0],
+            "num_val_groups": stats["val"][0],
+            "num_test_groups": stats["test"][0],
+            "num_augmentations": num_aug,
             "seed": seed,
         }
         
@@ -731,6 +881,9 @@ def main(
             json.dump(overall_meta, f, indent=2)
 
         click.echo(f"\n✓ Saved to {output_dir}")
+        click.echo(f"  Train: {stats['train'][0]} groups × {1 + num_aug} = {stats['train'][1]} puzzles")
+        click.echo(f"  Val:   {stats['val'][0]} groups = {stats['val'][1]} puzzles")
+        click.echo(f"  Test:  {stats['test'][0]} groups = {stats['test'][1]} puzzles")
         return
 
     # =========================================================================
@@ -780,28 +933,32 @@ def main(
         # Save
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        save_split_to_disk(
+        num_train_groups, num_train_puzzles = save_split_to_disk(
             output_dir, "train", train_pool, list(range(len(train_pool))),
-            train_grid_size, max_grid_size, train_min_givens, train_max_givens, vocab_size
+            train_grid_size, max_grid_size, train_min_givens, train_max_givens, vocab_size, num_aug
         )
-        save_split_to_disk(
+        num_val_groups, num_val_puzzles = save_split_to_disk(
             output_dir, "val", val_pool, list(range(len(val_pool))),
-            eval_grid_size, max_grid_size, eval_min_givens, eval_max_givens, vocab_size
+            eval_grid_size, max_grid_size, eval_min_givens, eval_max_givens, vocab_size, 0
         )
-        save_split_to_disk(
+        num_test_groups, num_test_puzzles = save_split_to_disk(
             output_dir, "test", test_pool, list(range(len(test_pool))),
-            eval_grid_size, max_grid_size, eval_min_givens, eval_max_givens, vocab_size
+            eval_grid_size, max_grid_size, eval_min_givens, eval_max_givens, vocab_size, 0
         )
         
-        # Global metadata - simple!
+        # Global metadata
         overall_meta = {
             "mode": "cross-size",
             "max_grid_size": max_grid_size,
             "vocab_size": vocab_size,
             "seq_len": max_grid_size * max_grid_size,
-            "num_train": num_train,
-            "num_val": num_val,
-            "num_test": num_test,
+            "num_train": num_train_puzzles,
+            "num_val": num_val_puzzles,
+            "num_test": num_test_puzzles,
+            "num_train_groups": num_train_groups,
+            "num_val_groups": num_val_groups,
+            "num_test_groups": num_test_groups,
+            "num_augmentations": num_aug,
             "seed": seed,
         }
         
@@ -809,6 +966,9 @@ def main(
             json.dump(overall_meta, f, indent=2)
 
         click.echo(f"\n✓ Saved to {output_dir}")
+        click.echo(f"  Train: {num_train_groups} groups × {1 + num_aug} = {num_train_puzzles} puzzles")
+        click.echo(f"  Val:   {num_val_groups} groups = {num_val_puzzles} puzzles")
+        click.echo(f"  Test:  {num_test_groups} groups = {num_test_puzzles} puzzles")
         return
 
     # =========================================================================
@@ -879,21 +1039,30 @@ def main(
     # Save
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    stats = {}
     for split_name in ["train", "val", "test"]:
-        save_split_to_disk(
+        num_groups, num_puzzles = save_split_to_disk(
             output_dir, split_name, puzzle_pool, split_indices[split_name],
-            grid_size, max_grid_size, min_givens, max_givens, vocab_size
+            grid_size, max_grid_size, min_givens, max_givens, vocab_size,
+            num_aug if split_name == "train" else 0
         )
+        stats[split_name] = (num_groups, num_puzzles)
 
-    # Global metadata - simple!
+    # Global metadata
     overall_meta = {
         "mode": "hybrid" if hybrid else ("full" if full else "standard"),
         "max_grid_size": max_grid_size,
         "vocab_size": vocab_size,
         "seq_len": max_grid_size * max_grid_size,
-        "num_train": num_train,
-        "num_val": num_val,
-        "num_test": num_test,
+        # Puzzle counts (including augmentations)
+        "num_train": stats["train"][1],
+        "num_val": stats["val"][1],
+        "num_test": stats["test"][1],
+        # Group counts (unique base puzzles)
+        "num_train_groups": stats["train"][0],
+        "num_val_groups": stats["val"][0],
+        "num_test_groups": stats["test"][0],
+        "num_augmentations": num_aug,
         "seed": seed,
     }
     
@@ -901,6 +1070,9 @@ def main(
         json.dump(overall_meta, f, indent=2)
 
     click.echo(f"\n✓ Saved to {output_dir}")
+    click.echo(f"  Train: {stats['train'][0]} groups × {1 + num_aug} = {stats['train'][1]} puzzles")
+    click.echo(f"  Val:   {stats['val'][0]} groups = {stats['val'][1]} puzzles")
+    click.echo(f"  Test:  {stats['test'][0]} groups = {stats['test'][1]} puzzles")
 
 
 if __name__ == "__main__":

@@ -211,6 +211,8 @@ class Attention(nn.Module):
         self.gate_type = gate_type
         self.gate_proj = None
 
+        log.info(f"Using attention gating of type: {self.gate_type}")
+
         if self.gate_type is not None:
             if self.gate_type == "headwise":
                 self.gate_proj = CastedLinear(hidden_size, num_heads, bias=True)

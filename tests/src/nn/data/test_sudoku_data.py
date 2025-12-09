@@ -10,10 +10,13 @@ Supports all modes:
 - cross-size: Different grid_size per split (train vs val/test)
 - mixed-size: Multiple grid sizes within each split
 
+Also validates group/augmentation structure.
+
 Usage:
     python test_sudoku_data.py ./data/sudoku_pregenerated
     python test_sudoku_data.py ./data/sudoku_pregenerated --num-samples 10
     python test_sudoku_data.py ./data/sudoku_pregenerated --validate-all
+    python test_sudoku_data.py ./data/sudoku_pregenerated --show-groups
 """
 
 import json
@@ -33,17 +36,34 @@ def load_dataset(data_dir: Path, split: str = "train"):
     inputs = np.load(split_dir / "all__inputs.npy")
     labels = np.load(split_dir / "all__labels.npy")
     
-    # Load optional grid_sizes array for mixed-size mode
+    # Load optional arrays
+    grid_sizes = None
+    puzzle_indices = None
+    group_indices = None
+    
     grid_sizes_path = split_dir / "all__grid_sizes.npy"
     if grid_sizes_path.exists():
         grid_sizes = np.load(grid_sizes_path)
-    else:
-        grid_sizes = None
+    
+    puzzle_indices_path = split_dir / "all__puzzle_indices.npy"
+    if puzzle_indices_path.exists():
+        puzzle_indices = np.load(puzzle_indices_path)
+    
+    group_indices_path = split_dir / "all__group_indices.npy"
+    if group_indices_path.exists():
+        group_indices = np.load(group_indices_path)
     
     with open(split_dir / "dataset.json") as f:
         metadata = json.load(f)
     
-    return inputs, labels, grid_sizes, metadata
+    return {
+        "inputs": inputs,
+        "labels": labels,
+        "grid_sizes": grid_sizes,
+        "puzzle_indices": puzzle_indices,
+        "group_indices": group_indices,
+        "metadata": metadata,
+    }
 
 
 def load_global_metadata(data_dir: Path):
@@ -167,10 +187,17 @@ def print_grid(grid: np.ndarray, grid_size: int, title: str = ""):
     print(h_line)
 
 
-def print_sample(idx: int, puzzle: np.ndarray, solution: np.ndarray, grid_size: int):
+def print_sample(idx: int, puzzle: np.ndarray, solution: np.ndarray, grid_size: int, 
+                 group_idx: int = None, aug_idx: int = None):
     """Print a single sample with puzzle and solution side by side."""
     print(f"\n{'='*60}")
-    print(f"Sample {idx} (grid_size={grid_size}x{grid_size})")
+    header = f"Sample {idx} (grid_size={grid_size}x{grid_size})"
+    if group_idx is not None:
+        header += f" [Group {group_idx}"
+        if aug_idx is not None:
+            header += f", Aug {aug_idx}"
+        header += "]"
+    print(header)
     print(f"{'='*60}")
     
     num_givens = np.sum(puzzle > 0)
@@ -203,6 +230,59 @@ def validate_sample(puzzle: np.ndarray, solution: np.ndarray, grid_size: int):
     return errors
 
 
+def validate_group_structure(data: dict):
+    """Validate the group/puzzle index structure."""
+    errors = []
+    
+    puzzle_indices = data.get("puzzle_indices")
+    group_indices = data.get("group_indices")
+    num_puzzles = len(data["inputs"])
+    metadata = data["metadata"]
+    
+    if puzzle_indices is None or group_indices is None:
+        return ["No group indices found (old format?)"]
+    
+    # Check puzzle_indices
+    expected_puzzle_indices = list(range(num_puzzles + 1))
+    if not np.array_equal(puzzle_indices, expected_puzzle_indices):
+        errors.append(f"puzzle_indices mismatch: expected [0..{num_puzzles}], got range [{puzzle_indices[0]}..{puzzle_indices[-1]}]")
+    
+    # Check group_indices
+    num_groups = metadata.get("num_groups", 0)
+    if len(group_indices) != num_groups + 1:
+        errors.append(f"group_indices length mismatch: expected {num_groups + 1}, got {len(group_indices)}")
+    
+    if group_indices[0] != 0:
+        errors.append(f"group_indices should start at 0, got {group_indices[0]}")
+    
+    if group_indices[-1] != num_puzzles:
+        errors.append(f"group_indices should end at {num_puzzles}, got {group_indices[-1]}")
+    
+    # Check monotonicity
+    if not np.all(np.diff(group_indices) > 0):
+        errors.append("group_indices is not strictly monotonic")
+    
+    # Check mean_puzzles_per_group
+    expected_mean = num_puzzles / num_groups if num_groups > 0 else 1
+    actual_mean = metadata.get("mean_puzzles_per_group", 0)
+    if abs(expected_mean - actual_mean) > 0.01:
+        errors.append(f"mean_puzzles_per_group mismatch: expected {expected_mean:.2f}, got {actual_mean:.2f}")
+    
+    return errors
+
+
+def get_group_for_sample(idx: int, group_indices: np.ndarray):
+    """Get the group index and within-group index for a sample."""
+    if group_indices is None:
+        return None, None
+    
+    # Binary search for group
+    group_idx = np.searchsorted(group_indices[1:], idx, side='right')
+    aug_idx = idx - group_indices[group_idx]
+    
+    return group_idx, aug_idx
+
+
 @click.command()
 @click.argument(
     "data_dir",
@@ -232,7 +312,13 @@ def validate_sample(puzzle: np.ndarray, solution: np.ndarray, grid_size: int):
     default=False,
     help="Only print summary, not individual samples",
 )
-def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet: bool):
+@click.option(
+    "--show-groups",
+    is_flag=True,
+    default=False,
+    help="Show samples from different groups to visualize augmentation",
+)
+def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet: bool, show_groups: bool):
     """
     Test and validate pre-generated Sudoku datasets.
     
@@ -249,21 +335,50 @@ def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet
     click.echo(f"  Max grid size: {metadata['max_grid_size']}x{metadata['max_grid_size']}")
     click.echo(f"  Vocab size: {metadata['vocab_size']}")
     click.echo(f"  Sequence length: {metadata['seq_len']}")
-    click.echo(f"  Train/Val/Test: {metadata['num_train']}/{metadata['num_val']}/{metadata['num_test']}")
+    
+    # Show puzzle counts
+    click.echo(f"\n  Puzzle counts (total):")
+    click.echo(f"    Train: {metadata['num_train']}")
+    click.echo(f"    Val:   {metadata['num_val']}")
+    click.echo(f"    Test:  {metadata['num_test']}")
+    
+    # Show group counts if available
+    if "num_train_groups" in metadata:
+        click.echo(f"\n  Group counts (base puzzles):")
+        click.echo(f"    Train: {metadata['num_train_groups']}")
+        click.echo(f"    Val:   {metadata['num_val_groups']}")
+        click.echo(f"    Test:  {metadata['num_test_groups']}")
+        
+        num_aug = metadata.get("num_augmentations", 0)
+        click.echo(f"\n  Augmentations: {num_aug} per training puzzle")
     
     # Load split
     click.echo(f"\nLoading {split} split...")
-    inputs, labels, grid_sizes_array, split_meta = load_dataset(data_dir, split)
+    data = load_dataset(data_dir, split)
+    
+    inputs = data["inputs"]
+    labels = data["labels"]
+    grid_sizes_array = data["grid_sizes"]
+    group_indices = data["group_indices"]
+    split_meta = data["metadata"]
     
     total_samples = len(inputs)
     max_grid_size = split_meta["max_grid_size"]
     is_mixed = split_meta.get("mixed_size", False) or grid_sizes_array is not None
     
     click.echo(f"\nSplit metadata:")
-    click.echo(f"  Samples: {total_samples}")
+    click.echo(f"  Total puzzles: {total_samples}")
+    
+    # Show group info
+    num_groups = split_meta.get("num_groups", total_samples)
+    num_aug = split_meta.get("num_augmentations", 0)
+    mean_per_group = split_meta.get("mean_puzzles_per_group", 1)
+    
+    click.echo(f"  Groups: {num_groups}")
+    click.echo(f"  Augmentations: {num_aug}")
+    click.echo(f"  Mean puzzles/group: {mean_per_group:.2f}")
     
     if is_mixed:
-        # Mixed-size mode: multiple grid sizes in this split
         grid_sizes_list = split_meta.get("grid_sizes", [])
         size_counts = split_meta.get("grid_size_counts", {})
         click.echo(f"  Mixed sizes: {grid_sizes_list}")
@@ -271,13 +386,59 @@ def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet
             count = size_counts.get(str(gs), "?")
             click.echo(f"    {gs}x{gs}: {count} puzzles")
     else:
-        # Single grid size for this split
         grid_size = split_meta["grid_size"]
         click.echo(f"  Grid size: {grid_size}x{grid_size}")
         click.echo(f"  Givens: {split_meta.get('min_givens', '?')}-{split_meta.get('max_givens', '?')}")
     
+    # Validate group structure
+    click.echo(f"\n{'='*60}")
+    click.echo("Validating group structure...")
+    click.echo(f"{'='*60}")
+    
+    group_errors = validate_group_structure(data)
+    if group_errors:
+        click.echo("❌ Group structure errors:")
+        for err in group_errors:
+            click.echo(f"   - {err}")
+    else:
+        click.echo("✓ Group structure valid")
+    
+    # Show groups if requested
+    if show_groups and group_indices is not None and num_groups > 0:
+        click.echo(f"\n{'='*60}")
+        click.echo("Showing augmentation groups...")
+        click.echo(f"{'='*60}")
+        
+        # Show first 2 groups
+        num_groups_to_show = min(2, num_groups)
+        for g in range(num_groups_to_show):
+            start_idx = group_indices[g]
+            end_idx = group_indices[g + 1]
+            group_size = end_idx - start_idx
+            
+            click.echo(f"\n--- Group {g} ({group_size} puzzles: indices {start_idx}-{end_idx-1}) ---")
+            
+            # Show first and last in group
+            indices_to_show = [start_idx]
+            if group_size > 1:
+                indices_to_show.append(start_idx + 1)
+            if group_size > 2:
+                indices_to_show.append(end_idx - 1)
+            
+            for idx in indices_to_show:
+                if is_mixed and grid_sizes_array is not None:
+                    sample_grid_size = int(grid_sizes_array[idx])
+                else:
+                    sample_grid_size = split_meta["grid_size"]
+                
+                puzzle = decode_grid(inputs[idx], sample_grid_size, max_grid_size)
+                solution = decode_grid(labels[idx], sample_grid_size, max_grid_size)
+                
+                aug_idx = idx - start_idx
+                print_sample(idx, puzzle, solution, sample_grid_size, g, aug_idx)
+    
     # Print some samples
-    if not quiet:
+    elif not quiet:
         print_indices = np.linspace(0, total_samples - 1, min(num_samples, total_samples), dtype=int)
         
         for idx in print_indices:
@@ -289,7 +450,9 @@ def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet
             
             puzzle = decode_grid(inputs[idx], sample_grid_size, max_grid_size)
             solution = decode_grid(labels[idx], sample_grid_size, max_grid_size)
-            print_sample(idx, puzzle, solution, sample_grid_size)
+            
+            group_idx, aug_idx = get_group_for_sample(idx, group_indices)
+            print_sample(idx, puzzle, solution, sample_grid_size, group_idx, aug_idx)
             
             errors = validate_sample(puzzle, solution, sample_grid_size)
             if errors:
@@ -349,21 +512,64 @@ def main(data_dir: Path, split: str, num_samples: int, validate_all: bool, quiet
     click.echo("Checking for duplicates...")
     click.echo(f"{'='*60}")
     
-    # Hash all puzzles
-    puzzle_hashes = set()
-    duplicate_count = 0
+    # Hash all puzzles - track by group
+    puzzle_hashes = {}  # hash -> list of (idx, group_idx)
     
     for idx in range(total_samples):
         h = inputs[idx].tobytes()
-        if h in puzzle_hashes:
-            duplicate_count += 1
-        else:
-            puzzle_hashes.add(h)
+        group_idx, _ = get_group_for_sample(idx, group_indices)
+        
+        if h not in puzzle_hashes:
+            puzzle_hashes[h] = []
+        puzzle_hashes[h].append((idx, group_idx))
     
-    if duplicate_count == 0:
-        click.echo(f"✓ No duplicates found in {split} split")
+    # Count duplicates
+    cross_group_dupes = 0
+    within_group_dupes = 0
+    
+    for h, occurrences in puzzle_hashes.items():
+        if len(occurrences) > 1:
+            groups = set(g for _, g in occurrences)
+            if len(groups) > 1:
+                # Same puzzle in different groups
+                cross_group_dupes += len(occurrences) - 1
+            else:
+                # Same puzzle within same group (unexpected for Sudoku augmentation)
+                within_group_dupes += len(occurrences) - 1
+    
+    unique_puzzles = len(puzzle_hashes)
+    click.echo(f"Unique puzzles: {unique_puzzles}")
+    click.echo(f"Total puzzles: {total_samples}")
+    
+    if cross_group_dupes > 0:
+        click.echo(f"⚠ Cross-group duplicates: {cross_group_dupes}")
     else:
-        click.echo(f"⚠ Found {duplicate_count} duplicate puzzles in {split} split")
+        click.echo(f"✓ No cross-group duplicates")
+    
+    if within_group_dupes > 0:
+        click.echo(f"⚠ Within-group duplicates: {within_group_dupes} (unexpected)")
+    
+    # Check solution uniqueness across groups
+    click.echo(f"\n{'='*60}")
+    click.echo("Checking solution uniqueness across groups...")
+    click.echo(f"{'='*60}")
+    
+    solution_to_groups = {}  # solution_hash -> set of group_indices
+    
+    for idx in range(total_samples):
+        sol_h = labels[idx].tobytes()
+        group_idx, _ = get_group_for_sample(idx, group_indices)
+        
+        if sol_h not in solution_to_groups:
+            solution_to_groups[sol_h] = set()
+        solution_to_groups[sol_h].add(group_idx)
+    
+    shared_solutions = sum(1 for groups in solution_to_groups.values() if len(groups) > 1)
+    
+    if shared_solutions > 0:
+        click.echo(f"⚠ {shared_solutions} solutions shared across groups")
+    else:
+        click.echo(f"✓ All groups have unique solutions")
     
     click.echo("\n✅ Test complete!")
 

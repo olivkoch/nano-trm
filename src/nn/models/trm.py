@@ -105,7 +105,7 @@ class TRMModule(LightningModule):
         self.embed_scale = math.sqrt(hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        log.info(f"Creating TRM with vocab size={vocab_size}, seq_len={seq_len}, puzzle_emb_len={puzzle_emb_len} {pos_emb_type=}")
+        log.info(f"Creating TRM with vocab size={vocab_size}, seq_len={seq_len}, puzzle_emb_len={puzzle_emb_len} {pos_emb_type=} and attn_gate_type={attn_gate_type}")
 
         self.input_embedding = CastedEmbedding(
             vocab_size, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype

@@ -6,39 +6,45 @@ defaults:
   - override /callbacks: default
   - override /trainer: gpu
 
-tags: ["arc", "trm"]
+tags: ["trm", "sudoku", "4x4"]
 
 timekeeping:
-  max_epochs: 30
-  batch_size: 512
+  max_epochs: 500
+  batch_size: 768
   num_workers: 0
 
 model_tuning:
   learning_rate: 1e-4
-  learning_rate_emb: 1e-3
-  weight_decay: 0.1
-  warmup_steps: 100
-  lr_min_ratio: 1.0
-  num_heads: 2
-  halt_exploration_prob: 0.0
-  N_supervision: 4
-  N_supervision_val: 4
-  H_cycles: 2
-  L_cycles: 2
-  num_layers: 1
-  max_steps: 0
-  puzzle_emb_dim: 4
-  puzzle_emb_len: 4
-  hidden_size: 64
-  ffn_expansion: 2
+  learning_rate_emb: 1e-4
+  warmup_steps: 2000
+  weight_decay: 1.0
+  lr_min_ratio: 0.01
+  num_heads: 8
+  halt_exploration_prob: 0.1
+  N_supervision: 16
+  N_supervision_val: 16
+  H_cycles: 3
+  L_cycles: 6
+  num_layers: 2
+  puzzle_emb_dim: 0
+  puzzle_emb_len: 0
+  hidden_size: 512
+  ffn_expansion: 4
   rope_theta: 10000
-  use_2d_rope: false
-  use_sigreg: true
-
-
+  pos_emb_type: null
+  use_mlp: true
+  use_sigreg: false
+  attn_gate_type: null
 
 trainer:
   check_val_every_n_epoch: 10
+
+callbacks:
+  ema:
+    _target_: src.nn.callbacks.ema.EMACallback
+    decay: 0.999
+    use_ema_for_validation: true
+    use_ema_for_test: true
 
 save_dir: /tmp/ml-experiments
 append_wandb_name_to_save_dir: true

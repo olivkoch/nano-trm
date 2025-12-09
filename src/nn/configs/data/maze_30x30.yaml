@@ -11,5 +11,5 @@ max_grid_size: 30
 min_givens: null
 max_givens: null
 seed: 42
-data_dir: ./data/maze_30x30
+data_dir: ./data/maze-30x30-hard-1k
 pad_value: 0

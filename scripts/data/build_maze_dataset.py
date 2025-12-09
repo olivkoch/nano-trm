@@ -173,7 +173,7 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 @click.option("--source-repo", default="sapientinc/maze-30x30-hard-1k", help="Source HuggingFace repository")
 @click.option("--output-dir", default="data/maze-30x30-hard-1k", help="Output directory")
 @click.option("--subsample-size", type=int, default=None, help="Subsample size for training set")
-@click.option("--num-aug", type=int, default=0, help="Number of augmentations per puzzle (max 7 for dihedral)")
+@click.option("--num-aug", type=int, default=7, help="Number of augmentations per puzzle (max 7 for dihedral)")
 @click.option("--eval-ratio", type=float, default=None, help="Test set size as ratio of training size")
 @click.option("--seed", type=int, default=42, help="Random seed")
 def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[int],

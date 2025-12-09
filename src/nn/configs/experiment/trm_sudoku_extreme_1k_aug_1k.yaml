@@ -34,7 +34,7 @@ model_tuning:
   pos_emb_type: null
   use_mlp: true
   use_sigreg: false
-  attn_gate_type: null
+  attn_gate_type: "elementwise"
 
 trainer:
   check_val_every_n_epoch: 100

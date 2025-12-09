@@ -62,34 +62,24 @@ Independant evaluation with visualizations:
 
 `uv run python src/nn/evaluate.py +checkpoint=/tmp/ml-experiments/lunar-pine-174/checkpoints/last.ckpt +data_dir=./data/sudoku_4x4_small`
 
-# Self-Play (WIP)
-
-Our long-term goal is to use TRM for self-play. This section is very much WIP.
-
-Generate curriculum training data by pitching two minimax players against each other: `uv run python scripts/data/generate_c4_curriculum_data.py --n-games 50000 --temp-player1 0.1 --temp-player2 0.3 --depth 4 --to-file minimax_games_.pkl`
-
-Set `enable_selfplay=False` to enable/disable self-play in `experiment/mlp_c4.yaml`
-
-Then run `uv run python src/nn/train_c4.py experiment=mlp_c4.yaml`
-
-Replace `mlp` with `cnn` or `trm` for CNN or TRM.
-
-The training script produces the evaluation metrics automatically.
-
 # Comments / contributions
 
 Follow me on [X](https://x.com/olivkoch)
 
-# Sweeps
+# Technical Notes
 
-## 1. Create sweep
+## Sweeps
+
+Create sweep
+
 ```
 uv run python scripts/create_sweep.py \
     --sweep-file src/nn/configs/sweeps/trm_sweep.yaml \
     --project trm-sudoku
 ```
 
-## 2. Run agent
+Run sweep agent
+
 ```
 uv run python src/nn/train_sweep.py \
     --sweep-id <sweep_id> \
@@ -98,3 +88,28 @@ uv run python src/nn/train_sweep.py \
     --count 20
 ```
 
+## Installing AdamATan2
+
+This project uses the vanilla AdamW optimizer if AdamATan2 is not installed. If you want AdamATan2 and struggle to install it, here is how to install it from source:
+
+```
+# Clone the repo
+cd /tmp
+git clone https://github.com/imoneoi/adam-atan2.git
+
+cd adam-atan2/
+
+# Build from source
+uv pip install --python /home/ubuntu/nano-trm/.venv/bin/python setuptools_scm ninja
+/home/ubuntu/nano-trm/.venv/bin/python setup.py build_ext --inplace
+
+# Check that the lib has been created
+ls -la adam_atan2_backend*.so
+
+# Copy it to your local env
+cp adam_atan2_backend.cpython-312-x86_64-linux-gnu.so /home/ubuntu/nano-trm/.venv/lib/python3.12/site-packages/adam_atan2
+cp /home/ubuntu/nano-trm/.venv/lib/python3.12/site-packages/adam_atan2/adam_atan2_backend.cpython-312-x86_64-linux-gnu.so /home/ubuntu/nano-trm/.venv/lib/python3.12/site-packages/
+
+# Test
+from adam_atan2 import AdamATan2 -> this should work
+```

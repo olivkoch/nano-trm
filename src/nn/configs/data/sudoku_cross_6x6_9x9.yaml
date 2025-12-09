@@ -7,7 +7,7 @@ num_train_puzzles: 0
 num_val_puzzles: 0
 num_test_puzzles: 0
 grid_size: 9
-max_grid_size: 9
+max_grid_size: 11
 min_givens: null
 max_givens: null
 seed: 42

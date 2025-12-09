@@ -1,9 +1,10 @@
 """
-Sudoku evaluation script with cross-size support.
-"""
+Sudoku evaluation script.
 
+Usage:
+    python -m src.nn.evaluate_sudoku checkpoint=/path/to/model.ckpt data_dir=/path/to/data
+"""
 import warnings
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -23,28 +24,29 @@ warnings.filterwarnings("ignore", module="pydantic")
 @task_wrapper
 def evaluate(cfg: DictConfig) -> Optional[float]:
     """
-    Evaluates a Sudoku model. Supports cross-size evaluation.
-    
+    Evaluates a Sudoku model.
+
     Args:
         cfg: Hydra configuration with:
             - checkpoint: path to model checkpoint
             - data_dir: path to dataset
-            - batch_size: evaluation batch size
-            - device: cpu/cuda/mps/auto
+            - batch_size: evaluation batch size (default: 256)
+            - device: cpu/cuda/mps/auto (default: auto)
+            - num_workers: dataloader workers (default: 0)
             - eval_split: train/val/test (default: val)
-            - per_task: whether to run per-puzzle analysis
-            - output_dir: where to save results
-    
+            - all_splits: evaluate all splits (default: False)
+            - output_dir: where to save results (default: checkpoint_dir/evaluation_results)
+
     Returns:
         Task accuracy as float
     """
-
     # Initialize evaluator
     evaluator = SudokuEvaluator(
         checkpoint_path=cfg.checkpoint,
         data_dir=cfg.data_dir,
         batch_size=cfg.get("batch_size", 256),
         device=cfg.get("device", "auto"),
+        num_workers=cfg.get("num_workers", 0),
         eval_split=cfg.get("eval_split", "val"),
     )
 
@@ -54,14 +56,18 @@ def evaluate(cfg: DictConfig) -> Optional[float]:
     # Print results
     print("\n" + "=" * 60)
     print("EVALUATION RESULTS")
-    if results.get("cross_size", False):
-        print(f"Cross-size: {results['train_grid_size']}x{results['train_grid_size']} → "
-              f"{results['eval_grid_size']}x{results['eval_grid_size']}")
+    if evaluator.cross_size:
+        print(f"Cross-size: train={evaluator.train_grid_size}x{evaluator.train_grid_size}, "
+              f"eval={evaluator.eval_grid_size}x{evaluator.eval_grid_size}")
+    else:
+        print(f"Grid size: {evaluator.grid_size}x{evaluator.grid_size}")
+    print(f"Split: {cfg.get('eval_split', 'val')}")
     print("=" * 60)
     print(f"Cell Accuracy:   {results['pixel_accuracy']:.4f} ({results['pixel_accuracy'] * 100:.2f}%)")
     print(f"Puzzle Accuracy: {results['task_accuracy']:.4f} ({results['task_accuracy'] * 100:.2f}%)")
     print(f"Validity Rate:   {results['validity_rate']:.4f} ({results['validity_rate'] * 100:.2f}%)")
     print(f"Puzzles Solved:  {results['tasks_correct']}/{results['total_tasks']}")
+    print(f"Valid Solutions: {results['valid_solutions']}/{results['total_tasks']}")
     print(f"Avg Steps:       {results.get('avg_steps', 0):.1f}")
     print("=" * 60)
 

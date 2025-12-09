@@ -9,7 +9,7 @@ defaults:
 tags: ["sudoku", "trm", "medium"]
 
 timekeeping:
-  max_epochs: 5000
+  max_epochs: 500
   batch_size: 768
   num_workers: 0
 

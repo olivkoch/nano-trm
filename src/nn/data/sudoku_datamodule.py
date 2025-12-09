@@ -6,8 +6,9 @@ Two modes:
 1. Generation mode (data_dir=None): Generate unique puzzle pool and split
 2. Loading mode (data_dir="/path"): Load pre-generated data from disk
 
-Optional full enumeration mode:
-- Pass base_grids (canonical representatives) for uniform sampling over ALL valid grids
+Cross-size support:
+- Train on one grid size (e.g., 6x6), evaluate on another (e.g., 9x9)
+- Detected automatically by reading grid_size from per-split dataset.json
 """
 
 import hashlib
@@ -226,9 +227,15 @@ class SudokuDataset(Dataset):
             self.puzzle_indices = np.arange(len(self.inputs) + 1, dtype=np.int32)
             self.num_groups = len(self.inputs)
 
-        # Load metadata
+        # Load split metadata
         with open(os.path.join(split_dir, "dataset.json")) as f:
             self.metadata = json.load(f)
+        
+        # Update grid_size from split metadata if available
+        if "grid_size" in self.metadata:
+            self.grid_size = self.metadata["grid_size"]
+        if "max_grid_size" in self.metadata:
+            self.max_grid_size = self.metadata["max_grid_size"]
 
         self.num_puzzles = len(self.inputs)
 
@@ -621,6 +628,11 @@ class SudokuDataModule(LightningDataModule):
     Modes:
     - Generation (data_dir=None): Generate puzzles on-the-fly
     - Loading (data_dir="/path"): Load pre-generated data
+    
+    Cross-size support:
+    - Automatically detects when train and val/test have different grid sizes
+    - Reads grid_size from per-split dataset.json files
+    - Exposes train_grid_size, eval_grid_size, cross_size attributes
     """
 
     def __init__(
@@ -652,11 +664,16 @@ class SudokuDataModule(LightningDataModule):
 
         self.mode = "loading" if data_dir is not None else "generation"
 
+        # Cross-size attributes (will be set in _load_metadata or _use_provided_params)
+        self.train_grid_size = None
+        self.eval_grid_size = None
+        self.cross_size = False
+
         if self.mode == "loading":
             metadata = self._load_metadata(data_dir)
 
             if metadata is not None:
-                # Global metadata - same for all modes now
+                # Global metadata
                 self.max_grid_size = metadata["max_grid_size"]
                 self.vocab_size = metadata["vocab_size"]
                 self.seq_len = metadata["seq_len"]
@@ -671,10 +688,17 @@ class SudokuDataModule(LightningDataModule):
                 self.num_val_groups = metadata.get("num_val_groups", self.num_val_puzzles)
                 self.num_test_groups = metadata.get("num_test_groups", self.num_test_puzzles)
                 
-                self.grid_size = self.vocab_size - 3
+                # Infer grid sizes from per-split metadata
+                self._load_split_grid_sizes(data_dir)
+                
+                # grid_size for backward compatibility (use eval_grid_size)
+                self.grid_size = self.eval_grid_size
 
                 log.info(f"✓ Loaded metadata from {data_dir}/metadata.json")
                 log.info(f"  Train: {self.num_train_groups} groups, {self.num_train_puzzles} total puzzles")
+                if self.cross_size:
+                    log.info(f"  Cross-size: train={self.train_grid_size}x{self.train_grid_size}, "
+                             f"eval={self.eval_grid_size}x{self.eval_grid_size}")
             else:
                 log.warning(f"⚠ Could not load metadata, using provided parameters")
                 self._use_provided_params(grid_size, max_grid_size, min_givens, max_givens,
@@ -688,6 +712,40 @@ class SudokuDataModule(LightningDataModule):
         self.split_indices = None
 
         self.save_hyperparameters(ignore=['base_grids'])
+
+    def _load_split_grid_sizes(self, data_dir: str):
+        """Load grid sizes from per-split dataset.json files."""
+        data_path = Path(data_dir)
+        
+        # Read train grid size
+        train_meta_path = data_path / "train" / "dataset.json"
+        if not train_meta_path.exists():
+            raise ValueError(f"Missing train metadata: {train_meta_path}")
+        
+        with open(train_meta_path) as f:
+            train_meta = json.load(f)
+        
+        if "grid_size" not in train_meta:
+            raise ValueError(f"Missing 'grid_size' in {train_meta_path}")
+        
+        self.train_grid_size = train_meta["grid_size"]
+        
+        # Read eval grid size (prefer val, fall back to test)
+        eval_grid_size = None
+        for split in ["val", "test"]:
+            split_meta_path = data_path / split / "dataset.json"
+            if split_meta_path.exists():
+                with open(split_meta_path) as f:
+                    split_meta = json.load(f)
+                eval_grid_size = split_meta.get("grid_size")
+                if eval_grid_size is not None:
+                    break
+        
+        if eval_grid_size is None:
+            raise ValueError(f"Missing 'grid_size' in val/dataset.json or test/dataset.json")
+        
+        self.eval_grid_size = eval_grid_size
+        self.cross_size = (self.train_grid_size != self.eval_grid_size)
 
     def _use_provided_params(self, grid_size, max_grid_size, min_givens, max_givens,
                              num_train, num_val, num_test):
@@ -704,6 +762,11 @@ class SudokuDataModule(LightningDataModule):
         
         self.vocab_size = 3 + grid_size
         self.seq_len = self.max_grid_size * self.max_grid_size
+        
+        # In generation mode, train and eval are same size
+        self.train_grid_size = grid_size
+        self.eval_grid_size = grid_size
+        self.cross_size = False
 
     def _load_metadata(self, data_dir: str) -> Optional[dict]:
         """Load metadata from pre-generated data directory."""
@@ -875,6 +938,9 @@ if __name__ == "__main__":
     print(f"  Train: {len(train_indices)} puzzles")
     print(f"  Val:   {len(val_indices)} puzzles")
     print(f"  Test:  {len(test_indices)} puzzles")
+    print(f"  Cross-size: {dm.cross_size}")
+    print(f"  Train grid: {dm.train_grid_size}x{dm.train_grid_size}")
+    print(f"  Eval grid: {dm.eval_grid_size}x{dm.eval_grid_size}")
     print(
         f"  Train ∩ Val: {len(train_indices & val_indices)} {'✓' if len(train_indices & val_indices) == 0 else '✗'}"
     )

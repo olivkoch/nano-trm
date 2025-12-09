@@ -9,8 +9,8 @@ defaults:
 tags: ["sudoku", "trm", "medium"]
 
 timekeeping:
-  max_epochs: 5000
-  batch_size: 768
+  max_epochs: 1000
+  batch_size: 512
   num_workers: 0
 
 model_tuning:
@@ -31,10 +31,10 @@ model_tuning:
   hidden_size: 512
   ffn_expansion: 4
   rope_theta: 10000
-  pos_emb_type: null
-  use_mlp: true
+  pos_emb_type: "1d"
+  use_mlp: false
   use_sigreg: false
-  attn_gate_type: null
+  attn_gate_type: "headwise"
 
 trainer:
   check_val_every_n_epoch: 10

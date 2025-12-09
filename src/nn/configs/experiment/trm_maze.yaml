@@ -27,14 +27,14 @@ model_tuning:
   L_cycles: 4
   num_layers: 2
   puzzle_emb_dim: 512
-  puzzle_emb_len: 4
+  puzzle_emb_len: 16
   hidden_size: 512
   ffn_expansion: 4
   rope_theta: 10000
   pos_emb_type: "1d"
   use_mlp: false
   use_sigreg: false
-  attn_gate_type: "elementwise"
+  attn_gate_type: null
 
 trainer:
   check_val_every_n_epoch: 10

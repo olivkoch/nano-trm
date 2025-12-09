@@ -16,6 +16,8 @@ from src.nn.utils.constants import IGNORE_LABEL_ID
 
 try:
     from adam_atan2 import AdamATan2
+    print(f"*"*60)
+    print("Imported AdamATan2 successfully")
 except ImportError:
     print("Failed to import adam2")
 
@@ -450,6 +452,7 @@ class TRMModule(LightningModule):
         scaled_loss.backward()
 
         self.grad_monitoring()
+        self.gate_monitoring()
 
         lr_this_step = None
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
@@ -606,6 +609,28 @@ class TRMModule(LightningModule):
             # Warning for problematic gradients
             if total_grad_norm < 1e-6 or total_grad_norm > 100:
                 log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
+
+    def gate_monitoring(self):
+        """Add to grad_monitoring or call separately"""
+        with torch.no_grad():
+            for layer_idx, layer in enumerate(self.lenet.layers):
+                if hasattr(layer, 'self_attn') and layer.self_attn.gate_proj is not None:
+                    gate_proj = layer.self_attn.gate_proj
+                    
+                    # Check if weights are changing
+                    weight_norm = gate_proj.weight.norm().item()
+                    bias_mean = gate_proj.bias.mean().item() if gate_proj.bias is not None else 0
+                    
+                    # Effective gate at bias (when input is ~zero mean)
+                    effective_gate = torch.sigmoid(torch.tensor(bias_mean)).item()
+                    
+                    self.log(f'gate/layer{layer_idx}/weight_norm', weight_norm)
+                    self.log(f'gate/layer{layer_idx}/bias_mean', bias_mean)
+                    self.log(f'gate/layer{layer_idx}/effective_gate', effective_gate)
+                    
+                    # Check gradient if available
+                    if gate_proj.weight.grad is not None:
+                        self.log(f'gate/layer{layer_idx}/grad_norm', gate_proj.weight.grad.norm().item())
 
     def log_metrics(self, metrics: dict, lr_this_step: float = None, batch_size: int = None):
 

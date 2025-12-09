@@ -220,7 +220,7 @@ class Attention(nn.Module):
                 self.gate_proj = CastedLinear(hidden_size, self.output_size, bias=True)
 
             if self.gate_proj.bias is not None:
-                nn.init.constant_(self.gate_proj.bias, 0.0)
+                nn.init.constant_(self.gate_proj.bias, 2.0) # make them quite open at init
 
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:

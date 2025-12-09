@@ -75,25 +75,20 @@ class SudokuEvaluator:
         # Setup datasets
         self.datamodule.setup()
 
-        # Handle cross-size vs standard mode
-        self.cross_size = getattr(self.datamodule, 'cross_size', False)
-        
-        if self.cross_size:
-            self.train_grid_size = self.datamodule.train_grid_size
-            self.eval_grid_size = self.datamodule.eval_grid_size
-            # For evaluation, use eval grid size
-            self.grid_size = self.eval_grid_size
-            print(f"Cross-size mode: trained on {self.train_grid_size}x{self.train_grid_size}, "
-                  f"evaluating on {self.eval_grid_size}x{self.eval_grid_size}")
-        else:
-            self.grid_size = self.datamodule.grid_size
-            self.train_grid_size = self.grid_size
-            self.eval_grid_size = self.grid_size
-            
+        # Get cross-size info from datamodule (now always set)
+        self.cross_size = self.datamodule.cross_size
+        self.train_grid_size = self.datamodule.train_grid_size
+        self.eval_grid_size = self.datamodule.eval_grid_size
+        self.grid_size = self.eval_grid_size  # Use eval grid size for evaluation
         self.max_grid_size = self.datamodule.max_grid_size
         self.vocab_size = self.datamodule.vocab_size
 
-        print(f"Evaluation grid size: {self.grid_size}x{self.grid_size}")
+        if self.cross_size:
+            print(f"Cross-size mode: trained on {self.train_grid_size}x{self.train_grid_size}, "
+                  f"evaluating on {self.eval_grid_size}x{self.eval_grid_size}")
+        else:
+            print(f"Grid size: {self.grid_size}x{self.grid_size}")
+            
         print(f"Max grid size: {self.max_grid_size}x{self.max_grid_size}")
         print(f"Vocab size: {self.vocab_size}")
         
@@ -178,6 +173,301 @@ class SudokuEvaluator:
                     return False
 
         return True
+
+    def visualize_thinking(
+        self, 
+        batch: Dict[str, torch.Tensor], 
+        sample_idx: int = 0,
+        max_steps: int = None,
+        show_confidence: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Visualize the TRM's thinking process for a single sample.
+        
+        Shows how z_H (decoded to predictions) evolves at each iteration.
+        
+        Args:
+            batch: Batch of samples
+            sample_idx: Which sample in the batch to visualize
+            max_steps: Maximum steps to run (default: N_supervision_val)
+            show_confidence: Whether to show confidence values
+            
+        Returns:
+            Dictionary with step-by-step predictions and metadata
+        """
+        batch = {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+            for k, v in batch.items()
+        }
+        
+        inputs = batch["input"]
+        targets = batch["output"]
+        batch_size = len(inputs)
+        
+        if sample_idx >= batch_size:
+            raise ValueError(f"sample_idx {sample_idx} >= batch_size {batch_size}")
+        
+        if max_steps is None:
+            max_steps = self.model.hparams.N_supervision_val
+        
+        # Get puzzle embedding length
+        puzzle_emb_len = getattr(self.model, 'puzzle_emb_len', 0)
+        
+        # Extract single sample info
+        inp = inputs[sample_idx].reshape(self.max_grid_size, self.max_grid_size)
+        tgt = targets[sample_idx].reshape(self.max_grid_size, self.max_grid_size)
+        inp_grid = inp[:self.grid_size, :self.grid_size]
+        tgt_grid = tgt[:self.grid_size, :self.grid_size]
+        
+        # Track predictions at each step
+        step_predictions = []
+        step_confidences = []
+        step_q_halt = []
+        step_halted = []
+        
+        with torch.no_grad():
+            carry = self.model.initial_carry(batch)
+            
+            for step in range(max_steps):
+                carry, outputs = self.model.forward(carry, batch)
+                
+                logits = outputs["logits"]  # [batch, seq_len, vocab]
+                q_halt = outputs["q_halt_logits"]  # [batch]
+                
+                # Get predictions and confidence for this sample
+                sample_logits = logits[sample_idx]  # [seq_len, vocab]
+                probs = torch.softmax(sample_logits, dim=-1)
+                confidence, preds = probs.max(dim=-1)  # [seq_len]
+                
+                # Reshape to grid
+                pred_grid = preds.reshape(self.max_grid_size, self.max_grid_size)
+                conf_grid = confidence.reshape(self.max_grid_size, self.max_grid_size)
+                
+                # Extract actual puzzle region
+                pred_sudoku = pred_grid[:self.grid_size, :self.grid_size].clone()
+                conf_sudoku = conf_grid[:self.grid_size, :self.grid_size].clone()
+                
+                step_predictions.append(pred_sudoku.cpu())
+                step_confidences.append(conf_sudoku.cpu())
+                step_q_halt.append(q_halt[sample_idx].item())
+                step_halted.append(carry.halted[sample_idx].item())
+                
+                # Check if this sample halted
+                if carry.halted[sample_idx]:
+                    break
+        
+        # Print visualization
+        self._print_thinking_visualization(
+            inp_grid.cpu(), 
+            tgt_grid.cpu(), 
+            step_predictions, 
+            step_confidences,
+            step_q_halt,
+            step_halted,
+            show_confidence=show_confidence,
+        )
+        
+        return {
+            "input": inp_grid.cpu(),
+            "target": tgt_grid.cpu(),
+            "step_predictions": step_predictions,
+            "step_confidences": step_confidences,
+            "step_q_halt": step_q_halt,
+            "step_halted": step_halted,
+            "num_steps": len(step_predictions),
+        }
+    
+    def _print_thinking_visualization(
+        self,
+        inp_grid: torch.Tensor,
+        tgt_grid: torch.Tensor,
+        step_predictions: list,
+        step_confidences: list,
+        step_q_halt: list,
+        step_halted: list,
+        show_confidence: bool = True,
+    ):
+        """Print a nice visualization of the thinking process."""
+        
+        def decode_cell(val, is_input=False):
+            val = val.item() if hasattr(val, 'item') else val
+            if val == 0:
+                return "."  # PAD
+            elif val == 1:
+                return "X"  # EOS
+            elif val == 2:
+                return "_" if is_input else "?"  # Empty
+            else:
+                return str(val - 2)  # Actual value (1-9)
+        
+        def format_cell(val, conf=None, prev_val=None, target_val=None, is_empty=False):
+            """Format a cell with optional markers."""
+            cell_str = decode_cell(val)
+            
+            # Markers: * = changed, ! = wrong
+            prefix = " "
+            if prev_val is not None and val != prev_val:
+                prefix = "*"  # Changed from previous step
+            elif target_val is not None and val != target_val and is_empty:
+                prefix = "!"  # Wrong vs target (only for cells that need prediction)
+            
+            return prefix + cell_str
+        
+        def grid_to_lines(grid, conf_grid=None, prev_grid=None, target=None, input_mask=None):
+            """Convert grid to list of formatted lines."""
+            lines = []
+            box_rows, box_cols = self._get_box_dims(self.grid_size)
+            
+            for r in range(self.grid_size):
+                if r > 0 and r % box_rows == 0:
+                    # Horizontal separator
+                    sep_parts = []
+                    for s in range(self.grid_size // box_cols):
+                        sep_parts.append("-" * (box_cols * 2))
+                    lines.append("+".join(sep_parts))
+                
+                row_str = ""
+                for c in range(self.grid_size):
+                    if c > 0 and c % box_cols == 0:
+                        row_str += "|"
+                    
+                    is_empty = input_mask[r, c].item() if input_mask is not None else False
+                    prev_val = prev_grid[r, c] if prev_grid is not None else None
+                    target_val = target[r, c] if target is not None else None
+                    
+                    row_str += format_cell(grid[r, c], None, prev_val, target_val, is_empty)
+                
+                lines.append(row_str)
+            
+            return lines
+        
+        def compute_metrics(pred, target, mask):
+            """Compute accuracy metrics."""
+            correct = (pred == target) & mask
+            total = mask.sum().item()
+            if total == 0:
+                return 1.0, 0
+            return correct.sum().item() / total, (mask & ~correct).sum().item()
+        
+        # Mask for cells to predict (empty cells in input, encoded as 2)
+        input_mask = (inp_grid == 2)
+        
+        print("\n" + "=" * 80)
+        print("TRM THINKING VISUALIZATION")
+        print(f"H_cycles={self.model.hparams.H_cycles}, L_cycles={self.model.hparams.L_cycles}")
+        print("=" * 80)
+        
+        # Print input and target side by side
+        inp_lines = grid_to_lines(inp_grid)
+        tgt_lines = grid_to_lines(tgt_grid)
+        
+        width = max(len(line) for line in inp_lines) + 4
+        
+        print(f"\n{'INPUT':<{width}}TARGET")
+        print(f"{'-' * (width - 2):<{width}}{'-' * (width - 2)}")
+        for inp_line, tgt_line in zip(inp_lines, tgt_lines):
+            print(f"{inp_line:<{width}}{tgt_line}")
+        
+        print(f"\nEmpty cells to fill: {input_mask.sum().item()}")
+        
+        print("\n" + "-" * 80)
+        print("STEP-BY-STEP REASONING (each step = H×L iterations of reasoning blocks)")
+        print("-" * 80)
+        
+        prev_pred = None
+        for step, (pred, conf, q_halt, halted) in enumerate(
+            zip(step_predictions, step_confidences, step_q_halt, step_halted)
+        ):
+            # Compute metrics
+            acc, errors = compute_metrics(pred, tgt_grid, input_mask)
+            avg_conf = conf[input_mask].mean().item() if input_mask.sum() > 0 else 1.0
+            min_conf = conf[input_mask].min().item() if input_mask.sum() > 0 else 1.0
+            
+            # Count changes from previous step
+            if prev_pred is not None:
+                changes = ((pred != prev_pred) & input_mask).sum().item()
+            else:
+                changes = "-"
+            
+            # Q-halt status
+            q_halt_str = f"q={q_halt:+.2f}"
+            if q_halt > 0:
+                q_halt_str += " (HALT)"
+            
+            halt_marker = " ← STOPPED" if halted else ""
+            
+            print(f"\n┌─ Step {step + 1} ─────────────────────────────────────────────────────────")
+            print(f"│ Accuracy: {acc:.1%} ({errors} errors) | Changes: {changes} | {q_halt_str}{halt_marker}")
+            print(f"│ Confidence: avg={avg_conf:.2f}, min={min_conf:.2f}")
+            print("└" + "─" * 70)
+            
+            # Print grid
+            pred_lines = grid_to_lines(pred, conf, prev_pred, tgt_grid, input_mask)
+            for line in pred_lines:
+                print(f"  {line}")
+            
+            prev_pred = pred
+        
+        # Final summary
+        final_pred = step_predictions[-1]
+        final_correct = torch.all(final_pred[input_mask] == tgt_grid[input_mask]).item() if input_mask.sum() > 0 else True
+        
+        # Decode for validity check
+        final_decoded = final_pred.clone()
+        valid_mask = final_pred >= 3
+        final_decoded[valid_mask] = final_pred[valid_mask] - 2
+        final_decoded[~valid_mask] = 0
+        is_valid = self.check_sudoku_validity(final_decoded)
+        
+        print("\n" + "=" * 80)
+        status = "✓ SOLVED" if final_correct else "✗ FAILED"
+        valid_str = "✓ Valid" if is_valid else "✗ Invalid"
+        print(f"RESULT: {status} | {valid_str} Sudoku | {len(step_predictions)} steps")
+        print("=" * 80)
+        
+        # Show final errors if any
+        if not final_correct:
+            print("\nErrors (row, col): ", end="")
+            errors = []
+            for r in range(self.grid_size):
+                for c in range(self.grid_size):
+                    if input_mask[r, c] and final_pred[r, c] != tgt_grid[r, c]:
+                        pred_val = decode_cell(final_pred[r, c])
+                        tgt_val = decode_cell(tgt_grid[r, c])
+                        errors.append(f"({r},{c}): {pred_val}→{tgt_val}")
+            print(", ".join(errors[:10]))
+            if len(errors) > 10:
+                print(f"  ... and {len(errors) - 10} more")
+        
+        print("\nLegend: *N = changed this step, !N = wrong prediction")
+
+    def visualize_sample(self, split: str = "val", sample_idx: int = 0, show_confidence: bool = True):
+        """
+        Convenience method to visualize thinking on a specific sample.
+        
+        Args:
+            split: Which split to use ('train', 'val', 'test')
+            sample_idx: Index of sample in the split
+            show_confidence: Whether to show confidence values
+        """
+        if split == "train":
+            dataloader = self.datamodule.train_dataloader()
+        elif split == "val":
+            dataloader = self.datamodule.val_dataloader()
+        elif split == "test":
+            dataloader = self.datamodule.test_dataloader()
+        else:
+            raise ValueError(f"Invalid split: {split}")
+        
+        # Find the right batch
+        batch_idx = sample_idx // self.batch_size
+        within_batch_idx = sample_idx % self.batch_size
+        
+        for i, batch in enumerate(dataloader):
+            if i == batch_idx:
+                return self.visualize_thinking(batch, within_batch_idx, show_confidence=show_confidence)
+        
+        raise ValueError(f"sample_idx {sample_idx} out of range for {split} split")
 
     def evaluate_batch(self, batch: Dict[str, torch.Tensor], print_examples: bool = False) -> Dict[str, Any]:
         """Evaluate a single batch."""

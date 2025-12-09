@@ -6,9 +6,7 @@ Watch the [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M)!
 
 Train a TRM in a few minutes on an A10. Reproduce the official TRM results. Push the envelope.
 
-Reproducing the results on Sudoku Extreme:
-
-![Evalution on Sudoku extreme](assets/pics/extreme-val.png)
+This project reproduces the results on Sudoku Extreme and Maze Hard (87% and 75% exact accuracy on validation, resp.)
 
 # Installation
 

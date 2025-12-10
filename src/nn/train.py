@@ -20,9 +20,6 @@ from src.nn.utils import (
     task_wrapper,
 )
 
-import torch
-torch.set_float32_matmul_precision("medium") # or high
-
 log = RankedLogger(__name__, rank_zero_only=True)
 import hydra
 from omegaconf import DictConfig, OmegaConf

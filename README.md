@@ -1,6 +1,6 @@
 # An implementation of TRM
 
-This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1). Reference [code](https://github.com/SamsungSAILMontreal/TinyRecursiveModels)
+This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1)
 
 Watch the [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M)!
 

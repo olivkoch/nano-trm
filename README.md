@@ -22,19 +22,19 @@ Run a training:
 
 `uv run python src/nn/train.py experiment=trm_sudoku_extreme_1k_aug_1k`
 
-Training time ~10h on an H100 SXM5. You should get to ~87% exact accuracy on validation (same as the reference implementation)
+Training time ~1h on an H100 SXM5. You should get to ~87% exact accuracy on validation (same as the reference implementation)
 
 # Maze Hard
 
 Generate data: 
 
-`uv run python scripts/data/build_maze_dataset.py --output-dir ./data/maze_30x30 --num-aug 7 --eval-ratio 0.5`
+`uv run python scripts/data/build_maze_dataset.py --output-dir ./data/maze-30x30-hard-1k --num-aug 0 --eval-ratio 1.0`
 
 Run a training: 
 
 `uv run python src/nn/train.py experiment=trm_maze`
 
-Training time ~20h on an H100 SXM5. You should get to ~85% exact accuracy on validation (same as the reference implementation)
+Training time ~2h on an H100 SXM5. You should get to ~75% exact accuracy on validation (same as the reference implementation)
 
 # ARC-AGI
 

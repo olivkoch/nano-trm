@@ -2,6 +2,7 @@
 HRM PyTorch Lightning Module - Following Figure 2 pseudocode exactly
 """
 
+import os
 import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -216,6 +217,22 @@ class TRMModule(LightningModule):
             log.info(f"  Total puzzles (with aug): {len(dm.train_dataset)}")
             log.info(f"  Steps per epoch: {steps_per_epoch}")
             log.info(f"  Total steps: {self.total_steps}")
+
+                # Add torch.compile for faster training
+            if "DISABLE_COMPILE" not in os.environ and hasattr(torch, 'compile') and self.device.type == "cuda":
+                try:
+                    log.info("Compiling inner_forward with torch.compile...")
+                    self.inner_forward = torch.compile(
+                        self.inner_forward,
+                        mode="reduce-overhead",  # Good for repeated calls (your H/L cycles)
+                        fullgraph=False,         # Allow graph breaks for dynamic control flow
+                    )
+                    log.info("Compilation successful")
+                except Exception as e:
+                    log.warning(f"torch.compile failed, running uncompiled: {e}")
+            else:
+                log.info('*' * 60)
+                log.info("torch.compile not available or disabled, running uncompiled")
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding

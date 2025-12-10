@@ -857,6 +857,8 @@ class SudokuDataModule(LightningDataModule):
                 self.test_dataset = SudokuDataset(split="test", data_dir=self.data_dir)
 
     def train_dataloader(self):
+        prefetch_factor = 8 if self.num_workers > 0 else None
+        log.info(f"Creating train dataloader with batch size {self.batch_size} and num_workers {self.num_workers} and prefetch_factor {prefetch_factor}")
         if self.mode == "loading" and hasattr(self.train_dataset, 'group_indices'):
             # Use group-aware sampling
             self._train_sampler = GroupedBatchSampler(
@@ -873,6 +875,7 @@ class SudokuDataModule(LightningDataModule):
                 num_workers=self.num_workers,
                 collate_fn=collate_fn_sudoku,
                 pin_memory=True,
+                prefetch_factor=prefetch_factor,
                 persistent_workers=self.num_workers > 0,
                 multiprocessing_context="spawn" if self.num_workers > 0 else None,
             )
@@ -882,6 +885,7 @@ class SudokuDataModule(LightningDataModule):
                 self.train_dataset,
                 batch_size=self.batch_size,
                 shuffle=True,
+                prefetch_factor=prefetch_factor,
                 num_workers=self.num_workers,
                 collate_fn=collate_fn_sudoku,
                 pin_memory=True,
@@ -891,21 +895,25 @@ class SudokuDataModule(LightningDataModule):
             )
 
     def val_dataloader(self):
+        prefetch_factor = 8 if self.num_workers > 0 else None
         return DataLoader(
             self.val_dataset, batch_size=self.batch_size, shuffle=False,
             num_workers=self.num_workers, collate_fn=collate_fn_sudoku,
             pin_memory=True, drop_last=True,
             persistent_workers=self.num_workers > 0,
             multiprocessing_context="spawn" if self.num_workers > 0 else None,
+            prefetch_factor=prefetch_factor,
         )
 
     def test_dataloader(self):
+        prefetch_factor = 8 if self.num_workers > 0 else None
         return DataLoader(
             self.test_dataset, batch_size=self.batch_size, shuffle=False,
             num_workers=self.num_workers, collate_fn=collate_fn_sudoku,
             pin_memory=True, drop_last=True,
             persistent_workers=self.num_workers > 0,
             multiprocessing_context="spawn" if self.num_workers > 0 else None,
+            prefetch_factor=prefetch_factor,
         )
 
     def on_train_epoch_start(self, current_epoch: int):

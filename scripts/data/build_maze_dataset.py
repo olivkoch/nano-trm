@@ -174,7 +174,7 @@ def convert_subset(set_name: str, source_repo: str, output_dir: str,
 @click.option("--output-dir", default="data/maze-30x30-hard-1k", help="Output directory")
 @click.option("--subsample-size", type=int, default=None, help="Subsample size for training set")
 @click.option("--num-aug", type=int, default=7, help="Number of augmentations per puzzle (max 7 for dihedral)")
-@click.option("--eval-ratio", type=float, default=None, help="Test set size as ratio of training size")
+@click.option("--eval-ratio", type=float, default=None, help="Ratio of test.csv to use for val (remainder goes to test)")
 @click.option("--seed", type=int, default=42, help="Random seed")
 def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[int],
                     num_aug: int, eval_ratio: Optional[float], seed: int):
@@ -190,22 +190,26 @@ def preprocess_data(source_repo: str, output_dir: str, subsample_size: Optional[
     
     # Val and test sets are taken from test.csv (no leakage with training)
     eval_subsample_size = None
-    if eval_ratio is not None:
+    if eval_ratio is not None and eval_ratio < 1.0:
         with open(hf_hub_download(source_repo, "test.csv", repo_type="dataset"), newline="") as csvfile:
             reader = csv.reader(csvfile)
             next(reader)  # Skip header
             original_test_size = sum(1 for _ in reader)
         eval_subsample_size = int(original_test_size * eval_ratio)
-        print(f"Original test.csv has {original_test_size} samples, using {eval_subsample_size} for each eval split")
+        print(f"Original test.csv has {original_test_size} samples, using {eval_subsample_size} for val, remainder for test")
     
     # Generate val set, keeping remaining data for test
     num_val_groups, num_val, remaining_data = convert_subset("val", source_repo, output_dir, 
                                                               eval_subsample_size, num_aug=0)
     
-    # Generate test set from remaining pool
-    num_test_groups, num_test, _ = convert_subset("test", source_repo, output_dir, 
-                                                   eval_subsample_size, num_aug=0,
-                                                   preloaded_data=remaining_data)
+    # Generate test set from remaining pool (skip if eval_ratio=1.0 or no remaining data)
+    if remaining_data is not None and len(remaining_data[0]) > 0:
+        num_test_groups, num_test, _ = convert_subset("test", source_repo, output_dir, 
+                                                       None, num_aug=0,
+                                                       preloaded_data=remaining_data)
+    else:
+        num_test_groups, num_test = 0, 0
+        print("✓ Skipping test split (all eval data used for val)")
     
     # Infer grid size from first training file
     train_meta_path = os.path.join(output_dir, "train", "dataset.json")

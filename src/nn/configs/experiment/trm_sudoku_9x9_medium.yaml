@@ -11,7 +11,7 @@ tags: ["sudoku", "trm", "medium"]
 timekeeping:
   max_epochs: 5000
   batch_size: 512
-  num_workers: 0
+  num_workers: 1
 
 model_tuning:
   learning_rate: 1e-4
@@ -34,10 +34,14 @@ model_tuning:
   pos_emb_type: "1d"
   use_mlp: false
   use_sigreg: false
-  attn_gate_type: "headwise"
+  attn_gate_type: null
 
 trainer:
   check_val_every_n_epoch: 10
+  profiler:
+    _target_: lightning.pytorch.profilers.SimpleProfiler
+    dirpath: /tmp/profiler
+    filename: "profiler" 
 
 callbacks:
   ema:

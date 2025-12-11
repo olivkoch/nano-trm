@@ -13,7 +13,7 @@ from typing import Optional
 import hydra
 import lightning
 import wandb
-from lightning import Callback, LightningDataModule, LightningModule, Trainer
+from lightning import Callback, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, OmegaConf
 

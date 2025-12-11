@@ -180,6 +180,11 @@ class SudokuEvaluator:
         sample_idx: int = 0,
         max_steps: int = None,
         show_confidence: bool = True,
+        save_gif: bool = False,
+        gif_path: str = None,
+        gif_size: int = 400,
+        gif_duration: int = 1000,
+        save_pngs: bool = True,
     ) -> Dict[str, Any]:
         """
         Visualize the TRM's thinking process for a single sample.
@@ -191,6 +196,11 @@ class SudokuEvaluator:
             sample_idx: Which sample in the batch to visualize
             max_steps: Maximum steps to run (default: N_supervision_val)
             show_confidence: Whether to show confidence values
+            save_gif: Whether to save an animated GIF
+            gif_path: Path to save GIF (default: thinking_visualization.gif)
+            gif_size: Width/height of the GIF in pixels
+            gif_duration: Duration of each frame in milliseconds
+            save_pngs: Whether to also save individual PNG frames
             
         Returns:
             Dictionary with step-by-step predictions and metadata
@@ -267,6 +277,19 @@ class SudokuEvaluator:
             show_confidence=show_confidence,
         )
         
+        # Generate GIF if requested
+        if save_gif:
+            gif_file = gif_path or "thinking_visualization.gif"
+            self._generate_thinking_gif(
+                inp_grid.cpu(),
+                tgt_grid.cpu(),
+                step_predictions,
+                gif_path=gif_file,
+                size=gif_size,
+                duration=gif_duration,
+                save_pngs=save_pngs,
+            )
+        
         return {
             "input": inp_grid.cpu(),
             "target": tgt_grid.cpu(),
@@ -276,6 +299,237 @@ class SudokuEvaluator:
             "step_halted": step_halted,
             "num_steps": len(step_predictions),
         }
+    
+    def _generate_thinking_gif(
+        self,
+        inp_grid: torch.Tensor,
+        tgt_grid: torch.Tensor,
+        step_predictions: list,
+        gif_path: str = "thinking_visualization.gif",
+        size: int = 400,
+        duration: int = 1000,
+        save_pngs: bool = True,
+    ):
+        """Generate an animated GIF showing the thinking process."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            print("PIL not installed. Run: pip install Pillow")
+            return
+        
+        frames = []
+        num_steps = len(step_predictions)
+        
+        # Mask for cells to predict (empty cells in input, encoded as 2)
+        input_mask = (inp_grid == 2)
+        
+        # Try to get a nice font, fall back to default
+        try:
+            # Try common fonts
+            font_size = size // 12
+            label_font_size = size // 20
+            for font_name in ["DejaVuSans.ttf", "Arial.ttf", "Helvetica.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
+                try:
+                    font = ImageFont.truetype(font_name, font_size)
+                    label_font = ImageFont.truetype(font_name, label_font_size)
+                    break
+                except (OSError, IOError):
+                    continue
+            else:
+                font = ImageFont.load_default()
+                label_font = font
+        except Exception:
+            font = ImageFont.load_default()
+            label_font = font
+        
+        # Calculate grid dimensions
+        padding = size // 10
+        grid_area = size - 2 * padding
+        cell_size = grid_area // self.grid_size
+        grid_size_px = cell_size * self.grid_size
+        
+        # Recenter grid
+        offset = (size - grid_size_px) // 2
+        
+        box_rows, box_cols = self._get_box_dims(self.grid_size)
+        
+        def decode_cell(val):
+            val = val.item() if hasattr(val, 'item') else val
+            if val == 0:
+                return ""
+            elif val == 1:
+                return ""
+            elif val == 2:
+                return ""
+            else:
+                return str(val - 2)
+        
+        # Create initial frame (input puzzle)
+        frames.append(self._create_grid_frame(
+            inp_grid, tgt_grid, None, input_mask,
+            size, cell_size, offset, box_rows, box_cols,
+            font, label_font, 0, num_steps, is_input=True
+        ))
+        
+        # Create frames for each step
+        # For first step, compare against input grid to detect new predictions
+        prev_pred = inp_grid  # Start with input so first step shows changes
+        for step, pred in enumerate(step_predictions):
+            frame = self._create_grid_frame(
+                pred, tgt_grid, prev_pred, input_mask,
+                size, cell_size, offset, box_rows, box_cols,
+                font, label_font, step + 1, num_steps, is_input=False
+            )
+            frames.append(frame)
+            prev_pred = pred
+        
+        # Save individual PNG files for debugging
+        if save_pngs:
+            import os
+            png_dir = gif_path.rsplit('.', 1)[0] + "_frames"
+            os.makedirs(png_dir, exist_ok=True)
+            for i, frame in enumerate(frames):
+                png_path = os.path.join(png_dir, f"frame_{i:02d}.png")
+                frame.save(png_path)
+            print(f"✓ Saved {len(frames)} PNG frames to {png_dir}/")
+        
+        # Convert frames to palette mode preserving colors
+        # Create a combined image with all frames to build a comprehensive palette
+        if len(frames) > 1:
+            # Stack all frames horizontally to get all colors in one image
+            total_width = sum(f.width for f in frames)
+            combined = Image.new('RGB', (total_width, frames[0].height))
+            x_offset = 0
+            for frame in frames:
+                combined.paste(frame, (x_offset, 0))
+                x_offset += frame.width
+            
+            # Quantize the combined image to get a palette with all colors
+            combined_quantized = combined.quantize(colors=256)
+            
+            # Apply this palette to each frame
+            palette_frames = []
+            for frame in frames:
+                p_frame = frame.quantize(palette=combined_quantized)
+                palette_frames.append(p_frame)
+        else:
+            palette_frames = [frames[0].quantize(colors=256)]
+        
+        # Save GIF
+        palette_frames[0].save(
+            gif_path,
+            save_all=True,
+            append_images=palette_frames[1:] if len(palette_frames) > 1 else [],
+            duration=duration,
+            loop=0,
+        )
+        print(f"\n✓ Saved GIF to {gif_path}")
+    
+    def _create_grid_frame(
+        self,
+        grid: torch.Tensor,
+        target: torch.Tensor,
+        prev_grid: torch.Tensor,
+        input_mask: torch.Tensor,
+        size: int,
+        cell_size: int,
+        offset: int,
+        box_rows: int,
+        box_cols: int,
+        font,
+        label_font,
+        step: int,
+        total_steps: int,
+        is_input: bool = False,
+    ):
+        """Create a single frame for the GIF."""
+        from PIL import Image, ImageDraw
+        
+        img = Image.new('RGB', (size, size), 'white')
+        draw = ImageDraw.Draw(img)
+        
+        def decode_cell(val):
+            val = val.item() if hasattr(val, 'item') else val
+            if val == 0 or val == 1 or val == 2:
+                return ""
+            else:
+                return str(val - 2)
+        
+        # Draw cells
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                x = offset + c * cell_size
+                y = offset + r * cell_size
+                
+                cell_val = grid[r, c]
+                is_empty_cell = input_mask[r, c].item()
+                
+                # Fill cell background (always white)
+                draw.rectangle(
+                    [x, y, x + cell_size, y + cell_size],
+                    fill='white',
+                    outline=None
+                )
+                
+                # Draw cell value
+                val_str = decode_cell(cell_val)
+                if val_str:
+                    # Determine text color
+                    if not is_empty_cell:
+                        # Given cell - gray
+                        text_color = '#666666'
+                    elif not is_input and grid[r, c] != prev_grid[r, c]:
+                        # New prediction this step - check if correct
+                        if grid[r, c] == target[r, c]:
+                            text_color = '#228B22'  # Forest green - correct
+                        else:
+                            text_color = '#FF8C00'  # Dark orange - incorrect
+                    else:
+                        # Existing prediction or input - black
+                        text_color = 'black'
+                    
+                    # Center text in cell
+                    bbox = draw.textbbox((0, 0), val_str, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                    text_x = x + (cell_size - text_w) // 2
+                    text_y = y + (cell_size - text_h) // 2 - bbox[1]
+                    
+                    draw.text((text_x, text_y), val_str, fill=text_color, font=font)
+        
+        # Draw grid lines
+        grid_size_px = cell_size * self.grid_size
+        
+        # Thin lines for all cells
+        for i in range(self.grid_size + 1):
+            # Horizontal
+            y = offset + i * cell_size
+            draw.line([(offset, y), (offset + grid_size_px, y)], fill='black', width=1)
+            # Vertical
+            x = offset + i * cell_size
+            draw.line([(x, offset), (x, offset + grid_size_px)], fill='black', width=1)
+        
+        # Thick lines for boxes
+        for i in range(self.grid_size // box_rows + 1):
+            y = offset + i * box_rows * cell_size
+            draw.line([(offset, y), (offset + grid_size_px, y)], fill='black', width=3)
+        for i in range(self.grid_size // box_cols + 1):
+            x = offset + i * box_cols * cell_size
+            draw.line([(x, offset), (x, offset + grid_size_px)], fill='black', width=3)
+        
+        # Draw step label
+        if is_input:
+            label = "Input"
+        else:
+            label = f"Step {step}/{total_steps}"
+        
+        bbox = draw.textbbox((0, 0), label, font=label_font)
+        label_w = bbox[2] - bbox[0]
+        label_x = size - label_w - 10
+        label_y = 10
+        draw.text((label_x, label_y), label, fill='black', font=label_font)
+        
+        return img
     
     def _print_thinking_visualization(
         self,
@@ -441,14 +695,33 @@ class SudokuEvaluator:
         
         print("\nLegend: *N = changed this step, !N = wrong prediction")
 
-    def visualize_sample(self, split: str = "val", sample_idx: int = 0, show_confidence: bool = True):
+    def visualize_sample(
+        self, 
+        split: str = "val", 
+        sample_idx: int = 0, 
+        show_confidence: bool = True,
+        min_steps: int = None,
+        max_search: int = 100,
+        save_gif: bool = False,
+        gif_path: str = None,
+        gif_size: int = 400,
+        gif_duration: int = 1000,
+        save_pngs: bool = True,
+    ):
         """
         Convenience method to visualize thinking on a specific sample.
         
         Args:
             split: Which split to use ('train', 'val', 'test')
-            sample_idx: Index of sample in the split
+            sample_idx: Starting index to search from
             show_confidence: Whether to show confidence values
+            min_steps: Minimum steps required to get correct answer (will search for such a sample)
+            max_search: Maximum samples to search through when min_steps is set
+            save_gif: Whether to save an animated GIF
+            gif_path: Path to save GIF (default: thinking_visualization.gif)
+            gif_size: Width/height of the GIF in pixels
+            gif_duration: Duration of each frame in milliseconds
+            save_pngs: Whether to also save individual PNG frames
         """
         if split == "train":
             dataloader = self.datamodule.train_dataloader()
@@ -459,15 +732,113 @@ class SudokuEvaluator:
         else:
             raise ValueError(f"Invalid split: {split}")
         
-        # Find the right batch
-        batch_idx = sample_idx // self.batch_size
-        within_batch_idx = sample_idx % self.batch_size
+        gif_kwargs = dict(
+            save_gif=save_gif,
+            gif_path=gif_path,
+            gif_size=gif_size,
+            gif_duration=gif_duration,
+            save_pngs=save_pngs,
+        )
         
-        for i, batch in enumerate(dataloader):
-            if i == batch_idx:
-                return self.visualize_thinking(batch, within_batch_idx, show_confidence=show_confidence)
+        if min_steps is None:
+            # Original behavior: just get the specific sample
+            batch_idx = sample_idx // self.batch_size
+            within_batch_idx = sample_idx % self.batch_size
+            
+            for i, batch in enumerate(dataloader):
+                if i == batch_idx:
+                    return self.visualize_thinking(
+                        batch, within_batch_idx, 
+                        show_confidence=show_confidence,
+                        **gif_kwargs
+                    )
+            
+            raise ValueError(f"sample_idx {sample_idx} out of range for {split} split")
         
-        raise ValueError(f"sample_idx {sample_idx} out of range for {split} split")
+        # Search for a sample that takes at least min_steps to get correct (but does succeed)
+        print(f"Searching for a sample that takes at least {min_steps} steps to solve (but succeeds)...")
+        
+        max_model_steps = self.model.hparams.N_supervision_val
+        samples_checked = 0
+        start_batch_idx = sample_idx // self.batch_size
+        start_within_batch = sample_idx % self.batch_size
+        
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx < start_batch_idx:
+                continue
+                
+            batch = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                for k, v in batch.items()
+            }
+            
+            batch_size = batch["input"].shape[0]
+            start_idx = start_within_batch if batch_idx == start_batch_idx else 0
+            
+            for within_batch_idx in range(start_idx, batch_size):
+                if samples_checked >= max_search:
+                    print(f"Searched {max_search} samples, none took >= {min_steps} steps and succeeded. Showing last checked.")
+                    return self.visualize_thinking(
+                        batch, within_batch_idx, 
+                        show_confidence=show_confidence,
+                        **gif_kwargs
+                    )
+                
+                # Check: how many steps until this sample gets the correct answer?
+                steps_to_correct = self._count_steps_for_sample(batch, within_batch_idx)
+                samples_checked += 1
+                
+                # Must take at least min_steps AND succeed (not exceed max_steps)
+                if steps_to_correct >= min_steps and steps_to_correct <= max_model_steps:
+                    actual_idx = batch_idx * self.batch_size + within_batch_idx
+                    print(f"Found sample {actual_idx} that takes {steps_to_correct} steps to solve (checked {samples_checked} samples)")
+                    return self.visualize_thinking(
+                        batch, within_batch_idx, 
+                        show_confidence=show_confidence,
+                        **gif_kwargs
+                    )
+        
+        raise ValueError(f"No sample found that takes >= {min_steps} steps AND succeeds in first {samples_checked} samples")
+    
+    def _count_steps_for_sample(self, batch: Dict[str, torch.Tensor], sample_idx: int) -> int:
+        """Count how many steps until the sample gets the correct answer."""
+        max_steps = self.model.hparams.N_supervision_val
+        
+        targets = batch["output"]
+        inputs = batch["input"]
+        
+        # Get target grid for this sample
+        tgt = targets[sample_idx].reshape(self.max_grid_size, self.max_grid_size)
+        tgt_grid = tgt[:self.grid_size, :self.grid_size]
+        
+        # Mask for cells to predict (empty cells = 2)
+        inp = inputs[sample_idx].reshape(self.max_grid_size, self.max_grid_size)
+        inp_grid = inp[:self.grid_size, :self.grid_size]
+        input_mask = (inp_grid == 2)
+        
+        with torch.no_grad():
+            carry = self.model.initial_carry(batch)
+            
+            for step in range(max_steps):
+                carry, outputs = self.model.forward(carry, batch)
+                
+                # Get predictions for this sample
+                logits = outputs["logits"][sample_idx]
+                preds = logits.argmax(dim=-1).reshape(self.max_grid_size, self.max_grid_size)
+                pred_grid = preds[:self.grid_size, :self.grid_size]
+                
+                # Check if all masked cells are correct
+                is_correct = torch.all(pred_grid[input_mask] == tgt_grid[input_mask]).item()
+                
+                if is_correct:
+                    return step + 1  # Took this many steps to get it right
+                
+                if carry.halted[sample_idx]:
+                    # Halted but still wrong - return max_steps to indicate "never got it right"
+                    return max_steps + 1
+            
+            # Ran all steps but never got it right
+            return max_steps + 1
 
     def evaluate_batch(self, batch: Dict[str, torch.Tensor], print_examples: bool = False) -> Dict[str, Any]:
         """Evaluate a single batch."""

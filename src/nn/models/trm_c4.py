@@ -2,6 +2,7 @@
 HRM/TRM PyTorch Lightning Module - Refactored to use base class
 """
 
+import os
 import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -231,6 +232,25 @@ class TRMC4Module(C4BaseModule):
         
         log.info(f"Learning rates: model={learning_rate}, emb={learning_rate_emb} max steps = {self.max_steps}")
     
+    def setup(self, stage: str):
+        """Called by Lightning when setting up the model."""
+        if stage == "fit":
+            # Add torch.compile for faster training
+            if "DISABLE_COMPILE" not in os.environ and hasattr(torch, 'compile') and self.device.type == "cuda":
+                try:
+                    log.info("Compiling inner_forward with torch.compile...")
+                    self.inner_forward = torch.compile(
+                        self.inner_forward,
+                        mode="reduce-overhead",  # Good for repeated calls (your H/L cycles)
+                        fullgraph=False,         # Allow graph breaks for dynamic control flow
+                    )
+                    log.info("Compilation successful")
+                except Exception as e:
+                    log.warning(f"torch.compile failed, running uncompiled: {e}")
+            else:
+                log.info('*' * 60)
+                log.info("torch.compile not available or disabled, running uncompiled")
+
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor, current_player: torch.Tensor):
 
         input = self._canonicalize_board(input, current_player)

@@ -36,6 +36,8 @@ def evaluate(cfg: DictConfig) -> Optional[float]:
             - eval_split: train/val/test (default: val)
             - all_splits: evaluate all splits (default: False)
             - output_dir: where to save results (default: checkpoint_dir/evaluation_results)
+            - visualize: visualize TRM thinking on sample(s) (default: False)
+            - visualize_samples: number of samples to visualize (default: 1)
 
     Returns:
         Task accuracy as float
@@ -49,6 +51,60 @@ def evaluate(cfg: DictConfig) -> Optional[float]:
         num_workers=cfg.get("num_workers", 0),
         eval_split=cfg.get("eval_split", "val"),
     )
+
+    # Visualization mode
+    if cfg.get("visualize", False):
+        num_samples = cfg.get("visualize_samples", 1)
+        split = cfg.get("eval_split", "val")
+        min_steps = cfg.get("min_steps", None)
+        
+        # Handle boolean parsing (Hydra might pass strings)
+        save_gif = cfg.get("save_gif", False)
+        if isinstance(save_gif, str):
+            save_gif = save_gif.lower() in ("true", "1", "yes")
+        
+        save_pngs = cfg.get("save_pngs", True)  # Default to True for debugging
+        if isinstance(save_pngs, str):
+            save_pngs = save_pngs.lower() in ("true", "1", "yes")
+        
+        gif_size = cfg.get("gif_size", 400)
+        gif_duration = cfg.get("gif_duration", 1000)
+        
+        print(f"\nVisualizing TRM thinking on {num_samples} sample(s) from {split} split...")
+        if min_steps:
+            print(f"Filtering for samples that require at least {min_steps} steps to solve")
+        if save_gif:
+            print(f"Will save GIF(s) with size={gif_size}px, duration={gif_duration}ms per frame")
+            if save_pngs:
+                print(f"Will also save individual PNG frames")
+        
+        for i in range(num_samples):
+            sample_idx = cfg.get("visualize_start_idx", 0) + i
+            print(f"\n{'#' * 80}")
+            print(f"# SAMPLE {i + 1} (starting search from index {sample_idx})")
+            print(f"{'#' * 80}")
+            
+            # Generate unique GIF path for each sample
+            gif_path = cfg.get("gif_path", None)
+            if save_gif and gif_path is None:
+                gif_path = f"thinking_sample_{i + 1}.gif"
+            elif save_gif and num_samples > 1 and gif_path is not None:
+                # Add index to filename if multiple samples
+                base, ext = gif_path.rsplit('.', 1) if '.' in gif_path else (gif_path, 'gif')
+                gif_path = f"{base}_{i + 1}.{ext}"
+            
+            evaluator.visualize_sample(
+                split=split, 
+                sample_idx=sample_idx,
+                min_steps=min_steps,
+                save_gif=save_gif,
+                gif_path=gif_path,
+                gif_size=gif_size,
+                gif_duration=gif_duration,
+                save_pngs=save_pngs,
+            )
+        
+        return None
 
     # Run evaluation
     results = evaluator.evaluate_full(print_examples=True)

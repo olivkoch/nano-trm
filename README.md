@@ -8,6 +8,8 @@ Train a TRM in a few minutes on an A10. Reproduce the official TRM results. Push
 
 This project reproduces the results on Sudoku Extreme and Maze Hard (87% and 75% exact accuracy on validation, resp.)
 
+<img src="demo/sudoku_thinking_9_steps.gif" width="400" alt="Sudoku thinking">
+
 # Installation
 
 This repo comes with `uv`. You just need to run `uv run python ...` commands and everything will be installed automagically on the first run.
@@ -61,6 +63,10 @@ Takes a few mins on an A10
 Independant evaluation with visualizations: 
 
 `uv run python src/nn/evaluate.py +checkpoint=/tmp/ml-experiments/lunar-pine-174/checkpoints/last.ckpt +data_dir=./data/sudoku_4x4_small`
+
+To generate an animated GIF:
+
+`uv run python src/nn/evaluate.py +checkpoint=./checkpoints/smooth-sunset-204.ckpt +data_dir=./data/sudoku-extreme-1k-aug-1k +visualize=true +save_gif=true +min_steps=9`
 
 # Comments / contributions
 

@@ -38,6 +38,7 @@ selfplay_update_interval: ${model_tuning.selfplay_update_interval}  # Update "pr
 selfplay_bootstrap_weight: ${model_tuning.selfplay_bootstrap_weight}
 selfplay_temporal_decay: ${model_tuning.selfplay_temporal_decay}
 eval_use_mcts: ${model_tuning.eval_use_mcts}
+curriculum_data_path: ${model_tuning.curriculum_data_path}
         
 # Evaluation parameters
 eval_minimax_depth: ${model_tuning.eval_minimax_depth}

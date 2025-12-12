@@ -38,36 +38,60 @@ class MCTSModelWrapper:
         
         return outputs['policy'], outputs['value']
 
+# In C4BaseModule, replace the SimpleDataset in train_dataloader:
 
-class SelfPlayDataset(Dataset):
-    """Dataset for self-play training"""
+# In c4_base.py, replace both SelfPlayDataset and SimpleDataset with:
+
+class CarryAwareDataset(Dataset):
+    """
+    Dataset that respects TRM carry state.
+    Only replaces positions when they halt, enabling multi-step reasoning.
+    Works for both self-play and curriculum modes.
+    """
     
     def __init__(self, module, batch_size, steps_per_epoch):
         self.module = module
         self.batch_size = batch_size
         self.steps_per_epoch = steps_per_epoch
-        
+        self.current_batch = None
+    
     def __len__(self):
         return self.steps_per_epoch
     
-    def __getitem__(self, idx):
-        # Sample from buffer
+    def _sample_positions(self, n):
+        """Sample n positions from replay buffer"""
         buffer = self.module.replay_buffer
-        samples = buffer.sample(self.batch_size, replace=len(buffer) < self.batch_size)
-
-        boards = torch.stack([s['board'] for s in samples])
-        policies = torch.stack([s['policy'] for s in samples])
-        values = torch.tensor([s['value'] for s in samples], dtype=torch.float32)
-        current_player = torch.tensor([s['current_player'] for s in samples], dtype=torch.long)
-        puzzle_identifiers = torch.zeros(self.batch_size, dtype=torch.long)
+        samples = buffer.sample(n, replace=len(buffer) < n)
         
         return {
-            'boards': boards,
-            'policies': policies,
-            'values': values,
-            'current_player': current_player,
-            'puzzle_identifiers': puzzle_identifiers
+            'boards': torch.stack([s['board'] for s in samples]),
+            'policies': torch.stack([s['policy'] for s in samples]),
+            'values': torch.tensor([s['value'] for s in samples], dtype=torch.float32),
+            'current_player': torch.tensor([s['current_player'] for s in samples], dtype=torch.long),
+            'puzzle_identifiers': torch.zeros(n, dtype=torch.long),
         }
+    
+    def __getitem__(self, idx):
+        # First call: initialize entire batch
+        if self.current_batch is None:
+            self.current_batch = self._sample_positions(self.batch_size)
+            return self.current_batch
+        
+        # Subsequent calls: only replace halted positions
+        if self.module.carry is not None:
+            halted = self.module.carry.halted.cpu()
+            halted_indices = halted.nonzero(as_tuple=True)[0]
+            
+            if len(halted_indices) > 0:
+                new_samples = self._sample_positions(len(halted_indices))
+                for k in self.current_batch:
+                    self.current_batch[k][halted_indices] = new_samples[k]
+        
+        return self.current_batch
+    
+    def reset(self):
+        """Reset batch state (call at epoch boundary if desired)"""
+        self.current_batch = None
 
 
 class C4BaseModule(LightningModule):
@@ -91,17 +115,16 @@ class C4BaseModule(LightningModule):
         self.games_played = 0
         self.max_steps = self.hparams.steps_per_epoch * self.hparams.max_epochs
         
+        self.replay_buffer = CircularBuffer(maxlen=self.hparams.selfplay_buffer_size)
+
         # Self-play attributes
-        if self.hparams.get('enable_selfplay', False):
-            self.replay_buffer = CircularBuffer(maxlen=self.hparams.selfplay_buffer_size)
+        if self.hparams.enable_selfplay:    
             self.games_generated = 0
             self.previous_model = None
             self.mcts = None
             # for monitoring
             self.value_preds_buffer = []  # Rolling buffer for correlation
             self.game_outcomes_buffer = []
-        else:
-            self.replay_buffer = []
     
     def forward_for_mcts(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -122,17 +145,23 @@ class C4BaseModule(LightningModule):
         raise NotImplementedError("Child class must implement log_grad_norms")
     
     def setup(self, stage: str):
-        """Setup - model is still on CPU, only do non-tensor operations"""
+        """Setup - model is still on CPU, only do non-tensor operations"""        
         if stage == "fit":
+            log.info("Training configuration:")
+            log.info(f"  Steps per epoch: {self.hparams.steps_per_epoch}")
+            log.info(f"  Max epochs: {self.hparams.max_epochs}")
+            log.info(f"  Total steps: {self.max_steps}")
+            log.info(f"  Buffer size: {len(self.replay_buffer)}")
+
             # Traditional training - load file data (no tensor operations needed)
-            if not self.hparams.get('enable_selfplay', False):
+            if not self.hparams.enable_selfplay:
                 if len(self.replay_buffer) == 0:
                     # This is safe because it just loads data into buffer
-                    self.load_games_from_file("minimax_games_.pkl")
+                    self.load_games_from_file(self.hparams.curriculum_data_path)
     
     def generate_selfplay_games(self, num_games: int, verbose: bool = False, log_metrics: bool = True) -> Tuple[int, int, int]:
         """Generate self-play games using MCTS"""
-        if not self.hparams.get('enable_selfplay', False):
+        if not self.hparams.enable_selfplay:
             raise RuntimeError("Self-play not enabled for this model")
         
         self.eval()
@@ -283,7 +312,7 @@ class C4BaseModule(LightningModule):
     
     def on_train_epoch_start(self):
         """Do all initialization here when model is on correct device"""
-        if self.hparams.get('enable_selfplay', False):
+        if self.hparams.enable_selfplay:
         
             num_games = self.hparams.selfplay_games_per_iteration
             
@@ -316,7 +345,7 @@ class C4BaseModule(LightningModule):
             self.log('eval/draw_rate_vs_random', draw_rate)
             
             # Evaluate vs previous
-            if self.hparams.get('enable_selfplay', False) and self.previous_model is not None:
+            if self.hparams.enable_selfplay and self.previous_model is not None:
                 win_rate, draw_rate, _ = self.evaluate(
                     opponent='previous',
                     n_games=50,
@@ -340,7 +369,7 @@ class C4BaseModule(LightningModule):
             self.log('eval/draw_rate_vs_minimax', draw_rate)
         
         # Update previous model checkpoint
-        if self.hparams.get('enable_selfplay', False) and epoch > 0:
+        if self.hparams.enable_selfplay and epoch > 0:
             if epoch % self.hparams.get('selfplay_update_interval', 10) == 0:
                 self.previous_model = pickle.loads(pickle.dumps(self.state_dict()))
     
@@ -619,13 +648,18 @@ class C4BaseModule(LightningModule):
     
     def load_games_from_file(self, input_file: str):
         """Load games from file - matching interface"""
-        print(f"Loading games from {input_file}...")
+        log.info(f"Loading games from {input_file}...")
         
         with open(input_file, 'rb') as f:
             data = pickle.load(f)
         
         positions = data['positions']
         
+        log.info(f"Loaded {len(positions)} positions from {data['num_games']} games. Pushing into buffer of size {self.hparams.selfplay_buffer_size}...")
+
+        if len(positions) > self.hparams.selfplay_buffer_size:
+            log.info(f"WARNING: Truncated to last {len(positions)} positions to fit buffer size.")
+
         for pos in positions:
             board = torch.tensor(pos['board'], dtype=torch.float32)
             policy = torch.tensor(pos['policy'], dtype=torch.float32)
@@ -690,15 +724,13 @@ class C4BaseModule(LightningModule):
         return channels
 
     def train_dataloader(self):
-        """Create dataloader matching interface"""
-        import random
-        
+        """Create dataloader - unified for both selfplay and curriculum modes"""
         log.info(f"Building train dataloader...")
         
-        if self.hparams.get('enable_selfplay', False):
-            if len(self.replay_buffer) == 0:
-                print("Buffer empty in dataloader, bootstrapping...")
-                
+        # === Ensure buffer is populated ===
+        if len(self.replay_buffer) == 0:
+            if self.hparams.enable_selfplay:
+                log.info("Buffer empty, bootstrapping for self-play...")
                 device = next(self.parameters()).device
                 
                 # Bootstrap with random games
@@ -706,7 +738,7 @@ class C4BaseModule(LightningModule):
                 
                 # Create MCTS if needed
                 if not hasattr(self, 'mcts') or self.mcts is None:
-                    log.info(f"Creating a MCTS with {self.hparams.selfplay_parallel_simulations} parallel simulations and {self.hparams.selfplay_mcts_simulations} simulations per move")
+                    log.info(f"Creating MCTS with {self.hparams.selfplay_parallel_simulations} parallel sims, {self.hparams.selfplay_mcts_simulations} sims/move")
                     self.mcts = TensorMCTSWrapper(
                         model=MCTSModelWrapper(self),
                         c_puct=0.5,
@@ -717,47 +749,31 @@ class C4BaseModule(LightningModule):
                     )
                 
                 # Generate initial self-play games
-                self.generate_selfplay_games(self.hparams.selfplay_games_per_iteration, verbose=True, log_metrics=False)
-            
-            # Now create dataset with populated buffer
-            dataset = SelfPlayDataset(
+                self.generate_selfplay_games(
+                    self.hparams.selfplay_games_per_iteration, 
+                    verbose=True, 
+                    log_metrics=False
+                )
+            else:
+                # Curriculum mode: buffer should have been loaded in setup()
+                raise RuntimeError(
+                    f"Replay buffer is empty! Did setup() run? "
+                    f"Check that games file exists: {self.hparams.get('games_file', 'N/A')}"
+                )
+        
+        log.info(f"Replay buffer size: {len(self.replay_buffer)}")
+        
+        # === Create or reuse dataset (unified for both modes) ===
+        if not hasattr(self, '_train_dataset') or self._train_dataset is None:
+            self._train_dataset = CarryAwareDataset(
                 module=self,
                 batch_size=self.hparams.batch_size,
                 steps_per_epoch=self.hparams.steps_per_epoch
             )
-        else:
-            class SimpleDataset(Dataset):
-                def __init__(self, module, steps_per_epoch):
-                    self.module = module
-                    self.steps_per_epoch = steps_per_epoch
-                    
-                def __len__(self):
-                    return self.steps_per_epoch
-                
-                def __getitem__(self, idx):
-                    # Sample batch
-                    samples = random.sample(
-                        self.module.replay_buffer,
-                        self.module.hparams.batch_size
-                    )
-                    
-                    boards = torch.stack([s['board'] for s in samples])
-                    policies = torch.stack([s['policy'] for s in samples])
-                    values = torch.tensor([s['value'] for s in samples], dtype=torch.float32)
-                    current_player = torch.tensor([s['current_player'] for s in samples], dtype=torch.long)
-
-                    puzzle_identifiers = torch.zeros(
-                        self.module.hparams.batch_size, dtype=torch.long
-                    )
-                    
-                    return {
-                        'boards': boards,
-                        'policies': policies,
-                        'values': values,
-                        'puzzle_identifiers': puzzle_identifiers,
-                        'current_player': current_player
-                    }
-            
-            dataset = SimpleDataset(self, self.hparams.steps_per_epoch)
         
-        return DataLoader(dataset, batch_size=None, num_workers=0, shuffle=False)
+        return DataLoader(
+            self._train_dataset, 
+            batch_size=None, 
+            num_workers=0, 
+            shuffle=False
+        )

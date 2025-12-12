@@ -79,7 +79,8 @@ class C4CNNModule(C4BaseModule):
         selfplay_update_interval: int = 10,  # Update "previous model" every N epochs
         selfplay_bootstrap_weight: float = 0.3,  # 0 = pure outcome, 1 = pure MCTS value
         selfplay_temporal_decay: float = 0.95,   # Decay bootstrap for later moves
-        
+        curriculum_data_path: str = None,
+
         # Evaluation parameters
         eval_minimax_depth: int = 4,
         eval_minimax_temperature: float = 0.5,

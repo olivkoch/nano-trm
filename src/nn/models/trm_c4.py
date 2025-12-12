@@ -40,8 +40,8 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 @dataclass
 class TRMInnerCarry:
-    z_H: torch.Tensor  # High-level state (y in your code)
-    z_L: torch.Tensor  # Low-level state (z in your code)
+    z_H: torch.Tensor  # High-level state (y in the paper)
+    z_L: torch.Tensor  # Low-level state (z in the paper)
 
 
 @dataclass
@@ -97,6 +97,7 @@ class TRMC4Module(C4BaseModule):
         selfplay_update_interval: int = 10,
         selfplay_bootstrap_weight: float = 0.3,  # 0 = pure outcome, 1 = pure MCTS value
         selfplay_temporal_decay: float = 0.95,   # Decay bootstrap for later moves
+        curriculum_data_path: str = None,
         
         # Evaluation parameters
         eval_minimax_depth: int = 4,
@@ -130,6 +131,7 @@ class TRMC4Module(C4BaseModule):
             selfplay_bootstrap_weight=selfplay_bootstrap_weight,
             selfplay_temporal_decay=selfplay_temporal_decay,
             selfplay_eval_mcts_simulations=selfplay_eval_mcts_simulations,
+            curriculum_data_path=curriculum_data_path,
             eval_minimax_depth=eval_minimax_depth,
             eval_minimax_temperature=eval_minimax_temperature,
             eval_games_vs_minimax=eval_games_vs_minimax,
@@ -192,7 +194,7 @@ class TRMC4Module(C4BaseModule):
         
         self.lm_head = CastedLinear(hidden_size, self.board_cols, bias=False)
         self.value_head = CastedLinear(hidden_size, 1, bias=False)
-        self.q_head = CastedLinear(hidden_size, 2, bias=True)
+        self.q_head = CastedLinear(hidden_size, 1, bias=True) # only learn to stop, not to continue
         
         # Halting head initialization
         with torch.no_grad():
@@ -231,9 +233,11 @@ class TRMC4Module(C4BaseModule):
         self.last_step_time = None
         
         log.info(f"Learning rates: model={learning_rate}, emb={learning_rate_emb} max steps = {self.max_steps}")
-    
+
     def setup(self, stage: str):
-        """Called by Lightning when setting up the model."""
+
+        super().setup(stage)
+        
         if stage == "fit":
             # Add torch.compile for faster training
             if "DISABLE_COMPILE" not in os.environ and hasattr(torch, 'compile') and self.device.type == "cuda":
@@ -241,7 +245,7 @@ class TRMC4Module(C4BaseModule):
                     log.info("Compiling inner_forward with torch.compile...")
                     self.inner_forward = torch.compile(
                         self.inner_forward,
-                        mode="reduce-overhead",  # Good for repeated calls (your H/L cycles)
+                        mode="default",  # TODO: make "reduce-overhead" work, good for repeated calls (H/L cycles)
                         fullgraph=False,         # Allow graph breaks for dynamic control flow
                     )
                     log.info("Compilation successful")
@@ -354,7 +358,7 @@ class TRMC4Module(C4BaseModule):
         policy_logits = self.lm_head(z_H[:, 0])
         value = torch.tanh(self.value_head(z_H[:, 0])).to(torch.float32)
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
-        return new_carry, policy_logits, value, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, policy_logits, value, q_logits[..., 0]
     
     def forward(
         self, carry: TRMCarry, batch: Dict[str, torch.Tensor]
@@ -370,7 +374,7 @@ class TRMC4Module(C4BaseModule):
         }
         
         # Forward inner model
-        new_inner_carry, policy_logits, value, (q_halt_logits, q_continue_logits) = self.inner_forward(
+        new_inner_carry, policy_logits, value, q_halt_logits = self.inner_forward(
             new_inner_carry, new_current_data
         )
         
@@ -387,7 +391,6 @@ class TRMC4Module(C4BaseModule):
             "policy": policy,
             "value": value.squeeze(-1),
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits,
         }
         
         with torch.no_grad():
@@ -480,7 +483,7 @@ class TRMC4Module(C4BaseModule):
                 "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
         
-        target_values = new_carry.current_data["values"]  # From your dataloader
+        target_values = new_carry.current_data["values"]  # From dataloader
         value_loss = F.mse_loss(outputs["value"], target_values, reduction="sum")
         policy_loss = -torch.sum(target_policy * torch.log(outputs["policy"] + 1e-8), dim=-1).sum()
         

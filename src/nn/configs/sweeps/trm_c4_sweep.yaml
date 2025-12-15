@@ -15,6 +15,8 @@ parameters:
     values: [64, 256, 512]
   model_tuning.num_layers:
     values: [1, 2, 3]
+  model_tuning.weight_decay:
+    values: [0.1, 1.0]
   model_tuning.learning_rate:
     distribution: log_uniform_values
     min: 1e-5

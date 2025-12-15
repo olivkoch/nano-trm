@@ -475,6 +475,8 @@ class TensorMCTS:
                         eval_states[non_term].flatten(start_dim=1).float(),  # Convert to float for NN
                         eval_players[non_term]
                     )
+                    policies = policies.float()
+                    values = values.float()
                 nn_values[non_term] = values.squeeze(-1) if values.dim() > 1 else values
                 nn_policies[non_term] = policies
             

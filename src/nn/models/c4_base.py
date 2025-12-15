@@ -1,7 +1,7 @@
 """
 Base class for Connect Four models with self-play and evaluation capabilities
 """
-
+import os
 import time
 import pickle
 from typing import Dict, Tuple
@@ -38,30 +38,27 @@ class MCTSModelWrapper:
         
         return outputs['policy'], outputs['value']
 
-# In C4BaseModule, replace the SimpleDataset in train_dataloader:
-
-# In c4_base.py, replace both SelfPlayDataset and SimpleDataset with:
-
-class CarryAwareDataset(Dataset):
+class SimpleReplayDataset(Dataset):
     """
-    Dataset that respects TRM carry state.
-    Only replaces positions when they halt, enabling multi-step reasoning.
-    Works for both self-play and curriculum modes.
+    Simple dataset that samples from replay buffer each step.
+    Carry logic is handled by the model's forward(), not here.
     """
     
     def __init__(self, module, batch_size, steps_per_epoch):
         self.module = module
         self.batch_size = batch_size
         self.steps_per_epoch = steps_per_epoch
-        self.current_batch = None
     
     def __len__(self):
         return self.steps_per_epoch
     
-    def _sample_positions(self, n):
-        """Sample n positions from replay buffer"""
+    def __getitem__(self, idx):
         buffer = self.module.replay_buffer
-        samples = buffer.sample(n, replace=len(buffer) < n)
+        n = self.batch_size
+        
+        # Sample with replacement if buffer is smaller than batch
+        indices = torch.randint(0, len(buffer), (n,))
+        samples = [buffer[i] for i in indices]
         
         return {
             'boards': torch.stack([s['board'] for s in samples]),
@@ -70,28 +67,6 @@ class CarryAwareDataset(Dataset):
             'current_player': torch.tensor([s['current_player'] for s in samples], dtype=torch.long),
             'puzzle_identifiers': torch.zeros(n, dtype=torch.long),
         }
-    
-    def __getitem__(self, idx):
-        # First call: initialize entire batch
-        if self.current_batch is None:
-            self.current_batch = self._sample_positions(self.batch_size)
-            return self.current_batch
-        
-        # Subsequent calls: only replace halted positions
-        if self.module.carry is not None:
-            halted = self.module.carry.halted.cpu()
-            halted_indices = halted.nonzero(as_tuple=True)[0]
-            
-            if len(halted_indices) > 0:
-                new_samples = self._sample_positions(len(halted_indices))
-                for k in self.current_batch:
-                    self.current_batch[k][halted_indices] = new_samples[k]
-        
-        return self.current_batch
-    
-    def reset(self):
-        """Reset batch state (call at epoch boundary if desired)"""
-        self.current_batch = None
 
 
 class C4BaseModule(LightningModule):
@@ -125,6 +100,8 @@ class C4BaseModule(LightningModule):
             # for monitoring
             self.value_preds_buffer = []  # Rolling buffer for correlation
             self.game_outcomes_buffer = []
+
+        self.epoch_idx = 0
     
     def forward_for_mcts(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -324,54 +301,62 @@ class C4BaseModule(LightningModule):
             self.log('selfplay/positions_generated', num_positions)
             self.log('selfplay/buffer_size', len(self.replay_buffer))
     
+    def val_dataloader(self):
+        """Dummy dataloader to trigger validation epoch"""
+        # Just need something to trigger validation_step once
+        return DataLoader([0], batch_size=1)
+
+    def validation_step(self, batch, batch_idx):
+        """Evaluate against various opponents at epoch end"""        
+        use_mcts = self.hparams.get('eval_use_mcts', True)
+        mcts_sims = self.hparams.get('selfplay_eval_mcts_simulations', 100)
+        mcts_parallel = self.hparams.get('selfplay_parallel_simulations', 100)
+        
+        # Evaluate vs random
+        win_rate, draw_rate, _ = self.evaluate(
+            opponent='random',
+            n_games=self.hparams.eval_games_vs_random,
+            use_mcts=use_mcts,
+            mcts_simulations=mcts_sims,
+            mcts_parallel_simulations=mcts_parallel,
+        )
+        self.log('eval/win_rate_vs_random', win_rate)
+        self.log('eval/draw_rate_vs_random', draw_rate)
+        
+        # Evaluate vs previous
+        if self.hparams.enable_selfplay and self.previous_model is not None:
+            win_rate, draw_rate, _ = self.evaluate(
+                opponent='previous',
+                n_games=50,
+                use_mcts=use_mcts,
+                mcts_simulations=mcts_sims,
+                mcts_parallel_simulations=mcts_parallel,
+            )
+            self.log('eval/win_rate_vs_previous', win_rate)
+        
+        # Evaluate vs minimax
+        win_rate, draw_rate, _ = self.evaluate(
+            opponent='minimax',
+            n_games=self.hparams.eval_games_vs_minimax,
+            use_mcts=use_mcts,
+            mcts_simulations=mcts_sims,
+            mcts_parallel_simulations=mcts_parallel,
+            minimax_depth=self.hparams.eval_minimax_depth,
+            minimax_temperature=self.hparams.eval_minimax_temperature,
+        )
+        self.log('eval/win_rate_vs_minimax', win_rate)
+        self.log('eval/draw_rate_vs_minimax', draw_rate)
+    
     def on_train_epoch_end(self):
-        """Evaluate against various opponents at epoch end"""
+        """Only handle non-evaluation tasks here"""
         epoch = self.trainer.current_epoch if hasattr(self, 'trainer') else 0
         
-        if epoch % self.hparams.eval_interval == 0:
-            use_mcts = self.hparams.get('eval_use_mcts', True)
-            mcts_sims = self.hparams.get('selfplay_eval_mcts_simulations', 100)
-            mcts_parallel = self.hparams.get('selfplay_parallel_simulations', 100)
-            
-            # Evaluate vs random
-            win_rate, draw_rate, _ = self.evaluate(
-                opponent='random',
-                n_games=self.hparams.eval_games_vs_random,
-                use_mcts=use_mcts,
-                mcts_simulations=mcts_sims,
-                mcts_parallel_simulations=mcts_parallel,
-            )
-            self.log('eval/win_rate_vs_random', win_rate)
-            self.log('eval/draw_rate_vs_random', draw_rate)
-            
-            # Evaluate vs previous
-            if self.hparams.enable_selfplay and self.previous_model is not None:
-                win_rate, draw_rate, _ = self.evaluate(
-                    opponent='previous',
-                    n_games=50,
-                    use_mcts=use_mcts,
-                    mcts_simulations=mcts_sims,
-                    mcts_parallel_simulations=mcts_parallel,
-                )
-                self.log('eval/win_rate_vs_previous', win_rate)
-            
-            # Evaluate vs minimax
-            win_rate, draw_rate, _ = self.evaluate(
-                opponent='minimax',
-                n_games=self.hparams.eval_games_vs_minimax,
-                use_mcts=use_mcts,
-                mcts_simulations=mcts_sims,
-                mcts_parallel_simulations=mcts_parallel,
-                minimax_depth=self.hparams.eval_minimax_depth,
-                minimax_temperature=self.hparams.eval_minimax_temperature,
-            )
-            self.log('eval/win_rate_vs_minimax', win_rate)
-            self.log('eval/draw_rate_vs_minimax', draw_rate)
-        
-        # Update previous model checkpoint
+        # Update previous model checkpoint (for self-play opponent)
         if self.hparams.enable_selfplay and epoch > 0:
             if epoch % self.hparams.get('selfplay_update_interval', 10) == 0:
                 self.previous_model = pickle.loads(pickle.dumps(self.state_dict()))
+        
+        self.epoch_idx += 1
     
     def _log_selfplay_metrics(self, visit_distributions, mcts_values, game_outcomes):
         """Log MCTS and value metrics to wandb"""
@@ -650,6 +635,9 @@ class C4BaseModule(LightningModule):
         """Load games from file - matching interface"""
         log.info(f"Loading games from {input_file}...")
         
+        if not os.path.exists(input_file):
+            raise FileNotFoundError(f"Games file not found: {input_file}")
+        
         with open(input_file, 'rb') as f:
             data = pickle.load(f)
         
@@ -673,7 +661,7 @@ class C4BaseModule(LightningModule):
                 'current_player': current_player
             })
         
-        print(f"Loaded {len(positions)} positions from {data['num_games']} games")
+        print(f"Loaded {len(positions)} positions from {data['num_games']} games in file {input_file}")
         print(f"Replay buffer now contains {len(self.replay_buffer)} positions")
     
     def _canonicalize_board(self, boards: torch.Tensor, current_player: torch.Tensor) -> torch.Tensor:
@@ -765,15 +753,22 @@ class C4BaseModule(LightningModule):
         
         # === Create or reuse dataset (unified for both modes) ===
         if not hasattr(self, '_train_dataset') or self._train_dataset is None:
-            self._train_dataset = CarryAwareDataset(
+            self._train_dataset = SimpleReplayDataset(
                 module=self,
                 batch_size=self.hparams.batch_size,
                 steps_per_epoch=self.hparams.steps_per_epoch
             )
         
+        prefetch_factor = 8 if self.hparams.num_workers > 0 else None
+        log.info(f"Train dataset with {len(self._train_dataset)} steps per epoch created. Prefetching with {self.hparams.num_workers} workers and factor {prefetch_factor}")
         return DataLoader(
             self._train_dataset, 
             batch_size=None, 
-            num_workers=0, 
+            num_workers=self.hparams.num_workers,
+            prefetch_factor=prefetch_factor, 
             shuffle=False
         )
+    
+    def on_train_epoch_start(self):
+        """Setup for training"""
+        pass

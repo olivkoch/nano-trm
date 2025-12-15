@@ -14,28 +14,28 @@ seed: 42
 
 # Training configuration
 timekeeping:
-  max_epochs: 1200
+  max_epochs: 500
   batch_size: 512
-  num_workers: 0
+  num_workers: 1
   steps_per_epoch: 100
 
 model_tuning:
-  learning_rate: 3e-3
-  learning_rate_emb: 3e-2
+  learning_rate: 1e-4
+  learning_rate_emb: 1e-2
   weight_decay: 1.0
-  warmup_steps: 10000
-  lr_min_ratio: 1.0
+  warmup_steps: 200
+  lr_min_ratio: 0.1
   num_heads: 8
   halt_exploration_prob: 0.1
-  N_supervision: 4
-  N_supervision_val: 4
+  N_supervision: 6
+  N_supervision_val: 6
   H_cycles: 2
-  L_cycles: 3
-  num_layers: 2
-  puzzle_emb_dim: 0
-  puzzle_emb_len: 0
+  L_cycles: 1
+  num_layers: 1
+  puzzle_emb_dim: 512
+  puzzle_emb_len: 1
   hidden_size: 512
-  ffn_expansion: 2
+  ffn_expansion: 4
   rope_theta: 10000
   seq_len: 42
   vocab_size: 3
@@ -51,7 +51,7 @@ model_tuning:
   selfplay_update_interval: 10  # Update "previous model" every N epochs
   selfplay_bootstrap_weight: 0.3  # 0 = pure outcome, 1 = pure MCTS value
   selfplay_temporal_decay: 0.95   # Decay bootstrap for later
-  curriculum_data_path: "data/c4/minimax_games_2.pkl"
+  curriculum_data_path: "data/c4/minimax_games_3.pkl"
           
   # Evaluation parameters
   eval_minimax_depth: 2
@@ -59,11 +59,10 @@ model_tuning:
   eval_games_vs_minimax: 64
   eval_games_vs_random: 100
   eval_use_mcts: true
-  eval_interval: 5
   
 trainer:
   accumulate_grad_batches: 1
-  check_val_every_n_epoch: 1
+  check_val_every_n_epoch: 5
   log_every_n_steps: 10
   num_sanity_val_steps: 0
 
@@ -80,3 +79,8 @@ logger:
 callbacks:
   model_checkpoint:
     monitor: "val/policy_accuracy"
+  ema:
+    _target_: src.nn.callbacks.ema.EMACallback
+    decay: 0.999
+    use_ema_for_validation: true
+    use_ema_for_test: true

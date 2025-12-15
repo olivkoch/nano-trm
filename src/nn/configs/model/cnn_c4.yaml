@@ -9,12 +9,10 @@ learning_rate: ${model_tuning.learning_rate}
 weight_decay: ${model_tuning.weight_decay}
 warmup_steps: ${model_tuning.warmup_steps}
 lr_min_ratio: ${model_tuning.lr_min_ratio}
-eval_minimax_depth: ${model_tuning.eval_minimax_depth}
-eval_minimax_temperature: ${model_tuning.eval_minimax_temperature}
-eval_games_vs_minimax: ${model_tuning.eval_games_vs_minimax}
 dropout: ${model_tuning.dropout}
-use_residual: ${model_tuning.use_residual}  # For CNN - use residual blocks
-# Self-play settings
+use_residual: ${model_tuning.use_residual}  # For CNN - use residual
+
+#self-play settings
 enable_selfplay: ${model_tuning.enable_selfplay}
 selfplay_buffer_size: ${model_tuning.selfplay_buffer_size}
 selfplay_games_per_iteration: ${model_tuning.selfplay_games_per_iteration}
@@ -22,11 +20,19 @@ selfplay_mcts_simulations: ${model_tuning.selfplay_mcts_simulations}
 selfplay_eval_mcts_simulations: ${model_tuning.selfplay_eval_mcts_simulations}
 selfplay_parallel_simulations: ${model_tuning.selfplay_parallel_simulations}
 selfplay_temperature_moves: ${model_tuning.selfplay_temperature_moves}
-selfplay_update_interval: ${model_tuning.selfplay_update_interval} 
+selfplay_update_interval: ${model_tuning.selfplay_update_interval}  # Update "previous model" every N epochs
 selfplay_bootstrap_weight: ${model_tuning.selfplay_bootstrap_weight}
 selfplay_temporal_decay: ${model_tuning.selfplay_temporal_decay}
 eval_use_mcts: ${model_tuning.eval_use_mcts}
+curriculum_data_path: ${model_tuning.curriculum_data_path}
+        
+# Evaluation parameters
+eval_minimax_depth: ${model_tuning.eval_minimax_depth}
+eval_minimax_temperature: ${model_tuning.eval_minimax_temperature}
+eval_games_vs_minimax: ${model_tuning.eval_games_vs_minimax}
+eval_games_vs_random: ${model_tuning.eval_games_vs_random}
 
 batch_size: ${timekeeping.batch_size}
 max_epochs: ${timekeeping.max_epochs}
 steps_per_epoch: ${timekeeping.steps_per_epoch}
+num_workers: ${timekeeping.num_workers}

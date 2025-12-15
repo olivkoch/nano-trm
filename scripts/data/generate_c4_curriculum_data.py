@@ -45,6 +45,8 @@ def collect_self_play_games_minimax_parallel(
     device: torch.device = torch.device("cpu"),
     n_workers: int = None,
     n_parallel: int = 64,
+    discount_factor: float = 0.97,
+    winners_only: bool = False,
 ):
     """
     Collect self-play games using Minimax players with different temperatures.
@@ -71,6 +73,7 @@ def collect_self_play_games_minimax_parallel(
     games_played = 0
     n_positions_added = 0
     trajectories_lengths = []
+    value_stats = []  # Track value distribution
     
     n_batches = max(1, (n_games + n_parallel - 1) // n_parallel)
     
@@ -157,25 +160,33 @@ def collect_self_play_games_minimax_parallel(
                     continue
                 
                 winner = states.winners[i].item()
+                game_length = len(trajectories[i])
                 
-                for position in trajectories[i]:
+                for move_idx, position in enumerate(trajectories[i]):
+                    moves_from_end = game_length - move_idx
+
                     # Assign value from current player's perspective
                     if winner == 0:
-                        value = 0.0  # Draw
+                        outcome = 0.0  # Draw
                     elif winner == position['current_player']:
-                        value = 1.0  # Win
+                        outcome = 1.0  # Win
                     else:
-                        value = -1.0  # Loss
+                        outcome = -1.0  # Loss
                     
-                    # Only add winning positions (as in original code)
-                    if value > 0:
-                        replay_buffer.append({
-                            'board': position['board'],
-                            'policy': position['policy'],
-                            'value': value,
-                            'current_player': position['current_player']
-                        })
-                        n_positions_added += 1
+                    discounted_value = outcome * (discount_factor ** moves_from_end)
+
+                    if winners_only and outcome <= 0:
+                        continue
+
+                    value_stats.append(discounted_value)
+
+                    replay_buffer.append({
+                        'board': position['board'],
+                        'policy': position['policy'],
+                        'value': discounted_value,
+                        'current_player': position['current_player']
+                    })
+                    n_positions_added += 1
             
             games_played += games_this_batch
     
@@ -185,12 +196,21 @@ def collect_self_play_games_minimax_parallel(
         win_rates = [w / total_games for w in win_counts]
     else:
         win_rates = [0.0, 0.0, 0.0]
-    
+        
     print(f"\nCollected {n_positions_added} positions from {games_played} games")
     print(f"  Win rates: P1={win_rates[1]*100:.1f}%, P2={win_rates[2]*100:.1f}%, Draw={win_rates[0]*100:.1f}%")
     if trajectories_lengths:
         print(f"  Average game length: {np.mean(trajectories_lengths):.1f} moves")
     
+    # Value distribution stats
+    if value_stats:
+        value_arr = np.array(value_stats)
+        print(f"  Value distribution:")
+        print(f"    min={value_arr.min():.3f}, max={value_arr.max():.3f}")
+        print(f"    mean={value_arr.mean():.3f}, std={value_arr.std():.3f}")
+        print(f"    unique values: {len(np.unique(value_arr.round(4)))}")
+
+
     return replay_buffer, games_played
 
 
@@ -201,8 +221,10 @@ def collect_self_play_games_minimax_parallel(
 @click.option('--temp_player2', type=float, default=0.2, help='Temperature for player 2 (O)')
 @click.option('--n_workers', type=int, default=None, help='Number of worker processes (default: CPU count)')
 @click.option('--n_parallel', type=int, default=64, help='Number of parallel games per batch')
+@click.option('--discount', type=float, default=0.97, help='Discount factor for value targets')
+@click.option('--winners_only', is_flag=True, default=True, help='Only include positions from winning side')
 @click.option('--to_file', type=str, default=None, help='Output file to save collected positions (.pkl)')
-def main(n_games, depth, temp_player1, temp_player2, n_workers, n_parallel, to_file):
+def main(n_games, depth, temp_player1, temp_player2, n_workers, n_parallel, discount, winners_only, to_file):
     """Collect Connect Four training data using parallelized Minimax self-play."""
     import time
     
@@ -218,6 +240,8 @@ def main(n_games, depth, temp_player1, temp_player2, n_workers, n_parallel, to_f
         device=device,
         n_workers=n_workers,
         n_parallel=n_parallel,
+        discount_factor=discount,
+        winners_only=winners_only
     )
     
     elapsed = time.time() - start_time

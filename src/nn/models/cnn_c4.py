@@ -67,6 +67,7 @@ class C4CNNModule(C4BaseModule):
         steps_per_epoch: int = 1000,
         batch_size: int = 256,
         max_epochs: int = 300,
+        num_workers: int = 1,
         
         # Self-play parameters (set enable_selfplay=True to activate)
         enable_selfplay: bool = False,
@@ -86,7 +87,6 @@ class C4CNNModule(C4BaseModule):
         eval_minimax_temperature: float = 0.5,
         eval_games_vs_minimax: int = 100,
         eval_games_vs_random: int = 100,
-        eval_interval: int = 5,
         eval_use_mcts: bool = True,
 
         output_dir: str = None,
@@ -103,6 +103,8 @@ class C4CNNModule(C4BaseModule):
             steps_per_epoch=steps_per_epoch,
             batch_size=batch_size,
             max_epochs=max_epochs,
+            num_workers=num_workers,
+            curriculum_data_path=curriculum_data_path,
             enable_selfplay=enable_selfplay,
             selfplay_buffer_size=selfplay_buffer_size,
             selfplay_games_per_iteration=selfplay_games_per_iteration,
@@ -117,7 +119,6 @@ class C4CNNModule(C4BaseModule):
             eval_minimax_temperature=eval_minimax_temperature,
             eval_games_vs_minimax=eval_games_vs_minimax,
             eval_games_vs_random=eval_games_vs_random,
-            eval_interval=eval_interval,
             eval_use_mcts=eval_use_mcts,
             output_dir=output_dir,
             model_type=model_type,
@@ -388,7 +389,44 @@ class C4CNNModule(C4BaseModule):
             weight_decay=self.hparams.weight_decay,
             betas=(0.9, 0.95)
         )
-
+    
+    def test_overfit_small_batch(self):
+        """Test if model can overfit a single batch - sanity check"""
+        samples = self.replay_buffer.sample(32)
+        batch = {
+            'boards': torch.stack([s['board'] for s in samples]).to(self.device),
+            'current_player': torch.tensor([s['current_player'] for s in samples]).to(self.device),
+            'policies': torch.stack([s['policy'] for s in samples]).to(self.device),
+            'values': torch.tensor([s['value'] for s in samples], dtype=torch.float32).to(self.device),
+            'puzzle_identifiers': torch.zeros(32, dtype=torch.long, device=self.device),
+        }
+        
+        opt = torch.optim.Adam(self.parameters(), lr=1e-3)
+        
+        print("Overfitting single batch...")
+        for i in range(200):
+            loss, metrics = self.compute_loss_and_metrics(batch)
+            loss.backward()
+            opt.step()
+            opt.zero_grad()
+            
+            if i % 50 == 0:
+                print(f"Step {i}: loss={loss.item():.4f}, policy_acc={metrics['policy_accuracy']:.2%}")
+        
+        # Should reach >95% accuracy on this tiny batch
+        if metrics['policy_accuracy'] < 0.9:
+            print("WARNING: Failed to overfit batch - architecture issue?")
+        else:
+            print("SUCCESS: Model can overfit batch")
+            return True            
+        return False
+    
+    def on_train_epoch_start(self):
+        ans = super().on_train_epoch_start()
+        if self.epoch_idx == 0:
+            if not self.test_overfit_small_batch():
+                raise RuntimeError("Model failed to overfit small batch - check architecture!")
+        return ans
 
 def test_baseline():
     """Test the baseline model"""

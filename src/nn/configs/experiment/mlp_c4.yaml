@@ -31,7 +31,7 @@ model_tuning:
   dropout: 0.1
   use_residual: False  # For CNN - use residual blocks
   # Self-play settings
-  enable_selfplay: true
+  enable_selfplay: false
   selfplay_buffer_size: 50000
   selfplay_games_per_iteration: 64
   selfplay_mcts_simulations: 800
@@ -48,6 +48,8 @@ model_tuning:
   eval_games_vs_random: 100
   eval_use_mcts: true
   eval_interval: 5
+  curriculum_data_path: "data/c4/minimax_games_2.pkl"
+
   
 trainer:
   accumulate_grad_batches: 1

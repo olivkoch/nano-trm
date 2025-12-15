@@ -22,6 +22,7 @@ lr_min_ratio: ${model_tuning.lr_min_ratio}
 steps_per_epoch: ${timekeeping.steps_per_epoch}
 batch_size: ${timekeeping.batch_size}
 max_epochs: ${timekeeping.max_epochs}
+num_workers: ${timekeeping.num_workers}
 
 seq_len: ${model_tuning.seq_len}
 vocab_size: ${model_tuning.vocab_size}
@@ -45,7 +46,6 @@ eval_minimax_depth: ${model_tuning.eval_minimax_depth}
 eval_minimax_temperature: ${model_tuning.eval_minimax_temperature}
 eval_games_vs_minimax: ${model_tuning.eval_games_vs_minimax}
 eval_games_vs_random: ${model_tuning.eval_games_vs_random}
-eval_interval: ${model_tuning.eval_interval}
 
 # Output directory
 output_dir: None

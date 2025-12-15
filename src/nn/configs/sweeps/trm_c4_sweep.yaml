@@ -1,0 +1,26 @@
+name: trm-c4-sweep
+method: bayes
+metric:
+  name: train/policy_accuracy
+  goal: maximize
+
+parameters:
+  model_tuning.N_supervision:
+    values: [1, 4, 8]
+  model_tuning.H_cycles:
+    values: [1, 2, 3]
+  model_tuning.L_cycles:
+    values: [1, 2, 3]
+  model_tuning.hidden_size:
+    values: [64, 256, 512]
+  model_tuning.num_layers:
+    values: [1, 2, 3]
+  model_tuning.learning_rate:
+    distribution: log_uniform_values
+    min: 1e-5
+    max: 1e-3
+
+early_terminate:
+  type: hyperband
+  min_iter: 100
+  eta: 3

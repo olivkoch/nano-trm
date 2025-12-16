@@ -169,10 +169,12 @@ class CircularBuffer:
         return self.buffer[idx]
     
     def sample(self, n: int, replace: bool = False) -> list:
-        """Sample n items efficiently"""
+        """ Sample n items efficiently
+            Important: use torch randint, not numpy randint in case we're using multiple workers
+        """
         if replace or n > len(self.buffer):
-            indices = np.random.randint(0, len(self.buffer), size=n)
+            indices = torch.randint(0, len(self.buffer), (n,)).tolist()
         else:
-            indices = np.random.choice(len(self.buffer), n, replace=False)
+            indices = torch.randperm(len(self.buffer))[:n].tolist()
         return [self.buffer[i] for i in indices]
     

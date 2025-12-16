@@ -17,6 +17,7 @@ warmup_steps: ${model_tuning.warmup_steps}
 puzzle_emb_dim: ${model_tuning.puzzle_emb_dim}
 puzzle_emb_len: ${model_tuning.puzzle_emb_len}
 rope_theta: ${model_tuning.rope_theta}
+use_mlp_t: ${model_tuning.use_mlp_t}
 lr_min_ratio: ${model_tuning.lr_min_ratio}
 
 steps_per_epoch: ${timekeeping.steps_per_epoch}

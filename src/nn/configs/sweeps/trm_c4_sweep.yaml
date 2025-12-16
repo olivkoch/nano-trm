@@ -1,7 +1,7 @@
 name: trm-c4-sweep
 method: bayes
 metric:
-  name: train/policy_accuracy
+  name: eval/win_rate_vs_minimax
   goal: maximize
 
 parameters:

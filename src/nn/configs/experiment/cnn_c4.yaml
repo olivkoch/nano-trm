@@ -14,13 +14,13 @@ seed: 42
 
 # Training configuration
 timekeeping:
-  max_epochs: 1200
+  max_epochs: 500
   batch_size: 512
   num_workers: 0
   steps_per_epoch: 100
 
 model_tuning:
-  model_type:  "mlp"  # "cnn" or "mlp"
+  model_type:  "cnn"  # "cnn" or "mlp"
   hidden_size:  512
   num_layers:  4  # For MLP or number of residual blocks for CNN
   cnn_channels: 128  # Number of channels for CNN
@@ -53,7 +53,7 @@ model_tuning:
 
 trainer:
   accumulate_grad_batches: 1
-  check_val_every_n_epoch: 1
+  check_val_every_n_epoch: 5
   log_every_n_steps: 10
   num_sanity_val_steps: 0
 
@@ -69,4 +69,4 @@ logger:
 
 callbacks:
   model_checkpoint:
-    monitor: "val/policy_accuracy"
+    monitor: "train/policy_accuracy"

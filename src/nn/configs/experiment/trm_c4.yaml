@@ -16,29 +16,31 @@ seed: 42
 timekeeping:
   max_epochs: 500
   batch_size: 512
-  num_workers: 1
+  num_workers: 0
   steps_per_epoch: 100
 
 model_tuning:
-  learning_rate: 1e-5
+  
+  learning_rate: 1e-4
   learning_rate_emb: 1e-2
-  weight_decay: 1.0
-  warmup_steps: 200
-  lr_min_ratio: 0.1
+  weight_decay: 0.1
+  warmup_steps:  10000
+  lr_min_ratio:  0.1
   num_heads: 8
   halt_exploration_prob: 0.1
-  N_supervision: 6
-  N_supervision_val: 6
-  H_cycles: 3
-  L_cycles: 3
+  N_supervision: 3
+  N_supervision_val: 3
+  H_cycles: 2
+  L_cycles: 2
   num_layers: 2
-  puzzle_emb_dim: 512
-  puzzle_emb_len: 1
+  puzzle_emb_dim: 64
+  puzzle_emb_len: 4
   hidden_size: 512
   ffn_expansion: 4
   rope_theta: 10000
   seq_len: 42
   vocab_size: 3
+  use_mlp_t: true
 
   #self-play settings
   enable_selfplay: false
@@ -78,9 +80,9 @@ logger:
 
 callbacks:
   model_checkpoint:
-    monitor: "val/policy_accuracy"
-  ema:
-    _target_: src.nn.callbacks.ema.EMACallback
-    decay: 0.999
-    use_ema_for_validation: true
-    use_ema_for_test: true
+    monitor: "train/policy_accuracy"
+  # ema:
+  #   _target_: src.nn.callbacks.ema.EMACallback
+  #   decay: 0.999
+  #   use_ema_for_validation: true
+  #   use_ema_for_test: true

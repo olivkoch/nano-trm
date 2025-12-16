@@ -337,9 +337,9 @@ class C4BaseModule(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         """Evaluate against various opponents at epoch end"""        
-        use_mcts = self.hparams.get('eval_use_mcts', True)
-        mcts_sims = self.hparams.get('selfplay_eval_mcts_simulations', 100)
-        mcts_parallel = self.hparams.get('selfplay_parallel_simulations', 100)
+        use_mcts = self.hparams.eval_use_mcts
+        mcts_sims = self.hparams.selfplay_eval_mcts_simulations
+        mcts_parallel = self.hparams.selfplay_parallel_simulations
         
         # Evaluate vs random
         win_rate, draw_rate, _ = self.evaluate(
@@ -350,7 +350,6 @@ class C4BaseModule(LightningModule):
             mcts_parallel_simulations=mcts_parallel,
         )
         self.log('eval/win_rate_vs_random', win_rate)
-        self.log('eval/draw_rate_vs_random', draw_rate)
         
         # Evaluate vs previous
         if self.hparams.enable_selfplay and self.previous_model is not None:
@@ -374,7 +373,6 @@ class C4BaseModule(LightningModule):
             minimax_temperature=self.hparams.eval_minimax_temperature,
         )
         self.log('eval/win_rate_vs_minimax', win_rate)
-        self.log('eval/draw_rate_vs_minimax', draw_rate)
     
     def on_train_epoch_end(self):
         """Only handle non-evaluation tasks here"""
@@ -448,7 +446,7 @@ class C4BaseModule(LightningModule):
             (win_rate, draw_rate, loss_rate)
         """
         self.eval()
-        
+
         # Setup opponent
         prev_model = None
         prev_mcts = None
@@ -790,11 +788,14 @@ class C4BaseModule(LightningModule):
         
         prefetch_factor = 8 if self.hparams.num_workers > 0 else None
         log.info(f"Train dataset with {len(self._train_dataset)} steps per epoch created. Prefetching with {self.hparams.num_workers} workers and factor {prefetch_factor}")
+        # Important note: using num_workers > 0 and persistent_workers=False
+        # yields a major bug in the RNG seeding, causing identical data across epochs.
         return DataLoader(
             self._train_dataset, 
             batch_size=None, 
             num_workers=self.hparams.num_workers,
             prefetch_factor=prefetch_factor, 
+            persistent_workers=self.hparams.num_workers > 0, # important to avoid rng seed issues
             shuffle=False
         )
     

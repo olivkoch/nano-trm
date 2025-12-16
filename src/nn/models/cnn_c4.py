@@ -49,94 +49,27 @@ class C4CNNModule(C4BaseModule):
     """
     CNN baseline model for Connect Four - inherits self-play from base
     """
-    
-    def __init__(
-        self,
-        # Model architecture
-        model_type: str = "cnn",  # "cnn" or "mlp"
-        hidden_size: int = 512,
-        num_layers: int = 4,  # For MLP or number of residual blocks for CNN
-        cnn_channels: int = 128,  # Number of channels for CNN
-        dropout: float = 0.1,
-        use_residual: bool = False,  # For CNN - use residual blocks
-        # Training hyperparameters
-        learning_rate: float = 1e-3,
-        weight_decay: float = 0.01,
-        warmup_steps: int = 1000,
-        lr_min_ratio: float = 0.1,
-        steps_per_epoch: int = 1000,
-        batch_size: int = 256,
-        max_epochs: int = 300,
-        num_workers: int = 1,
-        
-        # Self-play parameters (set enable_selfplay=True to activate)
-        enable_selfplay: bool = False,
-        selfplay_buffer_size: int = 100000,
-        selfplay_games_per_iteration: int = 50,
-        selfplay_mcts_simulations: int = 30,
-        selfplay_eval_mcts_simulations: int = 100,
-        selfplay_parallel_simulations: int = 8, # for debugging, should be much higher on gpu
-        selfplay_temperature_moves: int = 15,
-        selfplay_update_interval: int = 10,  # Update "previous model" every N epochs
-        selfplay_bootstrap_weight: float = 0.3,  # 0 = pure outcome, 1 = pure MCTS value
-        selfplay_temporal_decay: float = 0.95,   # Decay bootstrap for later moves
-        curriculum_data_path: str = None,
+    CNN_DEFAULTS = dict(
+        model_type="cnn",
+        cnn_channels=128,
+        dropout=0.1,
+        use_residual=False,
+    )
 
-        # Evaluation parameters
-        eval_minimax_depth: int = 4,
-        eval_minimax_temperature: float = 0.5,
-        eval_games_vs_minimax: int = 100,
-        eval_games_vs_random: int = 100,
-        eval_use_mcts: bool = True,
-
-        output_dir: str = None,
-        **kwargs
-    ):
+    def __init__(self, **kwargs):
         # Initialize base class
-        super().__init__(
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            warmup_steps=warmup_steps,
-            lr_min_ratio=lr_min_ratio,
-            steps_per_epoch=steps_per_epoch,
-            batch_size=batch_size,
-            max_epochs=max_epochs,
-            num_workers=num_workers,
-            curriculum_data_path=curriculum_data_path,
-            enable_selfplay=enable_selfplay,
-            selfplay_buffer_size=selfplay_buffer_size,
-            selfplay_games_per_iteration=selfplay_games_per_iteration,
-            selfplay_mcts_simulations=selfplay_mcts_simulations,
-            selfplay_eval_mcts_simulations=selfplay_eval_mcts_simulations,
-            selfplay_parallel_simulations=selfplay_parallel_simulations,
-            selfplay_temperature_moves=selfplay_temperature_moves,
-            selfplay_update_interval=selfplay_update_interval,
-            selfplay_bootstrap_weight=selfplay_bootstrap_weight,
-            selfplay_temporal_decay=selfplay_temporal_decay,
-            eval_minimax_depth=eval_minimax_depth,
-            eval_minimax_temperature=eval_minimax_temperature,
-            eval_games_vs_minimax=eval_games_vs_minimax,
-            eval_games_vs_random=eval_games_vs_random,
-            eval_use_mcts=eval_use_mcts,
-            output_dir=output_dir,
-            model_type=model_type,
-            cnn_channels=cnn_channels,
-            dropout=dropout,
-            use_residual=use_residual,
-            **kwargs
-        )
+        merged = {**self.CNN_DEFAULTS, **kwargs}
+        super().__init__(**merged)
         
         # Build model based on type
-        if model_type == "cnn":
+        if self.hparams.model_type == "cnn":
             self._build_cnn()
-        elif model_type == "mlp":
+        elif self.hparams.model_type == "mlp":
             self._build_mlp()
         else:
-            raise ValueError(f"Unknown model_type: {model_type}")
+            raise ValueError(f"Unknown model_type: {self.hparams.model_type}")
         
-        print(f"Created {model_type.upper()} baseline with {self._count_parameters():.2f}M parameters")
+        print(f"Created {self.hparams.model_type.upper()} baseline with {self._count_parameters():.2f}M parameters")
         if self.hparams.enable_selfplay:
             print(f"Self-play enabled: {self.hparams.selfplay_games_per_iteration} games/iter, "
                   f"{self.hparams.selfplay_mcts_simulations} MCTS sims")

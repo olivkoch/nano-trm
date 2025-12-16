@@ -73,11 +73,40 @@ class C4BaseModule(LightningModule):
     """
     Base class for Connect Four models with shared self-play and evaluation functionality
     """
-    
+    DEFAULT_HPARAMS = dict(
+        hidden_size=512,
+        num_layers=2,
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        warmup_steps=2000,
+        lr_min_ratio=1.0,
+        steps_per_epoch=1000,
+        batch_size=256,
+        max_epochs=300,
+        num_workers=1,
+        enable_selfplay=False,
+        selfplay_buffer_size=100000,
+        selfplay_games_per_iteration=50,
+        selfplay_mcts_simulations=30,
+        selfplay_eval_mcts_simulations=100,
+        selfplay_parallel_simulations=8,
+        selfplay_temperature_moves=15,
+        selfplay_update_interval=10,
+        selfplay_bootstrap_weight=0.3,
+        selfplay_temporal_decay=0.95,
+        curriculum_data_path=None,
+        eval_minimax_depth=4,
+        eval_minimax_temperature=0.5,
+        eval_games_vs_minimax=100,
+        eval_games_vs_random=100,
+        eval_use_mcts=True,
+        output_dir=None,
+    )
+
     def __init__(self, **kwargs):
         super().__init__()
-        # Store all hyperparameters
-        self.save_hyperparameters()
+        merged = {**self.DEFAULT_HPARAMS, **kwargs}
+        self.save_hyperparameters(merged)
         
         # Common attributes
         self.board_rows = 6

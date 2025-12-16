@@ -57,144 +57,66 @@ class TRMC4Module(C4BaseModule):
     """
     HRM/TRM implementation - now inherits self-play from base
     """
-    
-    def __init__(
-        self,
-        hidden_size: int = 512,
-        num_layers: int = 2,
-        num_heads: int = 8,
-        max_grid_size: int = 30,
-        H_cycles: int = 3,
-        L_cycles: int = 6,
-        N_supervision: int = 16,
-        N_supervision_val: int = 16,
-        ffn_expansion: int = 2,
-        learning_rate: float = 1e-4,
-        learning_rate_emb: float = 1e-2,
-        weight_decay: float = 0.01,
-        warmup_steps: int = 2000,
-        halt_exploration_prob: float = 0.1,
-        puzzle_emb_dim: int = 512,
-        puzzle_emb_len: int = 16,
-        rope_theta: int = 10000,
-        lr_min_ratio: float = 1.0,
-        steps_per_epoch: int = 1000,
-        num_workers: int = 1,
-        vocab_size: int = 3,
-        num_puzzles: int = 1,
-        batch_size: int = 256,
-        max_epochs: int = 300,
-        pad_value: int = -1,
-        seq_len: int = 42,  # Connect Four board size
-        
-        # Self-play parameters (can enable these)
-        enable_selfplay: bool = False,
-        selfplay_buffer_size: int = 100000,
-        selfplay_games_per_iteration: int = 50,
-        selfplay_mcts_simulations: int = 30,
-        selfplay_eval_mcts_simulations: int = 100,
-        selfplay_parallel_simulations: int = 8, # for debugging, should be much higher on gpu
-        selfplay_temperature_moves: int = 15,
-        selfplay_update_interval: int = 10,
-        selfplay_bootstrap_weight: float = 0.3,  # 0 = pure outcome, 1 = pure MCTS value
-        selfplay_temporal_decay: float = 0.95,   # Decay bootstrap for later moves
-        curriculum_data_path: str = None,
-        
-        # Evaluation parameters
-        eval_minimax_depth: int = 4,
-        eval_minimax_temperature: float = 0.5,
-        eval_games_vs_minimax: int = 100,
-        eval_games_vs_random: int = 100,
-        eval_use_mcts: bool = True,
-        
-        output_dir: str = None,
-        **kwargs
-    ):
+    TRM_DEFAULTS = dict(
+        num_heads=8,
+        max_grid_size=30,
+        H_cycles=1,
+        L_cycles=1,
+        N_supervision=1,
+        N_supervision_val=1,
+        ffn_expansion=2,
+        learning_rate_emb=1e-2,
+        halt_exploration_prob=0.1,
+        puzzle_emb_dim=512,
+        puzzle_emb_len=16,
+        rope_theta=10000,
+        vocab_size=3,
+        num_puzzles=1,
+        pad_value=-1,
+        seq_len=42,
+    )
+
+    def __init__(self, **kwargs):
         # Initialize base class with all shared parameters
-        super().__init__(
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            learning_rate=learning_rate,
-            weight_decay=weight_decay,
-            warmup_steps=warmup_steps,
-            lr_min_ratio=lr_min_ratio,
-            steps_per_epoch=steps_per_epoch,
-            batch_size=batch_size,
-            max_epochs=max_epochs,
-            num_workers=num_workers,
-            enable_selfplay=enable_selfplay,
-            selfplay_buffer_size=selfplay_buffer_size,
-            selfplay_games_per_iteration=selfplay_games_per_iteration,
-            selfplay_mcts_simulations=selfplay_mcts_simulations,
-            selfplay_parallel_simulations=selfplay_parallel_simulations,
-            selfplay_temperature_moves=selfplay_temperature_moves,
-            selfplay_update_interval=selfplay_update_interval,
-            selfplay_bootstrap_weight=selfplay_bootstrap_weight,
-            selfplay_temporal_decay=selfplay_temporal_decay,
-            selfplay_eval_mcts_simulations=selfplay_eval_mcts_simulations,
-            curriculum_data_path=curriculum_data_path,
-            eval_minimax_depth=eval_minimax_depth,
-            eval_minimax_temperature=eval_minimax_temperature,
-            eval_games_vs_minimax=eval_games_vs_minimax,
-            eval_games_vs_random=eval_games_vs_random,
-            eval_use_mcts=eval_use_mcts,
-            output_dir=output_dir,
-            # TRM-specific parameters
-            num_heads=num_heads,
-            max_grid_size=max_grid_size,
-            H_cycles=H_cycles,
-            L_cycles=L_cycles,
-            N_supervision=N_supervision,
-            N_supervision_val=N_supervision_val,
-            ffn_expansion=ffn_expansion,
-            learning_rate_emb=learning_rate_emb,
-            halt_exploration_prob=halt_exploration_prob,
-            puzzle_emb_dim=puzzle_emb_dim,
-            puzzle_emb_len=puzzle_emb_len,
-            rope_theta=rope_theta,
-            vocab_size=vocab_size,
-            num_puzzles=num_puzzles,
-            pad_value=pad_value,
-            seq_len=seq_len,
-            **kwargs
-        )
+        merged = {**self.TRM_DEFAULTS, **kwargs}
+        super().__init__(**merged)
         
         self.forward_dtype = torch.float32
         
         # Token embeddings
-        self.embed_scale = math.sqrt(hidden_size)
+        self.embed_scale = math.sqrt(self.hparams.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
         
         self.input_embedding = CastedEmbedding(
-            vocab_size, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
+            self.hparams.vocab_size, self.hparams.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
         )
         
         # Positional embeddings with rotary embeddings
         self.pos_embedding = RotaryEmbedding(
-            dim=hidden_size // num_heads,
-            max_position_embeddings=seq_len + puzzle_emb_len,
-            base=rope_theta,
+            dim=self.hparams.hidden_size // self.hparams.num_heads,
+            max_position_embeddings=self.hparams.seq_len + self.hparams.puzzle_emb_len,
+            base=self.hparams.rope_theta,
         )
         
         # Single network (not two separate networks)
         reasoning_config = ReasoningBlockConfig(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            expansion=ffn_expansion,
+            hidden_size=self.hparams.hidden_size,
+            num_heads=self.hparams.num_heads,
+            expansion=self.hparams.ffn_expansion,
             rms_norm_eps=1e-5,
-            seq_len=seq_len,
+            seq_len=self.hparams.seq_len,
             mlp_t=False,
-            puzzle_emb_ndim=puzzle_emb_dim,
-            puzzle_emb_len=puzzle_emb_len,
+            puzzle_emb_ndim=self.hparams.puzzle_emb_dim,
+            puzzle_emb_len=self.hparams.puzzle_emb_len,
         )
         
         self.lenet = ReasoningModule(
-            layers=[ReasoningBlock(reasoning_config) for _ in range(num_layers)]
+            layers=[ReasoningBlock(reasoning_config) for _ in range(self.hparams.num_layers)]
         )
         
-        self.lm_head = CastedLinear(hidden_size, self.board_cols, bias=False)
-        self.value_head = CastedLinear(hidden_size, 1, bias=False)
-        self.q_head = CastedLinear(hidden_size, 1, bias=True) # only learn to stop, not to continue
+        self.lm_head = CastedLinear(self.hparams.hidden_size, self.board_cols, bias=False)
+        self.value_head = CastedLinear(self.hparams.hidden_size, 1, bias=False)
+        self.q_head = CastedLinear(self.hparams.hidden_size, 1, bias=True) # only learn to stop, not to continue
         
         # Halting head initialization
         with torch.no_grad():
@@ -206,25 +128,25 @@ class TRMC4Module(C4BaseModule):
         self.carry = None
         
         self.z_H_init = nn.Buffer(
-            trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1),
+            trunc_normal_init_(torch.empty(self.hparams.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
         )
         self.z_L_init = nn.Buffer(
-            trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1),
+            trunc_normal_init_(torch.empty(self.hparams.hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
         )
         
         # Add puzzle embeddings
-        if puzzle_emb_dim > 0:
+        if self.hparams.puzzle_emb_dim > 0:
             self.puzzle_emb = CastedSparseEmbedding(
-                num_embeddings=num_puzzles,
-                embedding_dim=puzzle_emb_dim,
-                batch_size=batch_size,
+                num_embeddings=self.hparams.num_puzzles,
+                embedding_dim=self.hparams.puzzle_emb_dim,
+                batch_size=self.hparams.batch_size,
                 init_std=0.0,  # Reference uses 0 init
                 cast_to=self.forward_dtype,
             )
-            self.puzzle_emb_len = puzzle_emb_len
-            log.info(f"Created puzzle_emb with num_puzzles={num_puzzles}, batch_size={batch_size}")
+            self.puzzle_emb_len = self.hparams.puzzle_emb_len
+            log.info(f"Created puzzle_emb with num_puzzles={self.hparams.num_puzzles}, batch_size={self.hparams.batch_size}")
         else:
             log.info("puzzle_emb_dim <= 0, not creating puzzle embeddings")
             self.puzzle_emb = None
@@ -232,7 +154,7 @@ class TRMC4Module(C4BaseModule):
         
         self.last_step_time = None
         
-        log.info(f"Learning rates: model={learning_rate}, emb={learning_rate_emb} max steps = {self.max_steps}")
+        log.info(f"Learning rates: model={self.hparams.learning_rate}, emb={self.hparams.learning_rate_emb} max steps = {self.max_steps}")
 
     def setup(self, stage: str):
 

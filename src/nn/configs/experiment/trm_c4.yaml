@@ -20,7 +20,7 @@ timekeeping:
   steps_per_epoch: 100
 
 model_tuning:
-  learning_rate: 1e-4
+  learning_rate: 1e-5
   learning_rate_emb: 1e-2
   weight_decay: 1.0
   warmup_steps: 200
@@ -29,9 +29,9 @@ model_tuning:
   halt_exploration_prob: 0.1
   N_supervision: 6
   N_supervision_val: 6
-  H_cycles: 2
-  L_cycles: 1
-  num_layers: 1
+  H_cycles: 3
+  L_cycles: 3
+  num_layers: 2
   puzzle_emb_dim: 512
   puzzle_emb_len: 1
   hidden_size: 512

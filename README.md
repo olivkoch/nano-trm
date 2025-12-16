@@ -8,7 +8,9 @@ Train a TRM in a few minutes on an A10. Reproduce the official TRM results. Push
 
 This project reproduces the results on Sudoku Extreme and Maze Hard (87% and 75% exact accuracy on validation, resp.)
 
+<p align="center">
 <img src="demo/sudoku_thinking_9_steps.gif" width="400" alt="Sudoku thinking">
+</p>
 
 # Installation
 

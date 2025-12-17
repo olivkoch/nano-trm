@@ -28,14 +28,14 @@ model_tuning:
   lr_min_ratio:  0.1
   num_heads: 8
   halt_exploration_prob: 0.1
-  N_supervision: 8
-  N_supervision_val: 8
+  N_supervision: 16
+  N_supervision_val: 16
   H_cycles: 3
-  L_cycles: 2
+  L_cycles: 3
   num_layers: 2
   puzzle_emb_dim: 64
   puzzle_emb_len: 4
-  hidden_size: 512
+  hidden_size: 64
   ffn_expansion: 4
   rope_theta: 10000
   seq_len: 42

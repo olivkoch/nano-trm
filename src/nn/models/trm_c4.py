@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from src.nn.models.c4_base import C4BaseModule
 from src.nn.utils.constants import C4_EMPTY_CELL
 from src.nn.modules.utils import compute_lr
-
+from src.nn.utils.trm_debug_viz import debug_viz_training_step
 
 try:
     from adam_atan2 import AdamATan2
@@ -169,6 +169,11 @@ class TRMC4Module(C4BaseModule):
             self.puzzle_emb_len = 0
         
         self.last_step_time = None
+
+        # Debug visualization settings
+        self.debug_viz_enabled = False  # Toggle visualization on/off
+        self.debug_viz_every_n_steps = 500  # Save every N steps
+        self.debug_viz_dir = "debug_viz"  # Output directory
         
     def setup(self, stage: str):
 
@@ -395,9 +400,26 @@ class TRMC4Module(C4BaseModule):
         new_carry, outputs = self.forward(carry, batch)
         
         labels = new_carry.current_data["outputs"]
-        
+        labels_canonical = self._canonicalize_board(labels, new_carry.current_data["current_player"])
+
+        # Debug visualization
+        if getattr(self, 'debug_viz_enabled', True) and hasattr(self, 'manual_step'):
+            viz_path = debug_viz_training_step(
+                batch=new_carry.current_data,
+                outputs=outputs,
+                labels=labels,
+                step=self.manual_step,
+                save_dir=getattr(self, 'debug_viz_dir', 'debug_viz'),
+                every_n_steps=getattr(self, 'debug_viz_every_n_steps', 500),
+                sample_idx=10,  # Which sample in batch to visualize
+                current_player=new_carry.current_data.get("current_player"),
+            )
+            if viz_path:
+                log.info(f"Saved debug viz: {viz_path}")
+
         # if self.manual_step % 500 == 0:
         #     self._print_debug_samples(batch, n_samples=3)
+        labels = labels_canonical
 
         # Get legal moves for each position
         boards = new_carry.current_data["boards"]
@@ -418,10 +440,7 @@ class TRMC4Module(C4BaseModule):
             pred_actions = outputs["policy"].argmax(dim=-1)
             target_actions = target_policy.argmax(dim=-1)
             policy_accuracy = (pred_actions == target_actions).float()
-            
-            # value_certainty = outputs["value"].abs()  # How sure we are about position
-            # should_halt = value_certainty > 0.95  # Halt when very certain about outcome
-            
+
             # Metrics (halted)
             valid_metrics = new_carry.halted
             
@@ -441,8 +460,7 @@ class TRMC4Module(C4BaseModule):
         lm_loss = (
             stablemax_cross_entropy(
                 outputs["logits"], labels, ignore_index=-100
-            )
-            / label_counts
+            ) / label_counts
         ).sum()
 
         target_values = new_carry.current_data["values"]  # From dataloader
@@ -545,7 +563,7 @@ class TRMC4Module(C4BaseModule):
                 )
             else:
                 lr_this_step = base_lr
-            
+
             # Update learning rate
             if hasattr(opt, "_optimizer"):
                 for param_group in opt._optimizer.param_groups:
@@ -560,7 +578,7 @@ class TRMC4Module(C4BaseModule):
             
             # Log learning rate
             self.log(f"train/lr_{i}", lr_this_step, on_step=True)
-        
+
         # Log metrics
         if metrics["count"] > 0:
             self.log("train/accuracy", metrics["accuracy"], prog_bar=True, on_step=True)

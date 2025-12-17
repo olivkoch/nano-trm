@@ -12,7 +12,7 @@ parameters:
   model_tuning.L_cycles:
     values: [1, 2, 3]
   model_tuning.hidden_size:
-    values: [64, 256, 512]
+    values: [32, 128, 256]
   model_tuning.num_layers:
     values: [1, 2, 3]
   model_tuning.weight_decay:

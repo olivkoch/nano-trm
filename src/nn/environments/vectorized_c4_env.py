@@ -227,3 +227,7 @@ class VectorizedConnectFour:
             result += f"Current player: {self.current_players[env_id].item()}\n"
         
         return result
+    
+    def initialize(self, flat_boards: torch.Tensor, current_players: torch.Tensor):
+        self.current_players = current_players
+        self.boards = flat_boards.reshape(self.n_envs, self.rows, self.cols)

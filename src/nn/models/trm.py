@@ -412,7 +412,7 @@ class TRMModule(LightningModule):
                 "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
 
-        # Compute losses - IMPORTANT: These are per-sequence losses that will be summed
+        # Compute losses: These are per-sequence losses that will be summed
         lm_loss = (
             stablemax_cross_entropy(
                 outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask

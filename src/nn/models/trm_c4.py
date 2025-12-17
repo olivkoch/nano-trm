@@ -117,19 +117,21 @@ class TRMC4Module(C4BaseModule):
             layers=[ReasoningBlock(reasoning_config) for _ in range(self.hparams.num_layers)]
         )
         
-        self.policy_value_cnn = nn.Sequential(
-            nn.Conv2d(self.hparams.hidden_size, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-        self.policy_conv = nn.Conv2d(32, 1, kernel_size=1)  # [B, 1, 6, 7] -> pool rows -> [B, 7]
-        self.value_fc = nn.Linear(32 * 6 * 7, 1)
+        # self.policy_value_cnn = nn.Sequential(
+        #     nn.Conv2d(self.hparams.hidden_size, 128, kernel_size=3, padding=1),
+        #     nn.ReLU(),
+        #     nn.Conv2d(128, 64, kernel_size=3, padding=1),
+        #     nn.ReLU(),
+        #     nn.Conv2d(64, 32, kernel_size=3, padding=1),
+        #     nn.ReLU(),
+        # )
+        # self.policy_conv = nn.Conv2d(32, 1, kernel_size=1)  # [B, 1, 6, 7] -> pool rows -> [B, 7]
+        # self.value_fc = nn.Linear(32 * 6 * 7, 1)
 
         # self.lm_head = CastedLinear(self.hparams.hidden_size, self.board_cols, bias=False)
-        # self.value_head = CastedLinear(self.hparams.hidden_size, 1, bias=False)
+        self.lm_head = CastedLinear(self.hparams.hidden_size, self.hparams.vocab_size, bias=False)
+        self.value_head = CastedLinear(self.hparams.hidden_size, 1, bias=False)
+        self.policy_head = CastedLinear(self.hparams.hidden_size, self.board_cols, bias=False)
         self.q_head = CastedLinear(self.hparams.hidden_size, 1, bias=True) # only learn to stop, not to continue
         
         # Halting head initialization
@@ -283,22 +285,24 @@ class TRMC4Module(C4BaseModule):
 
         # policy_logits = self.lm_head(global_repr)
         # value = torch.tanh(self.value_head(global_repr))
-        board_repr = z_H[:, self.puzzle_emb_len:]  # [B, 42, hidden]
-        B = board_repr.shape[0]
+        # board_repr = z_H[:, self.puzzle_emb_len:]  # [B, 42, hidden]
+        # B = board_repr.shape[0]
         
-        # Reshape to 2D spatial format
-        x = board_repr.view(B, 6, 7, -1).permute(0, 3, 1, 2)  # [B, hidden, 6, 7]
-        x = self.policy_value_cnn(x)  # [B, 32, 6, 7]
+        # # Reshape to 2D spatial format
+        # x = board_repr.view(B, 6, 7, -1).permute(0, 3, 1, 2)  # [B, hidden, 6, 7]
+        # x = self.policy_value_cnn(x)  # [B, 32, 6, 7]
         
-        # Policy: column-wise (pool over rows)
-        policy_logits = self.policy_conv(x).mean(dim=2).squeeze(1)  # [B, 7]
+        # # Policy: column-wise (pool over rows)
+        # policy_logits = self.policy_conv(x).mean(dim=2).squeeze(1)  # [B, 7]
         
-        # Value: global
-        value = torch.tanh(self.value_fc(x.flatten(1)))  # [B, 1]
-
+        # # Value: global
+        # value = torch.tanh(self.value_fc(x.flatten(1)))  # [B, 1]
+        logits = self.lm_head(z_H)[:, self.puzzle_emb_len :]
+        policy_logits = self.policy_head(z_H[:, 0])
+        value = torch.tanh(self.value_head(z_H[:, 0]))
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
     
-        return new_carry, policy_logits, value, q_logits[..., 0]
+        return new_carry, logits, policy_logits, value, q_logits[..., 0]
 
     def forward(
         self, carry: TRMCarry, batch: Dict[str, torch.Tensor]
@@ -315,7 +319,7 @@ class TRMC4Module(C4BaseModule):
         }
         
         # Forward inner model
-        new_inner_carry, policy_logits, value, q_halt_logits = self.inner_forward(
+        new_inner_carry, logits, policy_logits, value, q_halt_logits = self.inner_forward(
             new_inner_carry, new_current_data
         )
 
@@ -328,6 +332,7 @@ class TRMC4Module(C4BaseModule):
         policy = F.softmax(policy_logits, dim=-1)
         
         outputs = {
+            "logits": logits,
             "policy_logits": policy_logits,
             "policy": policy,
             "value": value.squeeze(-1),
@@ -368,23 +373,8 @@ class TRMC4Module(C4BaseModule):
         
         with torch.no_grad():
 
-            # Pad to expected batch size if necessary
-            # if actual_batch_size < self.hparams.batch_size:
-            #     pad_size = self.hparams.batch_size - actual_batch_size
-            #     padded_batch = {}
-            #     for k, v in batch.items():
-            #         if k == "boards":
-            #             padded_batch[k] = F.pad(v, (0, 0, 0, pad_size))
-            #         elif k in ("puzzle_identifiers", "current_player"):
-            #             padded_batch[k] = F.pad(v, (0, pad_size))
-            #         else:
-            #             padded_batch[k] = v
-            # else:
-            #     padded_batch = batch
-            padded_batch = batch
-
             # Initialize carry for this batch
-            carry = self.initial_carry(padded_batch)
+            carry = self.initial_carry(batch)
 
             while True:
                 carry, outputs = self.forward(carry, batch)
@@ -404,6 +394,8 @@ class TRMC4Module(C4BaseModule):
         # Get model outputs
         new_carry, outputs = self.forward(carry, batch)
         
+        labels = new_carry.current_data["outputs"]
+        
         # if self.manual_step % 500 == 0:
         #     self._print_debug_samples(batch, n_samples=3)
 
@@ -417,25 +409,42 @@ class TRMC4Module(C4BaseModule):
         target_policy = target_policy / target_policy.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         
         with torch.no_grad():
+
+            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+            is_correct = torch.argmax(outputs["logits"], dim=-1) == labels
+            label_counts = labels.shape[-1]
+            seq_is_correct = is_correct.sum(-1) == label_counts
+
             pred_actions = outputs["policy"].argmax(dim=-1)
             target_actions = target_policy.argmax(dim=-1)
             policy_accuracy = (pred_actions == target_actions).float()
             
-            value_certainty = outputs["value"].abs()  # How sure we are about position
-            should_halt = value_certainty > 0.95  # Halt when very certain about outcome
+            # value_certainty = outputs["value"].abs()  # How sure we are about position
+            # should_halt = value_certainty > 0.95  # Halt when very certain about outcome
             
             # Metrics (halted)
             valid_metrics = new_carry.halted
             
             raw_metrics = {
                 "count": valid_metrics.sum(),
+                "accuracy": torch.where(
+                    valid_metrics, (is_correct.float() / label_counts).sum(-1), 0
+                ).sum(),
+                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
                 "policy_accuracy": torch.where(valid_metrics, policy_accuracy, 0).sum(),
                 "q_halt_accuracy": (
-                    valid_metrics & ((outputs["q_halt_logits"] >= 0) == should_halt)
+                    valid_metrics & ((outputs["q_halt_logits"].squeeze() >= 0) == seq_is_correct)
                 ).sum(),
                 "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
         
+        lm_loss = (
+            stablemax_cross_entropy(
+                outputs["logits"], labels, ignore_index=-100
+            )
+            / label_counts
+        ).sum()
+
         target_values = new_carry.current_data["values"]  # From dataloader
         value_loss = F.mse_loss(outputs["value"], target_values, reduction="sum")
 
@@ -443,18 +452,19 @@ class TRMC4Module(C4BaseModule):
         
         q_halt_loss = F.binary_cross_entropy_with_logits(
             outputs["q_halt_logits"],
-            should_halt.to(outputs["q_halt_logits"].dtype),
+            seq_is_correct.to(outputs["q_halt_logits"].dtype),
             reduction="sum",
         )
         raw_metrics.update(
             {
+                "lm_loss": lm_loss.detach(),
                 "policy_loss": policy_loss.detach(),
                 "value_loss": value_loss.detach(),
                 "q_halt_loss": q_halt_loss.detach(),
             }
         )
         
-        total_loss = policy_loss + value_loss + 0.5 * q_halt_loss
+        total_loss = lm_loss + policy_loss + value_loss + 0.5 * q_halt_loss
         
         self.carry = new_carry
 
@@ -462,14 +472,17 @@ class TRMC4Module(C4BaseModule):
         count = raw_metrics["count"].item()
 
         metrics = {
+            "lm_loss": raw_metrics["lm_loss"].item() / batch_size,
             "policy_loss": raw_metrics["policy_loss"].item() / batch_size,
+            "value_loss": raw_metrics["value_loss"].item() / batch_size,
             "q_halt_loss": raw_metrics["q_halt_loss"].item() / batch_size,
             "count": count,
         }
 
         if count > 0:
             metrics.update({
-                "value_loss": raw_metrics["value_loss"].item() / count,
+                "accuracy": raw_metrics["accuracy"].item() / count,
+                "exact_accuracy": raw_metrics["exact_accuracy"].item() / count,
                 "policy_accuracy": raw_metrics["policy_accuracy"].item() / count,
                 "q_halt_accuracy": raw_metrics["q_halt_accuracy"].item() / count,
                 "steps": raw_metrics["steps"].item() / count,
@@ -550,16 +563,19 @@ class TRMC4Module(C4BaseModule):
         
         # Log metrics
         if metrics["count"] > 0:
+            self.log("train/accuracy", metrics["accuracy"], prog_bar=True, on_step=True)
+            self.log("train/exact_accuracy", metrics["exact_accuracy"], prog_bar=True, on_step=True)
             self.log("train/policy_accuracy", metrics["policy_accuracy"], prog_bar=True, on_step=True)
-            self.log("train/value_loss", metrics["value_loss"], on_step=True)
             self.log("train/q_halt_accuracy", metrics["q_halt_accuracy"], on_step=True)
             self.log("train/steps", metrics["steps"], prog_bar=True, on_step=True)
     
         # These can be logged unconditionally (they're per-batch, not per-halted-sample)
+        self.log("train/lm_loss", metrics["lm_loss"], on_step=True)
+        self.log("train/value_loss", metrics["value_loss"], on_step=True)
         self.log("train/policy_loss", metrics["policy_loss"], on_step=True)
         self.log("train/q_halt_loss", metrics["q_halt_loss"], on_step=True)
         
-        # assert not torch.isnan(metrics.get("policy_loss")), f"Policy loss is NaN at step {self.manual_step}"
+        assert not torch.isnan(loss), f"Total loss is NaN at step {self.manual_step}"
         
         t1 = time.time()
         

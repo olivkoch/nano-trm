@@ -21,16 +21,16 @@ timekeeping:
 
 model_tuning:
   
-  learning_rate: 1e-4
+  learning_rate: 0.0002
   learning_rate_emb: 1e-2
-  weight_decay: 0.1
-  warmup_steps:  10000
+  weight_decay: 1.0
+  warmup_steps:  1000
   lr_min_ratio:  0.1
   num_heads: 8
   halt_exploration_prob: 0.1
-  N_supervision: 3
-  N_supervision_val: 3
-  H_cycles: 2
+  N_supervision: 8
+  N_supervision_val: 8
+  H_cycles: 3
   L_cycles: 2
   num_layers: 2
   puzzle_emb_dim: 64
@@ -53,7 +53,7 @@ model_tuning:
   selfplay_update_interval: 10  # Update "previous model" every N epochs
   selfplay_bootstrap_weight: 0.3  # 0 = pure outcome, 1 = pure MCTS value
   selfplay_temporal_decay: 0.95   # Decay bootstrap for later
-  curriculum_data_path: "data/c4/minimax_games_3.pkl"
+  curriculum_data_path: "data/c4/minimax_games_5.pkl"
           
   # Evaluation parameters
   eval_minimax_depth: 2

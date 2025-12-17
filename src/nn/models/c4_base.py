@@ -63,11 +63,11 @@ class SimpleReplayDataset(Dataset):
         return {
             'boards': torch.stack([s['board'] for s in samples]),
             'policies': torch.stack([s['policy'] for s in samples]),
+            'outputs': torch.stack([s['output'] for s in samples]),
             'values': torch.tensor([s['value'] for s in samples], dtype=torch.float32),
             'current_player': torch.tensor([s['current_player'] for s in samples], dtype=torch.long),
             'puzzle_identifiers': torch.zeros(n, dtype=torch.long),
         }
-
 
 class C4BaseModule(LightningModule):
     """
@@ -265,6 +265,9 @@ class C4BaseModule(LightningModule):
                 
                 states = env.step(actions)
                 move_count += 1
+
+                for i in range(current_batch_size):
+                    trajectories[i][-1].update({'new_board': states.boards[i].clone().flatten()})
             
             # Process completed games
             for i in range(current_batch_size):
@@ -296,7 +299,8 @@ class C4BaseModule(LightningModule):
                         'board': position['board'],
                         'policy': position['policy'],
                         'value': value,
-                        'current_player': position['current_player']
+                        'current_player': position['current_player'],
+                        'output': position['new_board'],
                     })
         
         # Add to replay buffer
@@ -486,7 +490,7 @@ class C4BaseModule(LightningModule):
         states = env.reset()
         
         # Alternate who plays first
-        model_players = [1 if i % 2 == 0 else 2 for i in range(n_games)]
+        model_players = [C4_PLAYER1_CELL if i % 2 == 0 else C4_PLAYER2_CELL for i in range(n_games)]
         
         while not states.is_terminal.all():
             actions = torch.zeros(n_games, dtype=torch.long, device=self.device)
@@ -577,10 +581,10 @@ class C4BaseModule(LightningModule):
         model = model or self
         
         # Build current_players tensor
-        if current_players is None:
-            current_players_tensor = torch.ones(len(boards), dtype=torch.long, device=self.device)
-        else:
-            current_players_tensor = torch.stack(current_players) if isinstance(current_players[0], torch.Tensor) else torch.tensor(current_players, dtype=torch.long, device=self.device)
+        # if current_players is None:
+        #     current_players_tensor = torch.ones(len(boards), dtype=torch.long, device=self.device)
+        # else:
+        current_players_tensor = torch.stack(current_players) if isinstance(current_players[0], torch.Tensor) else torch.tensor(current_players, dtype=torch.long, device=self.device)
         
         if mcts is not None:
             _, action_probs = mcts.get_action_probs_batch_parallel(
@@ -638,28 +642,40 @@ class C4BaseModule(LightningModule):
                     actions[i] = legal_actions[torch.randint(len(legal_actions), (1,))].item()
             
             states = env.step(actions)
+
+            for i in range(num_games):
+                game_histories[i][-1].update({'new_board': states.boards[i].clone().flatten()})
         
         # Process games
         for game_idx in range(num_games):
             winner = states.winners[game_idx].item()
             
-            for move_data in game_histories[game_idx]:
+            game_length = len(game_histories[game_idx])
+            discount_factor = 0.97
+
+            for idx, move_data in enumerate(game_histories[game_idx]):
+
+                moves_from_end = game_length - idx
+
                 if winner == 0:
-                    value = 0.0
+                    outcome = 0.0
                 elif winner == move_data['current_player']:
-                    value = 1.0
+                    outcome = 1.0
                 else:
-                    value = -1.0
-                
+                    outcome = -1.0
+
+                discounted_value = outcome * (discount_factor ** moves_from_end)
+
                 self.replay_buffer.append({
                     'board': move_data['board'],
                     'policy': move_data['policy'],
-                    'value': value,
-                    'current_player': move_data['current_player']
+                    'value': discounted_value,
+                    'current_player': move_data['current_player'],
+                    'output': move_data['new_board']
                 })
-    
+
     def load_games_from_file(self, input_file: str):
-        """Load games from file - matching interface"""
+        """Load games from file """
         log.info(f"Loading games from {input_file}...")
         
         if not os.path.exists(input_file):
@@ -678,6 +694,7 @@ class C4BaseModule(LightningModule):
         for pos in positions:
             board = torch.tensor(pos['board'], dtype=torch.float32)
             policy = torch.tensor(pos['policy'], dtype=torch.float32)
+            output = torch.tensor(pos['new_board'], dtype=torch.float32)
             value = pos['value']
             current_player = pos['current_player']
 
@@ -685,12 +702,13 @@ class C4BaseModule(LightningModule):
                 'board': board,
                 'policy': policy,
                 'value': value,
-                'current_player': current_player
+                'current_player': current_player,
+                'output': output
             })
         
         print(f"Loaded {len(positions)} positions from {data['num_games']} games in file {input_file}")
         print(f"Replay buffer now contains {len(self.replay_buffer)} positions")
-    
+
     def _canonicalize_board(self, boards: torch.Tensor, current_player: torch.Tensor) -> torch.Tensor:
         """
         Canonicalize board so current player's pieces = 1, opponent's = 2.
@@ -799,6 +817,3 @@ class C4BaseModule(LightningModule):
             shuffle=False
         )
     
-    def on_train_epoch_start(self):
-        """Setup for training"""
-        pass

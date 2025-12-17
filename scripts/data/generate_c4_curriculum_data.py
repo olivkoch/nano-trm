@@ -144,6 +144,12 @@ def collect_self_play_games_minimax_parallel(
                 # Step environment for all games
                 states = vec_env.step(actions)
                 
+                # Save output board for imitation learning
+                for i in active_indices:
+                    trajectories[i][-1].update({
+                        'new_board': states.boards[i].flatten().clone()
+                    })
+
                 # Mark completed games
                 for i in active_indices:
                     if states.is_terminal[i]:
@@ -184,7 +190,8 @@ def collect_self_play_games_minimax_parallel(
                         'board': position['board'],
                         'policy': position['policy'],
                         'value': discounted_value,
-                        'current_player': position['current_player']
+                        'current_player': position['current_player'],
+                        'new_board': position['new_board']
                     })
                     n_positions_added += 1
             
@@ -257,7 +264,8 @@ def main(n_games, depth, temp_player1, temp_player2, n_workers, n_parallel, disc
                 'board': item['board'].cpu().numpy().tolist(),
                 'policy': item['policy'].cpu().numpy().tolist(),
                 'value': float(item['value']),
-                'current_player': int(item['current_player'])
+                'current_player': int(item['current_player']),
+                'new_board': item['new_board'].cpu().numpy().tolist(),
             })
         
         data = {

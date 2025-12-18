@@ -30,7 +30,6 @@ vocab_size: ${model_tuning.vocab_size}
 
 #self-play settings
 enable_selfplay: ${model_tuning.enable_selfplay}
-selfplay_buffer_size: ${model_tuning.selfplay_buffer_size}
 selfplay_games_per_iteration: ${model_tuning.selfplay_games_per_iteration}
 selfplay_mcts_simulations: ${model_tuning.selfplay_mcts_simulations}
 selfplay_eval_mcts_simulations: ${model_tuning.selfplay_eval_mcts_simulations}
@@ -50,3 +49,4 @@ eval_games_vs_random: ${model_tuning.eval_games_vs_random}
 
 # Output directory
 output_dir: None
+pretrained_checkpoint_path: ${pretrained_checkpoint_path}

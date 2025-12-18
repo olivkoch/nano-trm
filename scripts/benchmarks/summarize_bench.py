@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Summarize GPU benchmark results from multiple JSON files.
 
@@ -191,6 +192,118 @@ def print_comparison_matrix(summary: dict):
             click.echo(row)
 
 
+def print_gpu_speedup_summary(summary: dict):
+    """Print average speedup for each GPU relative to the slowest GPU."""
+    
+    click.echo(f"\n{'='*100}")
+    click.echo("GPU SPEEDUP SUMMARY (relative to slowest GPU, averaged across all models)")
+    click.echo(f"{'='*100}")
+    
+    # Collect all GPUs
+    all_gpus = set()
+    for variants in summary.values():
+        for gpu_data in variants.values():
+            all_gpus.update(gpu_data.keys())
+    all_gpus = sorted(all_gpus)
+    
+    if len(all_gpus) < 2:
+        click.echo("Need at least 2 GPUs to compare.")
+        return
+    
+    # Collect throughput for each (arch, variant, gpu) combination
+    # Structure: (arch, variant) -> {gpu: throughput}
+    model_throughputs = defaultdict(dict)
+    
+    for arch, variants in summary.items():
+        for variant, gpus in variants.items():
+            key = (arch, variant)
+            for gpu, compiles in gpus.items():
+                # Prefer compiled, fall back to eager
+                compiled = compiles.get("compiled", {})
+                eager = compiles.get("eager", {})
+                throughput = compiled.get("samples_per_sec") or eager.get("samples_per_sec")
+                if throughput:
+                    model_throughputs[key][gpu] = throughput
+    
+    # For each model, find the slowest GPU and calculate speedups
+    # gpu -> list of speedups across models
+    gpu_speedups = defaultdict(list)
+    
+    for (arch, variant), gpu_data in model_throughputs.items():
+        if len(gpu_data) < 2:
+            continue  # Need at least 2 GPUs for comparison
+        
+        # Find slowest throughput for this model
+        min_throughput = min(gpu_data.values())
+        
+        for gpu, throughput in gpu_data.items():
+            speedup = throughput / min_throughput
+            gpu_speedups[gpu].append({
+                "model": f"{arch}/{variant}",
+                "speedup": speedup,
+                "throughput": throughput,
+            })
+    
+    if not gpu_speedups:
+        click.echo("No comparable results found.")
+        return
+    
+    # Calculate average speedup per GPU
+    gpu_avg_speedups = {}
+    for gpu, speedups in gpu_speedups.items():
+        avg = sum(s["speedup"] for s in speedups) / len(speedups)
+        gpu_avg_speedups[gpu] = {
+            "avg_speedup": avg,
+            "num_models": len(speedups),
+            "details": speedups,
+        }
+        
+    # Sort GPUs by average speedup (descending)
+    sorted_gpus = sorted(gpu_avg_speedups.keys(), key=lambda g: gpu_avg_speedups[g]["avg_speedup"], reverse=True)
+    
+    # Find the baseline (slowest) GPU
+    baseline_gpu = sorted_gpus[-1]
+    
+    # Print summary table
+    click.echo(f"\n{'GPU':<25} {'Avg Speedup':>12} {'Models':>8}")
+    click.echo("-" * 50)
+    
+    for gpu in sorted_gpus:
+        data = gpu_avg_speedups[gpu]
+        speedup_str = f"{data['avg_speedup']:.2f}x"
+        click.echo(f"{gpu:<25} {speedup_str:>12} {data['num_models']:>8}")
+    
+    click.echo("-" * 50)
+    click.echo(f"Baseline (1.00x): {baseline_gpu}")
+    
+    # Print detailed breakdown
+    click.echo(f"\n{'Detailed speedups by model:'}")
+    click.echo("-" * 80)
+    
+    # Get all models
+    all_models = sorted(set(s["model"] for speedups in gpu_speedups.values() for s in speedups))
+    
+    # Dynamic column width
+    gpu_width = max(12, max(len(g) for g in sorted_gpus) + 1)
+    
+    header = f"{'Model':<20}"
+    for gpu in sorted_gpus:
+        header += f" {gpu:>{gpu_width}}"
+    click.echo(header)
+    click.echo("-" * len(header))
+    
+    for model in all_models:
+        row = f"{model:<20}"
+        for gpu in sorted_gpus:
+            # Find speedup for this gpu/model
+            speedup_data = next((s for s in gpu_speedups[gpu] if s["model"] == model), None)
+            if speedup_data:
+                row += f" {speedup_data['speedup']:>{gpu_width}.2f}x"
+            else:
+                row += f" {'-':>{gpu_width}}"
+        click.echo(row)
+
+
 def export_csv(summary: dict, output_path: Path):
     """Export results to CSV."""
     rows = []
@@ -226,9 +339,10 @@ def export_csv(summary: dict, output_path: Path):
 @click.argument("directory", type=click.Path(exists=True), default=".")
 @click.option("--by-gpu", is_flag=True, help="Organize output by GPU instead of architecture")
 @click.option("--matrix", is_flag=True, help="Show GPU comparison matrix")
+@click.option("--speedup", is_flag=True, help="Show average GPU speedup relative to slowest GPU")
 @click.option("--csv", "csv_path", type=click.Path(), help="Export to CSV file")
 @click.option("--all", "show_all", is_flag=True, help="Show all views")
-def main(directory: str, by_gpu: bool, matrix: bool, csv_path: str, show_all: bool):
+def main(directory: str, by_gpu: bool, matrix: bool, speedup: bool, csv_path: str, show_all: bool):
     """Summarize GPU benchmark results.
     
     Reads all benchmark_*.json files from DIRECTORY (default: current directory)
@@ -249,6 +363,10 @@ def main(directory: str, by_gpu: bool, matrix: bool, csv_path: str, show_all: bo
     python summarize_benchmarks.py ./results/ --matrix
     
     \b
+    # Show GPU speedup comparison
+    python summarize_benchmarks.py ./results/ --speedup
+    
+    \b
     # Show everything and export CSV
     python summarize_benchmarks.py ./results/ --all --csv results.csv
     """
@@ -266,10 +384,13 @@ def main(directory: str, by_gpu: bool, matrix: bool, csv_path: str, show_all: bo
         print_summary_by_architecture(summary)
         print_summary_by_gpu(summary)
         print_comparison_matrix(summary)
+        print_gpu_speedup_summary(summary)
     elif by_gpu:
         print_summary_by_gpu(summary)
     elif matrix:
         print_comparison_matrix(summary)
+    elif speedup:
+        print_gpu_speedup_summary(summary)
     else:
         print_summary_by_architecture(summary)
     

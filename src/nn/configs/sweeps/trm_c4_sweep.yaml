@@ -6,15 +6,15 @@ metric:
 
 parameters:
   model_tuning.N_supervision:
-    values: [1, 4, 8]
+    values: [2, 4, 8]
   model_tuning.H_cycles:
-    values: [1, 2, 3]
+    values: [2, 3, 4]
   model_tuning.L_cycles:
-    values: [1, 2, 3]
+    values: [2, 3, 4]
   model_tuning.hidden_size:
-    values: [32, 128, 256]
+    values: [4, 16, 32, 64]
   model_tuning.num_layers:
-    values: [1, 2, 3]
+    values: [2, 3, 4]
   model_tuning.weight_decay:
     values: [0.1, 1.0]
   model_tuning.learning_rate:

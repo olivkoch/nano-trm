@@ -85,7 +85,6 @@ class C4BaseModule(LightningModule):
         max_epochs=300,
         num_workers=1,
         enable_selfplay=False,
-        selfplay_buffer_size=100000,
         selfplay_games_per_iteration=50,
         selfplay_mcts_simulations=30,
         selfplay_eval_mcts_simulations=100,
@@ -101,6 +100,7 @@ class C4BaseModule(LightningModule):
         eval_games_vs_random=100,
         eval_use_mcts=True,
         output_dir=None,
+        pretrained_checkpoint_path=None,
     )
 
     def __init__(self, **kwargs):
@@ -108,6 +108,9 @@ class C4BaseModule(LightningModule):
         merged = {**self.DEFAULT_HPARAMS, **kwargs}
         self.save_hyperparameters(merged)
         
+        # Skip heavy init if just creating for evaluation
+        self._eval_only = kwargs.get('_eval_only', False)
+
         # Common attributes
         self.board_rows = 6
         self.board_cols = 7
@@ -119,7 +122,12 @@ class C4BaseModule(LightningModule):
         self.games_played = 0
         self.max_steps = self.hparams.steps_per_epoch * self.hparams.max_epochs
         
-        self.replay_buffer = CircularBuffer(maxlen=self.hparams.selfplay_buffer_size)
+        if self.hparams.enable_selfplay and not self._eval_only:
+            buffer_len = 4 * self.hparams.steps_per_epoch * self.hparams.batch_size
+            self.replay_buffer = CircularBuffer(maxlen=buffer_len)
+            log.info(f"Initialized replay buffer with size {buffer_len} for self-play")
+        else:
+            self.replay_buffer = None # will be created during data loading, or just eval mode
 
         # Self-play attributes
         if self.hparams.enable_selfplay:    
@@ -129,8 +137,8 @@ class C4BaseModule(LightningModule):
             # for monitoring
             self.value_preds_buffer = []  # Rolling buffer for correlation
             self.game_outcomes_buffer = []
-
-        self.epoch_idx = 0
+            self.best_player = None  # Best player weights
+            self.games_generated = 0
     
     def forward_for_mcts(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -157,25 +165,48 @@ class C4BaseModule(LightningModule):
             log.info(f"  Steps per epoch: {self.hparams.steps_per_epoch}")
             log.info(f"  Max epochs: {self.hparams.max_epochs}")
             log.info(f"  Total steps: {self.max_steps}")
-            log.info(f"  Buffer size: {len(self.replay_buffer)}")
 
-            # Traditional training - load file data (no tensor operations needed)
+            # Traditional training - load file data
             if not self.hparams.enable_selfplay:
-                if len(self.replay_buffer) == 0:
-                    # This is safe because it just loads data into buffer
-                    self.load_games_from_file(self.hparams.curriculum_data_path)
+                self.load_games_from_file(self.hparams.curriculum_data_path)
+            
+            if self.hparams.pretrained_checkpoint_path is not None:
+                self.load_pretrained_checkpoint(self.hparams.pretrained_checkpoint_path)
     
+    def load_pretrained_checkpoint(self, checkpoint_path: str):
+        """Load weights from a pretrained checkpoint"""
+        log.info(f"Loading pretrained checkpoint from {checkpoint_path}")
+        
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, weights_only=False)
+        
+        # Handle Lightning checkpoint format
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+        
+        self.load_state_dict(state_dict, strict=False)
+        log.info(f"Successfully loaded pretrained weights")
+        
     def generate_selfplay_games(self, num_games: int, verbose: bool = False, log_metrics: bool = True) -> Tuple[int, int, int]:
         """Generate self-play games using MCTS"""
         if not self.hparams.enable_selfplay:
             raise RuntimeError("Self-play not enabled for this model")
         
+        # Use best player for self-play generation, not current training weights
+        if self.best_player is not None:
+            original_state = pickle.loads(pickle.dumps(self.state_dict()))
+            self.load_state_dict(self.best_player)
+
         self.eval()
         
         # Update MCTS with current model
         self.mcts.model = MCTSModelWrapper(self)
                 
-        batch_size = min(512, num_games)
+        batch_size = min(1024, num_games)
         num_batches = (num_games + batch_size - 1) // batch_size
         all_positions = []
 
@@ -244,9 +275,10 @@ class C4BaseModule(LightningModule):
                 for i in range(current_batch_size):
                     if active_games[i]:
                         # Store position
+                        # Store data on CPU during generation to avoid GPU OOM
                         trajectories[i].append({
-                            'board': states.boards[i].clone().flatten(),
-                            'policy': visit_distributions[policy_idx].clone(),
+                            'board': states.boards[i].clone().flatten().cpu(),
+                            'policy': visit_distributions[policy_idx].clone().cpu(),
                             'current_player': states.current_players[i].item(),
                             'mcts_value': raw_values[policy_idx].item()
                         })
@@ -267,7 +299,7 @@ class C4BaseModule(LightningModule):
                 move_count += 1
 
                 for i in range(current_batch_size):
-                    trajectories[i][-1].update({'new_board': states.boards[i].clone().flatten()})
+                    trajectories[i][-1].update({'new_board': states.boards[i].clone().flatten().cpu()})
             
             # Process completed games
             for i in range(current_batch_size):
@@ -294,7 +326,6 @@ class C4BaseModule(LightningModule):
 
                     # print(f"Storing position: outcome={game_outcome}, mcts={position['mcts_value']:.3f}, value={value:.3f}, move {move_idx+1}/{game_length}")
                     # print(f"Parameters used: bootstrap_weight={bootstrap_weight}, temporal_decay={temporal_decay}, effective_bootstrap={effective_bootstrap:.3f}")
-
                     all_positions.append({
                         'board': position['board'],
                         'policy': position['policy'],
@@ -307,12 +338,18 @@ class C4BaseModule(LightningModule):
         self.replay_buffer.extend(all_positions)
         self.games_generated += num_games
         
+        self.mcts._cached_mcts.clear()
+
         if verbose:
             t1 = time.time()
             print(f"Generated {len(all_positions)} positions from {num_games} games")
             print(f"Buffer size: {len(self.replay_buffer)} positions")
             print(f"Generation took {t1 - t0:.3f} seconds. Games per second: {num_games / (t1 - t0):.2f}")
         
+        # Restore training weights after generation
+        if self.best_player is not None:
+            self.load_state_dict(original_state)
+
         self.train()
 
         if log_metrics:
@@ -320,6 +357,12 @@ class C4BaseModule(LightningModule):
 
         return len(all_positions), len(self.replay_buffer), num_games
     
+    def on_train_start(self):
+        # Initialize best player from current weights
+        self.best_player = pickle.loads(pickle.dumps(self.state_dict()))
+        # Run a first validation to sanity-check a pretrained model
+        self.validation_step(None, 0)
+        
     def on_train_epoch_start(self):
         """Do all initialization here when model is on correct device"""
         if self.hparams.enable_selfplay:
@@ -332,7 +375,7 @@ class C4BaseModule(LightningModule):
             
             self.log('selfplay/games_per_second', num_games / elapsed)
             self.log('selfplay/positions_generated', num_positions)
-            self.log('selfplay/buffer_size', len(self.replay_buffer))
+            self.log('selfplay/buffer_size', len(self.replay_buffer)) # in self-play, should plateau after a few epochs
     
     def val_dataloader(self):
         """Dummy dataloader to trigger validation epoch"""
@@ -345,6 +388,9 @@ class C4BaseModule(LightningModule):
         mcts_sims = self.hparams.selfplay_eval_mcts_simulations
         mcts_parallel = self.hparams.selfplay_parallel_simulations
         
+        log.info(f"*"*60)
+        log.info(f"Running evaluation...")
+
         # Evaluate vs random
         win_rate, draw_rate, _ = self.evaluate(
             opponent='random',
@@ -376,19 +422,33 @@ class C4BaseModule(LightningModule):
             minimax_depth=self.hparams.eval_minimax_depth,
             minimax_temperature=self.hparams.eval_minimax_temperature,
         )
+        log.info(f"Final win rate vs minimax: {win_rate:.3f}, draw rate: {draw_rate:.3f}")
         self.log('eval/win_rate_vs_minimax', win_rate)
     
     def on_train_epoch_end(self):
         """Only handle non-evaluation tasks here"""
         epoch = self.trainer.current_epoch if hasattr(self, 'trainer') else 0
         
-        # Update previous model checkpoint (for self-play opponent)
-        if self.hparams.enable_selfplay and epoch > 0:
-            if epoch % self.hparams.get('selfplay_update_interval', 10) == 0:
-                self.previous_model = pickle.loads(pickle.dumps(self.state_dict()))
-        
-        self.epoch_idx += 1
-    
+        if self.hparams.enable_selfplay:
+            if epoch % self.hparams.selfplay_update_interval == 0 and epoch > 0:
+                # Evaluate current training weights vs best player
+                self.previous_model = self.best_player
+                win_rate, _, _ = self.evaluate(
+                    opponent='previous',
+                    n_games=100,
+                    use_mcts=True,
+                    mcts_simulations=self.hparams.selfplay_eval_mcts_simulations,
+                    mcts_parallel_simulations=self.hparams.selfplay_parallel_simulations,
+                )
+                
+                self.log('selfplay/win_rate_vs_best', win_rate)
+                
+                if win_rate > 0.55:
+                    self.best_player = pickle.loads(pickle.dumps(self.state_dict()))
+                    log.info(f"New best player! Win rate: {win_rate:.3%}")
+                else:
+                    log.info(f"Kept best player. Current win rate: {win_rate:.3%}")
+            
     def _log_selfplay_metrics(self, visit_distributions, mcts_values, game_outcomes):
         """Log MCTS and value metrics to wandb"""
         import numpy as np
@@ -457,10 +517,8 @@ class C4BaseModule(LightningModule):
         minimax = None
         
         if opponent == 'previous':
-            if self.previous_model is None:
-                self.train()
-                return 0.5, 0.0, 0.5
-            prev_model = self.__class__(**dict(self.hparams))
+            assert self.previous_model is not None, "No previous model available for evaluation"
+            prev_model = self.__class__(**dict(self.hparams), _eval_only=True)
             prev_model.load_state_dict(self.previous_model)
             prev_model.eval()
             prev_model.to(self.device)
@@ -686,10 +744,7 @@ class C4BaseModule(LightningModule):
         
         positions = data['positions']
         
-        log.info(f"Loaded {len(positions)} positions from {data['num_games']} games. Pushing into buffer of size {self.hparams.selfplay_buffer_size}...")
-
-        if len(positions) > self.hparams.selfplay_buffer_size:
-            log.info(f"WARNING: Truncated to last {len(positions)} positions to fit buffer size.")
+        self.replay_buffer = CircularBuffer(maxlen=len(positions))
 
         for pos in positions:
             board = torch.tensor(pos['board'], dtype=torch.float32)
@@ -761,33 +816,30 @@ class C4BaseModule(LightningModule):
         log.info(f"Building train dataloader...")
         
         # === Ensure buffer is populated ===
-        if len(self.replay_buffer) == 0:
-            if self.hparams.enable_selfplay:
-                log.info("Buffer empty, bootstrapping for self-play...")
-                device = next(self.parameters()).device
-                
-                # Bootstrap with random games
-                self._bootstrap_random_games(100)
-                
-                # Create MCTS if needed
-                if not hasattr(self, 'mcts') or self.mcts is None:
-                    log.info(f"Creating MCTS with {self.hparams.selfplay_parallel_simulations} parallel sims, {self.hparams.selfplay_mcts_simulations} sims/move")
-                    self.mcts = TensorMCTSWrapper(
-                        model=MCTSModelWrapper(self),
-                        c_puct=0.5,
-                        num_simulations=self.hparams.selfplay_mcts_simulations,
-                        parallel_simulations=self.hparams.selfplay_parallel_simulations,
-                        virtual_loss_value=3.0,
-                        device=device
-                    )
-                
-                # Generate initial self-play games
-                self.generate_selfplay_games(
-                    self.hparams.selfplay_games_per_iteration, 
-                    verbose=True, 
-                    log_metrics=False
+        if self.hparams.enable_selfplay:
+            log.info("Bootstrapping for self-play...")
+            device = next(self.parameters()).device
+                        
+            # Create MCTS if needed
+            if not hasattr(self, 'mcts') or self.mcts is None:
+                log.info(f"Creating MCTS with {self.hparams.selfplay_parallel_simulations} parallel sims, {self.hparams.selfplay_mcts_simulations} sims/move")
+                self.mcts = TensorMCTSWrapper(
+                    model=MCTSModelWrapper(self),
+                    c_puct=0.5,
+                    num_simulations=self.hparams.selfplay_mcts_simulations,
+                    parallel_simulations=self.hparams.selfplay_parallel_simulations,
+                    virtual_loss_value=3.0,
+                    device=device
                 )
-            else:
+            
+            # Generate initial self-play games
+            self.generate_selfplay_games(
+                self.hparams.selfplay_games_per_iteration, 
+                verbose=True, 
+                log_metrics=False
+            )
+        else:
+            if len(self.replay_buffer) == 0:
                 # Curriculum mode: buffer should have been loaded in setup()
                 raise RuntimeError(
                     f"Replay buffer is empty! Did setup() run? "

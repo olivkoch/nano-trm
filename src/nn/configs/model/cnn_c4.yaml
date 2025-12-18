@@ -14,7 +14,6 @@ use_residual: ${model_tuning.use_residual}  # For CNN - use residual
 
 #self-play settings
 enable_selfplay: ${model_tuning.enable_selfplay}
-selfplay_buffer_size: ${model_tuning.selfplay_buffer_size}
 selfplay_games_per_iteration: ${model_tuning.selfplay_games_per_iteration}
 selfplay_mcts_simulations: ${model_tuning.selfplay_mcts_simulations}
 selfplay_eval_mcts_simulations: ${model_tuning.selfplay_eval_mcts_simulations}
@@ -36,3 +35,6 @@ batch_size: ${timekeeping.batch_size}
 max_epochs: ${timekeeping.max_epochs}
 steps_per_epoch: ${timekeeping.steps_per_epoch}
 num_workers: ${timekeeping.num_workers}
+
+output_dir: None
+pretrained_checkpoint_path: ${pretrained_checkpoint_path}

@@ -33,13 +33,12 @@ model_tuning:
 
   # Self-play settings
   enable_selfplay: true
-  selfplay_buffer_size: 1500000 # use 50K for self play testing, 1.5M for curriculum
-  selfplay_games_per_iteration: 64
-  selfplay_mcts_simulations: 400
-  selfplay_eval_mcts_simulations: 50
-  selfplay_parallel_simulations: 100
+  selfplay_games_per_iteration: 1024
+  selfplay_mcts_simulations: 800
+  selfplay_eval_mcts_simulations: 200
+  selfplay_parallel_simulations: 256
   selfplay_temperature_moves: 15
-  selfplay_update_interval: 10  # Update "previous model" every N epochs
+  selfplay_update_interval: 5  # should be aligned with eval interval
   selfplay_bootstrap_weight: 0.3  # 0 = pure outcome, 1 = pure MCTS value
   selfplay_temporal_decay: 0.97   # Decay bootstrap
   curriculum_data_path: "data/c4/minimax_games_5.pkl"
@@ -60,6 +59,7 @@ trainer:
 # Paths
 save_dir: /tmp/ml-experiments/connectfour
 append_wandb_name_to_save_dir: true
+pretrained_checkpoint_path: null
 
 # Logger
 logger:

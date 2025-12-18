@@ -44,7 +44,6 @@ model_tuning:
 
   #self-play settings
   enable_selfplay: false
-  selfplay_buffer_size: 1500000 # use 50K for self play testing, 1.5M for curriculum
   selfplay_games_per_iteration: 64
   selfplay_mcts_simulations: 400
   selfplay_eval_mcts_simulations: 50
@@ -71,6 +70,7 @@ trainer:
 # Paths
 save_dir: /tmp/ml-experiments/connectfour
 append_wandb_name_to_save_dir: true
+pretrained_checkpoint_path: null
 
 # Logger
 logger:

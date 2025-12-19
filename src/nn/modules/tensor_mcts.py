@@ -373,7 +373,37 @@ class TensorMCTS:
         self._should_backup = (~already_expanded).view(n_sims, n_trees)
         self._last_leaf_values = full_values.view(n_sims, n_trees)
         
+    # def _expand_nodes(self, tree_indices, node_indices, policies, states, node_players):
+    #     legal_masks = states[:, 0, :] == 0
+    #     masked_policies = policies * legal_masks.float()
+    #     masked_policies = masked_policies / (masked_policies.sum(dim=1, keepdim=True) + 1e-8)
+    #     self.priors[tree_indices, node_indices] = masked_policies
+    #     child_players = 3 - node_players
+        
+    #     for action in range(self.config.n_actions):
+    #         is_legal = legal_masks[:, action]
+    #         if not is_legal.any(): continue
+    #         legal_tree_idx = tree_indices[is_legal]
+    #         legal_node_idx = node_indices[is_legal]
+    #         legal_child_players = child_players[is_legal]
+    #         child_idx = self.next_node_idx[legal_tree_idx]
+    #         has_space = child_idx < self.config.max_nodes_per_tree
+    #         if not has_space.any(): continue
+    #         legal_tree_idx = legal_tree_idx[has_space]
+    #         legal_node_idx = legal_node_idx[has_space]
+    #         legal_child_players = legal_child_players[has_space]
+    #         child_idx = child_idx[has_space]
+    #         self.children[legal_tree_idx, legal_node_idx, action] = child_idx
+    #         self.parent[legal_tree_idx, child_idx] = legal_node_idx
+    #         self.parent_action[legal_tree_idx, child_idx] = action
+    #         self.current_player[legal_tree_idx, child_idx] = legal_child_players
+    #         self.next_node_idx[legal_tree_idx] += 1
+    
     def _expand_nodes(self, tree_indices, node_indices, policies, states, node_players):
+        """
+        Safely allocate unique child nodes for every expansion request.
+        Handles collision where multiple simulations expand the same tree in the same batch.
+        """
         legal_masks = states[:, 0, :] == 0
         masked_policies = policies * legal_masks.float()
         masked_policies = masked_policies / (masked_policies.sum(dim=1, keepdim=True) + 1e-8)
@@ -383,22 +413,51 @@ class TensorMCTS:
         for action in range(self.config.n_actions):
             is_legal = legal_masks[:, action]
             if not is_legal.any(): continue
+            
             legal_tree_idx = tree_indices[is_legal]
             legal_node_idx = node_indices[is_legal]
             legal_child_players = child_players[is_legal]
-            child_idx = self.next_node_idx[legal_tree_idx]
-            has_space = child_idx < self.config.max_nodes_per_tree
-            if not has_space.any(): continue
-            legal_tree_idx = legal_tree_idx[has_space]
-            legal_node_idx = legal_node_idx[has_space]
-            legal_child_players = legal_child_players[has_space]
-            child_idx = child_idx[has_space]
-            self.children[legal_tree_idx, legal_node_idx, action] = child_idx
-            self.parent[legal_tree_idx, child_idx] = legal_node_idx
-            self.parent_action[legal_tree_idx, child_idx] = action
-            self.current_player[legal_tree_idx, child_idx] = legal_child_players
-            self.next_node_idx[legal_tree_idx] += 1
-    
+            
+            # 1. Sort by tree index to group requests
+            sorted_tree_idx, sort_order = torch.sort(legal_tree_idx)
+            unique_trees, counts = torch.unique_consecutive(sorted_tree_idx, return_counts=True)
+            
+            # 2. Get current next_node_idx for each tree
+            current_next = self.next_node_idx[unique_trees]
+            
+            # 3. Create ranges: [base, base+1, ...] for each group
+            bases = torch.repeat_interleave(current_next, counts)
+            cumsum = counts.cumsum(0)
+            group_starts = torch.cat([torch.tensor([0], device=self.device), cumsum[:-1]])
+            repeated_starts = torch.repeat_interleave(group_starts, counts)
+            relative_offsets = torch.arange(legal_tree_idx.size(0), device=self.device) - repeated_starts
+            
+            # 4. Final unique indices
+            new_indices_sorted = bases + relative_offsets
+            
+            # 5. Check Capacity
+            has_space_sorted = new_indices_sorted < self.config.max_nodes_per_tree
+            
+            if has_space_sorted.any():
+                # Apply writes using sort_order to map back to legal_tree_idx order
+                valid_sorted_idx = sort_order[has_space_sorted]
+                
+                valid_tree_idx = legal_tree_idx[valid_sorted_idx]
+                valid_node_idx = legal_node_idx[valid_sorted_idx]
+                valid_child_val = new_indices_sorted[has_space_sorted]
+                valid_player = legal_child_players[valid_sorted_idx]
+                
+                # Write to structure
+                self.children[valid_tree_idx, valid_node_idx, action] = valid_child_val
+                self.parent[valid_tree_idx, valid_child_val] = valid_node_idx
+                self.parent_action[valid_tree_idx, valid_child_val] = action
+                self.current_player[valid_tree_idx, valid_child_val] = valid_player
+                
+                # 6. Update global counters (ONLY for successful allocations)
+                # CRITICAL FIX: Only update counts for the nodes that actually fit
+                u_valid, c_valid = torch.unique_consecutive(valid_tree_idx, return_counts=True)
+                self.next_node_idx.index_add_(0, u_valid, c_valid)
+
     def _batch_backup_vectorized(self, leaves: torch.Tensor, paths: torch.Tensor, path_lengths: torch.Tensor):
         n_sims, n_trees = leaves.shape
         max_depth = paths.shape[2]
@@ -409,7 +468,7 @@ class TensorMCTS:
             active = (path_lengths > depth) & self._should_backup
             
             if not active.any():
-                values = -values  # Still flip sign
+                # values = -values  # Still flip sign
                 continue
             
             node_idx = paths[:, :, depth]
@@ -422,7 +481,8 @@ class TensorMCTS:
             self.visits.view(-1).index_add_(0, linear_indices, ones)
             self.total_value.view(-1).index_add_(0, linear_indices, active_values)
             
-            values = -values
+            # values = -values
+            values = torch.where(active, -values, values)
     
     def _check_terminal_batch(self, boards):
         batch_size = boards.shape[0]

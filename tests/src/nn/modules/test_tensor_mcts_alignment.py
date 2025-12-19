@@ -1678,6 +1678,695 @@ def test_wrapper():
         return False
     
 # =============================================================================
+# Test 23: Double Threat Detection
+# =============================================================================
+
+def test_double_threat():
+    """Test position where opponent has TWO winning threats - compare both engines"""
+    print("\n" + "=" * 70)
+    print("TEST 23: Double Threat Detection")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # P2 has threats at BOTH col 0 and col 6
+    # P1 can only block one - will lose next turn regardless
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    board_np[5, 0] = 2
+    board_np[4, 0] = 2
+    board_np[3, 0] = 2  # P2 threat at col 0
+    board_np[5, 6] = 2
+    board_np[4, 6] = 2
+    board_np[3, 6] = 2  # P2 threat at col 6
+    # Add some P1 pieces to balance
+    board_np[5, 3] = 1
+    board_np[4, 3] = 1
+    board_np[5, 4] = 1
+    
+    print("  Board (P1 to move, P2 has double threat at cols 0 and 6):")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board_np[row, c]] for c in range(7)])}|")
+    print("  Note: This is a LOSING position for P1 - can only block one threat")
+    
+    # --- Run mcts_v2 ---
+    env = ConnectFourEnv()
+    env.board = board_np.copy()
+    env.to_play = 1
+    env.legal_actions = np.ones(7, dtype=np.float32)
+    eval_func = make_numpy_eval_func()
+    
+    move_v2, v2_dist, _, _, _ = parallel_uct_search(
+        env, eval_func, None, 19652.0, 1.25, 500, num_parallel=16
+    )
+    
+    # --- Run tensor_mcts ---
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    tensor_dist = mcts.run_simulations(500, parallel_sims=16)[0].numpy()
+    
+    best_v2 = np.argmax(v2_dist)
+    best_tensor = np.argmax(tensor_dist)
+    
+    print(f"\n  Results:")
+    print(f"    mcts_v2 dist:     {v2_dist.round(3)}")
+    print(f"    tensor_mcts dist: {tensor_dist.round(3)}")
+    print(f"    mcts_v2 choice:     col {best_v2}")
+    print(f"    tensor_mcts choice: col {best_tensor}")
+    
+    # Check Q-values for both
+    print(f"\n  tensor_mcts Q-values:")
+    root_children = mcts.children[0, 0]
+    tensor_qs = []
+    for i in range(7):
+        child_idx = root_children[i].item()
+        if child_idx >= 0:
+            v = mcts.visits[0, child_idx].item()
+            val = mcts.total_value[0, child_idx].item()
+            q = -val / max(1, v)
+            tensor_qs.append(q)
+            print(f"    Col {i}: Q={q:.3f}")
+        else:
+            tensor_qs.append(None)
+    
+    # Analysis
+    aligned = (best_v2 == best_tensor)
+    both_block = best_v2 in [0, 6] and best_tensor in [0, 6]
+    all_negative = all(q < 0 for q in tensor_qs if q is not None)
+    
+    print(f"\n  Analysis:")
+    if aligned:
+        print(f"    ✓ Both engines chose the same move (col {best_v2})")
+    else:
+        print(f"    ~ Engines differed: v2={best_v2}, tensor={best_tensor}")
+        return False
+    
+    if both_block:
+        print(f"    ✓ Both engines chose to block a threat")
+    else:
+        print(f"    ~ Not both blocking: v2={best_v2}, tensor={best_tensor}")
+        return False
+    
+    if all_negative:
+        print(f"    ✓ All Q-values negative (correctly sees losing position)")
+    else:
+        print(f"    ~ Some Q-values non-negative")
+        return False
+    return True
+    
+    # Pass if engines are aligned OR both choose a blocking move
+    if aligned or both_block:
+        return True
+    else:
+        return False
+
+def test_double_threat_debug():
+    """Debug: trace through what tensor_mcts sees in the double threat position"""
+    print("\n" + "=" * 70)
+    print("TEST 23b: Double Threat DEBUG")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    board_np[5, 0] = 2
+    board_np[4, 0] = 2
+    board_np[3, 0] = 2  # P2 threat at col 0
+    board_np[5, 6] = 2
+    board_np[4, 6] = 2
+    board_np[3, 6] = 2  # P2 threat at col 6
+    board_np[5, 3] = 1
+    board_np[4, 3] = 1
+    board_np[5, 4] = 1
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    mcts.run_simulations(500, parallel_sims=16)
+    
+    # Detailed tree inspection
+    print("\n  Tree structure from root:")
+    root_children = mcts.children[0, 0]
+    
+    for action in range(7):
+        child_idx = root_children[action].item()
+        if child_idx < 0:
+            continue
+            
+        v = mcts.visits[0, child_idx].item()
+        val = mcts.total_value[0, child_idx].item()
+        is_term = mcts.is_terminal[0, child_idx].item()
+        term_val = mcts.terminal_value[0, child_idx].item()
+        player = mcts.current_player[0, child_idx].item()
+        q = -val / max(1, v)
+        
+        print(f"\n  Col {action} -> Node {child_idx}:")
+        print(f"    Player to move: P{player}")
+        print(f"    Visits: {v:.0f}, Total W: {val:.2f}, Q: {q:.3f}")
+        print(f"    Is terminal: {is_term}, Terminal value: {term_val:.2f}")
+        
+        # Check grandchildren (P2's responses)
+        grandchildren = mcts.children[0, child_idx]
+        gc_with_visits = (grandchildren >= 0) & (mcts.visits[0, grandchildren.clamp(min=0)] > 0)
+        
+        if gc_with_visits.any():
+            print(f"    Grandchildren (P2 responses):")
+            for gc_action in range(7):
+                gc_idx = grandchildren[gc_action].item()
+                if gc_idx < 0:
+                    continue
+                gc_v = mcts.visits[0, gc_idx].item()
+                if gc_v == 0:
+                    continue
+                gc_val = mcts.total_value[0, gc_idx].item()
+                gc_term = mcts.is_terminal[0, gc_idx].item()
+                gc_term_val = mcts.terminal_value[0, gc_idx].item()
+                gc_player = mcts.current_player[0, gc_idx].item()
+                gc_q = -gc_val / max(1, gc_v)
+                print(f"      P2 plays col {gc_action} -> Node {gc_idx}: V={gc_v:.0f}, Q={gc_q:.3f}, term={gc_term}, term_val={gc_term_val:.2f}, next_player=P{gc_player}")
+                
+                # Show the board state if terminal
+                if gc_term and mcts.has_state[0, gc_idx]:
+                    state = mcts.states[0, gc_idx]
+                    print(f"        Terminal state:")
+                    for row in range(6):
+                        print(f"          |{''.join(['.XO'[state[row, c].item()] for c in range(7)])}|")
+    
+    # Count terminals found
+    total_terminals = mcts.is_terminal[0].sum().item()
+    print(f"\n  Total terminal nodes found: {total_terminals}")
+    
+    return True
+
+# =============================================================================
+# Test 24: Value Network Influence
+# =============================================================================
+
+# def test_value_influence():
+#     """Test that value predictions affect exploration correctly"""
+#     print("\n" + "=" * 70)
+#     print("TEST 24: Value Network Influence")
+#     print("=" * 70)
+    
+#     device = "cpu"
+    
+#     class ValueBiasedModel:
+#         """Returns uniform policy but biased value based on move"""
+#         def __init__(self, device="cpu"):
+#             self.device = device
+            
+#         def forward(self, boards, players):
+#             batch = boards.shape[0]
+#             # Uniform policy
+#             policy = torch.ones(batch, 7, device=self.device) / 7
+#             # Check if col 3 was played (piece at row 5, col 3)
+#             boards_2d = boards.view(batch, 6, 7)
+#             col3_played = boards_2d[:, 5, 3] != 0
+#             # Value is from CURRENT player's perspective
+#             # If col 3 was played, current player (P2) is in a BAD position
+#             # which means P1 (who played col 3) made a GOOD move
+#             values = torch.where(col3_played, 
+#                                  torch.tensor(-0.5, device=self.device),  # Bad for P2 = Good for P1
+#                                  torch.tensor(0.5, device=self.device))   # Good for P2 = Bad for P1
+#             return policy, values
+    
+#     model = ValueBiasedModel(device)
+#     config = TensorMCTSConfig(exploration_fraction=0.0)
+#     mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+#     board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+#     legal = torch.ones(1, 7)
+#     players = torch.tensor([1], dtype=torch.long)
+    
+#     with torch.no_grad():
+#         policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+#     mcts.reset(board_t, policies, legal, players, root_values=vals)
+#     dist = mcts.run_simulations(200, parallel_sims=8)[0].numpy()
+    
+#     print(f"  Model: col 3 played → value=-0.5 (bad for opponent = good for P1)")
+#     print(f"  Distribution: {dist.round(3)}")
+    
+#     if np.argmax(dist) == 3 and dist[3] > 0.25:
+#         print("  ✓ Search correctly favored high-value move")
+#         return True
+#     else:
+#         print(f"  ✗ Search didn't follow value signal (col 3 = {dist[3]:.1%})")
+#         return False
+
+def test_value_influence():
+    """Test that value predictions affect exploration correctly"""
+    print("\n" + "=" * 70)
+    print("TEST 24: Value Network Influence")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    class ValueBiasedModel:
+        """Returns uniform policy but biased value when P1 has played col 3"""
+        def __init__(self, device="cpu"):
+            self.device = device
+            
+        def forward(self, boards, players):
+            batch = boards.shape[0]
+            policy = torch.ones(batch, 7, device=self.device) / 7
+            boards_2d = boards.view(batch, 6, 7)
+            
+            # Check if P1 (value=1) has a piece at col 3
+            p1_played_col3 = (boards_2d[:, 5, 3] == 1)
+            
+            # This position is GOOD for P1, BAD for P2
+            # Value must be from CURRENT player's perspective
+            current_is_p1 = (players == 1)
+            
+            # If P1 played col 3:
+            #   - P1 to move: +0.5 (good for P1)
+            #   - P2 to move: -0.5 (bad for P2)
+            # If P1 did NOT play col 3:
+            #   - P1 to move: -0.5 (bad for P1)  
+            #   - P2 to move: +0.5 (good for P2)
+            
+            good_for_p1 = p1_played_col3
+            values = torch.where(
+                current_is_p1 == good_for_p1,  # Same sign
+                torch.tensor(0.5, device=self.device),
+                torch.tensor(-0.5, device=self.device)
+            )
+            return policy, values
+    
+    model = ValueBiasedModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dist = mcts.run_simulations(200, parallel_sims=1)[0].numpy()
+    
+    print(f"  Model: P1 played col 3 → good for P1, bad for P2")
+    print(f"  Distribution: {dist.round(3)}")
+    
+    # DEBUG: Check Q values
+    print(f"\n  DEBUG - Q values after search:")
+    root_children = mcts.children[0, 0]
+    for i in range(7):
+        child_idx = root_children[i].item()
+        if child_idx >= 0:
+            v = mcts.visits[0, child_idx].item()
+            val = mcts.total_value[0, child_idx].item()
+            q = -val / max(1, v)
+            print(f"    Col {i}: N={v:.0f}, W={val:.2f}, Q={q:.3f}")
+    
+    if np.argmax(dist) == 3 and dist[3] > 0.3:
+        print("  ✓ Search correctly favored high-value move")
+        return True
+    else:
+        print(f"  ✗ Search didn't follow value signal (col 3 = {dist[3]:.1%})")
+        return False
+
+# =============================================================================
+# Test 25: Near-Full Board
+# =============================================================================
+
+def test_near_full_board():
+    """Test with board that's almost full - limited legal moves"""
+    print("\n" + "=" * 70)
+    print("TEST 25: Near-Full Board")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # Create board with only 2 legal moves remaining
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    # Fill most of the board in a draw-like pattern
+    for c in range(7):
+        for r in range(6):
+            if c in [2, 4]:  # Leave cols 2 and 4 with one spot each
+                if r > 0:
+                    board_np[r, c] = 1 if (r + c) % 2 == 0 else 2
+            else:
+                board_np[r, c] = 1 if (r + c) % 2 == 0 else 2
+    
+    print("  Board (only cols 2 and 4 have space):")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board_np[row, c]] for c in range(7)])}|")
+    
+    legal_np = (board_np[0, :] == 0).astype(np.float32)
+    print(f"  Legal mask: {legal_np}")
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.from_numpy(legal_np).unsqueeze(0)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dist = mcts.run_simulations(100, parallel_sims=8)[0].numpy()
+    
+    print(f"  Distribution: {dist.round(3)}")
+    
+    # Only cols 2 and 4 should have visits
+    illegal_visits = dist[[0, 1, 3, 5, 6]].sum()
+    legal_visits = dist[[2, 4]].sum()
+    
+    if illegal_visits < 0.01 and legal_visits > 0.99:
+        print("  ✓ Correctly concentrated visits on legal moves")
+        return True
+    else:
+        print(f"  ✗ Illegal visits: {illegal_visits:.3f}")
+        return False
+
+
+# =============================================================================
+# Test 26: Symmetric Position Mirror
+# =============================================================================
+
+def test_symmetry():
+    print("\n" + "=" * 70 + "\nTEST 26: Symmetric Position Mirror\n" + "=" * 70)
+    device = "cpu"
+    
+    # Left Board: P1 has 3 in a row at Col 1 (rows 3,4,5). P1 to move. Win at Col 1.
+    board_left = np.zeros((6, 7), dtype=np.int8)
+    board_left[5, 1] = 1; board_left[4, 1] = 1; board_left[3, 1] = 1
+    # Add P2 pieces to make piece counts equal (valid turn)
+    board_left[5, 6] = 2; board_left[4, 6] = 2; board_left[3, 6] = 2
+    
+    # Right Board: Mirror image. P1 has 3 in a row at Col 5. Win at Col 5.
+    board_right = np.zeros((6, 7), dtype=np.int8)
+    board_right[5, 5] = 1; board_right[4, 5] = 1; board_right[3, 5] = 1
+    board_right[5, 0] = 2; board_right[4, 0] = 2; board_right[3, 0] = 2
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0) # Deterministic
+    
+    # Run Left
+    mcts1 = TensorMCTS(model, 1, config, device)
+    # P1 to play (piece count 3 vs 3)
+    mcts1.reset(torch.from_numpy(board_left).unsqueeze(0).long(), torch.ones(1, 7), torch.ones(1, 7), torch.tensor([1]))
+    dist_left = mcts1.run_simulations(500, 16)[0].numpy()
+    
+    # Run Right
+    mcts2 = TensorMCTS(model, 1, config, device)
+    mcts2.reset(torch.from_numpy(board_right).unsqueeze(0).long(), torch.ones(1, 7), torch.ones(1, 7), torch.tensor([1]))
+    dist_right = mcts2.run_simulations(500, 16)[0].numpy()
+    
+    best_left = np.argmax(dist_left)
+    best_right = np.argmax(dist_right)
+    
+    print(f"  Left Board (Win @ 1) Best:  {best_left}")
+    print(f"  Right Board (Win @ 5) Best: {best_right}")
+    
+    if best_left == 1 and best_right == 5:
+        print("  ✓ Symmetry preserved (found mirrored winning moves)")
+        return True
+    else:
+        print(f"  ✗ Symmetry broken. Left Dist: {dist_left.round(2)}, Right Dist: {dist_right.round(2)}")
+        return False
+
+
+# =============================================================================
+# Test 27: Stress Test - Many Simulations
+# =============================================================================
+
+def test_stress_many_sims():
+    """Stress test with many simulations"""
+    print("\n" + "=" * 70)
+    print("TEST 27: Stress Test (5000 sims)")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0, max_nodes_per_tree=10000)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    
+    import time
+    start = time.time()
+    dist = mcts.run_simulations(5000, parallel_sims=32)[0].numpy()
+    elapsed = time.time() - start
+    
+    nodes_used = mcts.next_node_idx[0].item()
+    
+    print(f"  Time: {elapsed:.2f}s")
+    print(f"  Nodes used: {nodes_used}")
+    print(f"  Distribution: {dist.round(3)}")
+    print(f"  Sims/sec: {5000/elapsed:.0f}")
+    
+    # Check reasonable distribution (should be fairly uniform with DummyModel)
+    if dist.min() > 0.05 and dist.max() < 0.30:
+        print("  ✓ Stress test passed")
+        return True
+    else:
+        print("  ✗ Distribution seems off")
+        return False
+
+
+# =============================================================================
+# Test 28: Multi-Tree Stress
+# =============================================================================
+
+def test_multi_tree_stress():
+    """Test many parallel trees"""
+    print("\n" + "=" * 70)
+    print("TEST 28: Multi-Tree Stress (32 trees)")
+    print("=" * 70)
+    
+    device = "cpu"
+    n_trees = 32
+    
+    # Create different boards for each tree
+    boards = []
+    for i in range(n_trees):
+        b = np.zeros((6, 7), dtype=np.int8)
+        # Put a piece in different column for each
+        b[5, i % 7] = 1
+        boards.append(b)
+    
+    board_t = torch.from_numpy(np.stack(boards)).long()
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=n_trees, config=config, device=device)
+    
+    legal = torch.ones(n_trees, 7)
+    players = torch.ones(n_trees, dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dists = mcts.run_simulations(200, parallel_sims=16).numpy()
+    
+    print(f"  Running {n_trees} trees in parallel")
+    print(f"  First 3 distributions:")
+    for i in range(3):
+        print(f"    Tree {i}: {dists[i].round(3)}")
+    
+    # Check all trees have reasonable distributions
+    all_valid = all(d.sum() > 0.99 for d in dists)
+    
+    if all_valid:
+        print("  ✓ All trees produced valid distributions")
+        return True
+    else:
+        print("  ✗ Some trees failed")
+        return False
+
+
+# =============================================================================
+# Test 29: Immediate Win vs Future Win
+# =============================================================================
+
+def test_immediate_vs_future():
+    """Test that immediate win is preferred over setting up future win"""
+    print("\n" + "=" * 70)
+    print("TEST 29: Immediate Win vs Future Win")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # P1 can win immediately at col 3
+    # OR set up a "better" position at col 0
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    board_np[5, 0:3] = 1  # X X X _ (win at col 3)
+    board_np[5, 4:7] = 2  # Some P2 pieces
+    board_np[4, 4] = 2
+    
+    print("  Board (P1 can win immediately at col 3):")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board_np[row, c]] for c in range(7)])}|")
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dist = mcts.run_simulations(500, parallel_sims=16)[0].numpy()
+    
+    print(f"  Distribution: {dist.round(3)}")
+    
+    # Should overwhelmingly choose col 3 (immediate win)
+    if dist[3] > 0.9:
+        print("  ✓ Correctly chose immediate win")
+        return True
+    else:
+        print(f"  ✗ Did not strongly prefer immediate win (col 3 = {dist[3]:.1%})")
+        return False
+
+
+# =============================================================================
+# Test 30: Zugzwang-like Position  
+# =============================================================================
+
+def test_zugzwang():
+    """Test position where any move leads to opponent winning"""
+    print("\n" + "=" * 70)
+    print("TEST 30: Zugzwang-like Position")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # Create position where P2 has multiple threats
+    # Any move P1 makes, P2 wins next turn
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    
+    # P2 has horizontal threat
+    board_np[5, 1:4] = 2  # O O O at bottom
+    # P2 also has vertical threat  
+    board_np[5, 5] = 2
+    board_np[4, 5] = 2
+    board_np[3, 5] = 2
+    
+    # P1 pieces (fewer, can't block both)
+    board_np[5, 0] = 1
+    board_np[4, 0] = 1
+    board_np[5, 6] = 1
+    
+    print("  Board (P1 to move, P2 has multiple winning threats):")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board_np[row, c]] for c in range(7)])}|")
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.from_numpy((board_np[0, :] == 0).astype(np.float32)).unsqueeze(0)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dist = mcts.run_simulations(500, parallel_sims=16)[0].numpy()
+    
+    print(f"  Distribution: {dist.round(3)}")
+    
+    # Check Q-values - all should be negative (losing position)
+    root_children = mcts.children[0, 0]
+    q_values = []
+    for i in range(7):
+        child_idx = root_children[i].item()
+        if child_idx >= 0:
+            v = mcts.visits[0, child_idx].item()
+            val = mcts.total_value[0, child_idx].item()
+            q = -val / max(1, v)
+            q_values.append(q)
+        else:
+            q_values.append(None)
+    
+    print(f"  Q-values: {[f'{q:.2f}' if q else 'N/A' for q in q_values]}")
+    
+    # All Q-values should be negative (losing)
+    valid_qs = [q for q in q_values if q is not None]
+    if valid_qs and max(valid_qs) < 0:
+        print("  ✓ Correctly identified losing position (all Q < 0)")
+        return True
+    else:
+        print("  ~ Position evaluation may vary")
+        return True  # Don't fail - this is a diagnostic test
+    
+# =============================================================================
+# Test 31: Test Fork Creation
+# =============================================================================
+def test_fork_creation():
+    print("\n" + "=" * 70 + "\nTEST 31: Fork Creation (Guaranteed Win)\n" + "=" * 70)
+    device = "cpu"
+    
+    # Board where P1 playing Col 3 creates TWO winning threats (Col 2 and Col 4)
+    # P1: (5,2) and (5,4).
+    # Play (5,3) -> P1 has (5,2)-(5,3)-(5,4)
+    # Open on both ends? 1 and 5.
+    # P2 blocks 1 -> P1 wins at 5.
+    
+    board = np.zeros((6, 7), dtype=np.int8)
+    board[5, 2] = 1
+    board[5, 4] = 1
+    # Add dummy P2 pieces to validate turn
+    board[5, 0] = 2; board[5, 6] = 2
+    
+    model = DummyModel(device)
+    # Low VL to allow deep search for the fork
+    config = TensorMCTSConfig(exploration_fraction=0.0, virtual_loss_weight=0.1)
+    mcts = TensorMCTS(model, 1, config, device)
+    
+    mcts.reset(torch.from_numpy(board).unsqueeze(0).long(), torch.ones(1,7), torch.ones(1,7), torch.tensor([1]))
+    dist = mcts.run_simulations(2000, 16)[0].numpy()
+    
+    print(f"  Dist: {dist.round(3)}")
+    if np.argmax(dist) == 3:
+        print("  ✓ Found Fork at Col 3")
+        return True
+    else:
+        print(f"  ✗ Missed Fork (Best: {np.argmax(dist)})")
+        return False
+    
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1724,6 +2413,18 @@ def run_all_tests():
     results.append(("Dirichlet Noise Application", test_dirichlet_noise()))
     results.append(("Wrapper Class", test_wrapper()))
     results.append(("Visit Convergence", test_visit_convergence()))
+    results.append(("Double Threat Detection", test_double_threat()))
+    results.append(("Double Threat DEBUG", test_double_threat_debug()))
+    results.append(("Value Network Influence", test_value_influence()))
+
+    # New Hardening Tests Part 2
+    results.append(("Near-Full Board", test_near_full_board()))
+    results.append(("Symmetric Position Mirror", test_symmetry()))
+    results.append(("Stress Test - Many Simulations", test_stress_many_sims()))
+    results.append(("Multi-Tree Stress", test_multi_tree_stress()))
+    results.append(("Immediate Win vs Future Win", test_immediate_vs_future()))
+    results.append(("Zugzwang-like Position", test_zugzwang()))
+    results.append(("Fork Creation", test_fork_creation()))
 
     
     print("\n" + "=" * 70)

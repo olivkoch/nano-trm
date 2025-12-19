@@ -435,7 +435,7 @@ class C4BaseModule(LightningModule):
                 self.previous_model = self.best_player
                 win_rate, _, _ = self.evaluate(
                     opponent='previous',
-                    n_games=100,
+                    n_games=400,
                     use_mcts=True,
                     mcts_simulations=self.hparams.selfplay_eval_mcts_simulations,
                     mcts_parallel_simulations=self.hparams.selfplay_parallel_simulations,
@@ -530,6 +530,7 @@ class C4BaseModule(LightningModule):
         if use_mcts:
             model_mcts = TensorMCTSWrapper(
                 model=MCTSModelWrapper(self),
+                c_puct_base=1000, # explore more than AlphaGo Zero
                 num_simulations=mcts_simulations,
                 parallel_simulations=mcts_parallel_simulations,
                 device=self.device
@@ -825,7 +826,7 @@ class C4BaseModule(LightningModule):
                 log.info(f"Creating MCTS with {self.hparams.selfplay_parallel_simulations} parallel sims, {self.hparams.selfplay_mcts_simulations} sims/move")
                 self.mcts = TensorMCTSWrapper(
                     model=MCTSModelWrapper(self),
-                    c_puct=0.5,
+                    c_puct_init=0.5,
                     num_simulations=self.hparams.selfplay_mcts_simulations,
                     parallel_simulations=self.hparams.selfplay_parallel_simulations,
                     virtual_loss_value=3.0,

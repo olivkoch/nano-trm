@@ -6,11 +6,11 @@ metric:
 
 parameters:
   model_tuning.N_supervision:
-    values: [2, 4, 8]
+    values: [4, 8, 12]
   model_tuning.H_cycles:
-    values: [2, 3, 4]
+    values: [3, 5, 7]
   model_tuning.L_cycles:
-    values: [2, 3, 4]
+    values: [3, 5, 7]
   model_tuning.hidden_size:
     values: [4, 16, 32, 64]
   model_tuning.num_layers:

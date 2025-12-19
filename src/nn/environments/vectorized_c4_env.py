@@ -1,15 +1,27 @@
 """
-Vectorized Connect Four Environment with proper token encoding
-Uses constants from src.nn.utils.constants
+Connect Four Environments
+
+Contains:
+- VectorizedConnectFour: Batch environment for parallel game execution (torch-based)
+- ConnectFourEnv: Single-game environment compatible with BoardGameEnv/mcts_v2.py (numpy-based)
+
+Uses constants from src.nn.utils.constants for token encoding.
 """
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 from typing import Tuple, Optional
 from dataclasses import dataclass
+from collections import deque
+from copy import copy
 
 from src.nn.utils.constants import C4_EMPTY_CELL, C4_PLAYER1_CELL, C4_PLAYER2_CELL
 
+
+# =============================================================================
+# Vectorized Environment for Batch Operations (torch-based)
+# =============================================================================
 
 @dataclass
 class VectorizedC4State:
@@ -231,3 +243,75 @@ class VectorizedConnectFour:
     def initialize(self, flat_boards: torch.Tensor, current_players: torch.Tensor):
         self.current_players = current_players
         self.boards = flat_boards.reshape(self.n_envs, self.rows, self.cols)
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def create_board_from_string(board_str: str) -> np.ndarray:
+    """
+    Create a board from a string representation.
+    
+    Example:
+        board_str = '''
+        .......
+        .......
+        .......
+        .......
+        ....X..
+        XXX.OO.
+        '''
+    
+    Returns:
+        6x7 numpy array with 0=empty, 1=X, 2=O
+    """
+    lines = [line.strip() for line in board_str.strip().split('\n') if line.strip()]
+    board = np.zeros((6, 7), dtype=np.int8)
+    
+    for row, line in enumerate(lines):
+        for col, char in enumerate(line):
+            if char == 'X':
+                board[row, col] = 1
+            elif char == 'O':
+                board[row, col] = 2
+    
+    return board
+
+
+def create_vectorized_board_from_string(board_str: str, device: str = "cpu") -> torch.Tensor:
+    """
+    Create a board tensor using C4 token encoding from a string.
+    
+    Returns:
+        6x7 torch tensor with C4_EMPTY_CELL, C4_PLAYER1_CELL, C4_PLAYER2_CELL
+    """
+    lines = [line.strip() for line in board_str.strip().split('\n') if line.strip()]
+    board = torch.full((6, 7), C4_EMPTY_CELL, dtype=torch.int32, device=device)
+    
+    for row, line in enumerate(lines):
+        for col, char in enumerate(line):
+            if char == 'X':
+                board[row, col] = C4_PLAYER1_CELL
+            elif char == 'O':
+                board[row, col] = C4_PLAYER2_CELL
+    
+    return board
+
+
+if __name__ == "__main__":
+    
+    print("\n" + "=" * 60)
+    print("Testing VectorizedConnectFour")  
+    print("=" * 60)
+    
+    vec_env = VectorizedConnectFour(n_envs=2)
+    print(vec_env.render(0))
+    print(vec_env.render(1))
+    
+    # Make different moves in each env
+    actions = torch.tensor([3, 0])
+    state = vec_env.step(actions)
+    print("After moves [3, 0]:")
+    print(vec_env.render(0))
+    print(vec_env.render(1))

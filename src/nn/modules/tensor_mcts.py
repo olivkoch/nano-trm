@@ -52,20 +52,21 @@ class TensorMCTS:
         max_nodes = self.config.max_nodes_per_tree
         n_actions = self.config.n_actions
         
-        self.visits = torch.zeros(n, max_nodes, device=self.device)
-        self.total_value = torch.zeros(n, max_nodes, device=self.device)
-        self.virtual_loss = torch.zeros(n, max_nodes, device=self.device)
-        self.priors = torch.zeros(n, max_nodes, n_actions, device=self.device)
-        self.children = torch.full((n, max_nodes, n_actions), -1, dtype=torch.long, device=self.device)
-        self.parent = torch.full((n, max_nodes), -1, dtype=torch.long, device=self.device)
-        self.parent_action = torch.full((n, max_nodes), -1, dtype=torch.long, device=self.device)
-        self.states = torch.zeros(n, max_nodes, 6, 7, dtype=torch.long, device=self.device)
-        self.has_state = torch.zeros(n, max_nodes, dtype=torch.bool, device=self.device)
-        self.current_player = torch.zeros(n, max_nodes, dtype=torch.long, device=self.device)
-        self.is_terminal = torch.zeros(n, max_nodes, dtype=torch.bool, device=self.device)
-        self.terminal_value = torch.zeros(n, max_nodes, device=self.device)
-        self.next_node_idx = torch.ones(n, dtype=torch.long, device=self.device)
-        self.batch_idx = torch.arange(n, device=self.device)
+        with torch.no_grad():
+            self.visits = torch.zeros(n, max_nodes, device=self.device)
+            self.total_value = torch.zeros(n, max_nodes, device=self.device)
+            self.virtual_loss = torch.zeros(n, max_nodes, device=self.device)
+            self.priors = torch.zeros(n, max_nodes, n_actions, device=self.device)
+            self.children = torch.full((n, max_nodes, n_actions), -1, dtype=torch.long, device=self.device)
+            self.parent = torch.full((n, max_nodes), -1, dtype=torch.long, device=self.device)
+            self.parent_action = torch.full((n, max_nodes), -1, dtype=torch.long, device=self.device)
+            self.states = torch.zeros(n, max_nodes, 6, 7, dtype=torch.long, device=self.device)
+            self.has_state = torch.zeros(n, max_nodes, dtype=torch.bool, device=self.device)
+            self.current_player = torch.zeros(n, max_nodes, dtype=torch.long, device=self.device)
+            self.is_terminal = torch.zeros(n, max_nodes, dtype=torch.bool, device=self.device)
+            self.terminal_value = torch.zeros(n, max_nodes, device=self.device)
+            self.next_node_idx = torch.ones(n, dtype=torch.long, device=self.device)
+            self.batch_idx = torch.arange(n, device=self.device)
     
     def reset(self, root_states: torch.Tensor, root_policies: torch.Tensor, 
               legal_masks: torch.Tensor, root_players: torch.Tensor,
@@ -91,9 +92,9 @@ class TensorMCTS:
         
         if root_values is not None:
             self.visits[:, 0] = 1
-            self.total_value[:, 0] = root_values.squeeze()
+            self.total_value[:, 0] = root_values.detach().squeeze() # avoid mem leak
         
-        masked_policy = root_policies * legal_masks.float()
+        masked_policy = root_policies.detach() * legal_masks.float() # avoid mem leak
         masked_policy = masked_policy / (masked_policy.sum(dim=1, keepdim=True) + 1e-8)
         
         if self.config.exploration_fraction > 0:
@@ -115,11 +116,21 @@ class TensorMCTS:
             is_legal = legal_masks.bool()[:, action]
             child_idx = self.next_node_idx.clone()
             
-            self.children[:, 0, action] = torch.where(is_legal, child_idx, torch.full_like(child_idx, -1))
-            self.parent[self.batch_idx, child_idx] = torch.where(is_legal, torch.zeros_like(child_idx), self.parent[self.batch_idx, child_idx])
-            self.parent_action[self.batch_idx, child_idx] = torch.where(is_legal, torch.full_like(child_idx, action), self.parent_action[self.batch_idx, child_idx])
-            self.current_player[self.batch_idx, child_idx] = torch.where(is_legal, child_player, self.current_player[self.batch_idx, child_idx])
-            self.next_node_idx += is_legal.long()
+            # Check capacity before expanding
+            has_space = child_idx < self.config.max_nodes_per_tree
+            can_expand = is_legal & has_space
+
+            self.children[:, 0, action] = torch.where(can_expand, child_idx, torch.full_like(child_idx, -1))
+        
+            # Only update nodes that have space
+            if can_expand.any():
+                expand_idx = self.batch_idx[can_expand]
+                expand_child = child_idx[can_expand]
+                self.parent[expand_idx, expand_child] = 0
+                self.parent_action[expand_idx, expand_child] = action
+                self.current_player[expand_idx, expand_child] = child_player[can_expand]
+                    
+            self.next_node_idx += can_expand.long()
     
     def _compute_pb_c(self, parent_visits: torch.Tensor) -> torch.Tensor:
         base = self.config.c_puct_base
@@ -334,8 +345,8 @@ class TensorMCTS:
             if non_term.any():
                 with torch.no_grad():
                     policies, values = self.model.forward(eval_states[non_term].flatten(start_dim=1).float(), eval_players[non_term])
-                    policies = policies.float()
-                    values = values.float()
+                    policies = policies.detach().float() # avoid mem leak
+                    values = values.detach().float() # avoid mem leak
                 nn_values[non_term] = values.squeeze(-1) if values.dim() > 1 else values
                 nn_policies[non_term] = policies
             

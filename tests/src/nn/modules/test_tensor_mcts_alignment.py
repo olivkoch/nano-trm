@@ -559,9 +559,10 @@ def test_visit_convergence():
         # Allow some difference due to implementation details
         if max_diff > 0.15:
             print(f"    ✗ Distributions differ significantly!")
+            return False
         else:
             print(f"    ✓ Distributions reasonably similar")
-
+    return True
 
 # =============================================================================
 # Test 7: Virtual Loss Effect
@@ -1015,6 +1016,666 @@ def test_forced_mate_depth():
     else:
         print("  ✗ FAILED: tensor_mcts Q-values did not identify the forced block")
         return False
+
+# =============================================================================
+# Test 14: Prior Probability Influence
+# =============================================================================
+
+def test_prior_influence():
+    """Test that high-probability moves get explored more (U-term works)"""
+    print("\n" + "=" * 70)
+    print("TEST 14: Prior Probability Influence")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # Setup: Empty board
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    
+    # Model: Biased towards Col 3 (0.9 prob), others low
+    # Value is 0.0 everywhere.
+    # Therefore, search should favor Col 3 purely due to the 'U' term.
+    favored_col = 3
+    model = BiasedModel(favored_col, device=device)
+    
+    config = TensorMCTSConfig(
+        c_puct_base=19652.0,
+        c_puct_init=1.25,
+        exploration_fraction=0.0, # Disable noise to isolate prior influence
+        virtual_loss_weight=1.0
+    )
+    
+    # --- Run tensor_mcts ---
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+        
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    
+    # Run enough sims to see the distribution difference
+    dists = mcts.run_simulations(200, parallel_sims=16).numpy()[0]
+    
+    print(f"  Model favors Col {favored_col} (50% mass)")
+    print(f"  Visit Distribution: {dists.round(3)}")
+    
+    most_visited = np.argmax(dists)
+    
+    if most_visited == favored_col and dists[favored_col] > 0.3:
+        print("  ✓ Search correctly followed the high-probability prior")
+        return True
+    else:
+        print(f"  ✗ FAILED: Search ignored the prior (Winner: {most_visited})")
+        return False
+
+# =============================================================================
+# Test 15: Temperature Scaling
+# =============================================================================
+
+def test_temperature_scaling():
+    """Test that temperature parameter correctly shapes the output distribution"""
+    print("\n" + "=" * 70)
+    print("TEST 15: Temperature Scaling")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # We don't need to run simulations, just checking the formula in get_action_probs
+    # Setup a fake mcts state manually
+    mcts = TensorMCTS(DummyModel(), n_trees=1, config=TensorMCTSConfig(), device=device)
+    
+    # Manually inject visits into root children
+    # Root is index 0. Children of root are indices 1..7 (if we pretend)
+    # But get_action_probs reads mcts.visits using mcts.children
+    
+    # 1. Setup Children
+    mcts.children[0, 0, :] = torch.arange(1, 8) # Indices 1 to 7
+    
+    # 2. Setup Visits for those children
+    # A clear distribution: [10, 20, 30, 100, 5, 5, 5]
+    raw_visits = torch.tensor([10., 20., 30., 100., 5., 5., 5.])
+    
+    # We need to set these in the global visits tensor at the correct indices
+    # We are batch 0.
+    for i in range(7):
+        child_idx = i + 1
+        mcts.visits[0, child_idx] = raw_visits[i]
+        
+    # --- Check Temp = 1.0 (Linear) ---
+    probs_1 = mcts.get_action_probs(temperature=1.0)[0]
+    expected_1 = raw_visits / raw_visits.sum()
+    diff_1 = torch.abs(probs_1 - expected_1).max().item()
+    
+    print(f"  Visits: {raw_visits.tolist()}")
+    print(f"  Temp 1.0 Probs: {probs_1.numpy().round(3)}")
+    
+    if diff_1 > 1e-4:
+        print("  ✗ FAILED Temp 1.0")
+        return False
+        
+    # --- Check Temp -> 0 (Argmax) ---
+    probs_0 = mcts.get_action_probs(temperature=0.01)[0] # effectively 0
+    # Should be 1.0 at index 3 (visits=100)
+    print(f"  Temp 0.0 Probs: {probs_0.numpy().round(3)}")
+    
+    if probs_0[3] < 0.95:
+        print("  ✗ FAILED Temp 0.0 (Argmax)")
+        return False
+
+    # --- Check Temp = 0 (Strict Argmax logic) ---
+    probs_strict_0 = mcts.get_action_probs(temperature=0)[0]
+    if probs_strict_0[3] != 1.0:
+        print("  ✗ FAILED Temp 0 (Strict Argmax)")
+        return False
+
+    print("  ✓ Temperature scaling works correctly")
+    return True
+
+# =============================================================================
+# Test 16: Deterministic Consistency
+# =============================================================================
+
+def test_determinism():
+    """Test that running the same search twice produces identical results"""
+    print("\n" + "=" * 70)
+    print("TEST 16: Deterministic Consistency")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0) # No noise
+    
+    # Run 1
+    mcts1 = TensorMCTS(model, n_trees=1, config=config, device=device)
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts1.reset(board_t, policies, legal, players, root_values=vals)
+    # Use parallel sims to trigger potential race conditions if any existed
+    dist1 = mcts1.run_simulations(200, parallel_sims=16).numpy()[0]
+    
+    # Run 2
+    mcts2 = TensorMCTS(model, n_trees=1, config=config, device=device)
+    mcts2.reset(board_t, policies, legal, players, root_values=vals)
+    dist2 = mcts2.run_simulations(200, parallel_sims=16).numpy()[0]
+    
+    diff = np.abs(dist1 - dist2).max()
+    print(f"  Run 1: {dist1.round(3)}")
+    print(f"  Run 2: {dist2.round(3)}")
+    print(f"  Max Diff: {diff}")
+    
+    if diff == 0.0:
+        print("  ✓ Results are deterministic")
+        return True
+    else:
+        print("  ✗ FAILED: Results differ (Race condition or unseeded RNG?)")
+        return False
+
+# =============================================================================
+# Test 17: Dirichlet Noise Application
+# =============================================================================
+
+def test_dirichlet_noise():
+    """Test that Dirichlet noise is correctly applied to root priors"""
+    print("\n" + "=" * 70)
+    print("TEST 17: Dirichlet Noise Application")
+    print("=" * 70)
+    
+    device = "cpu"
+    # Uniform model
+    model = DummyModel(device)
+    
+    # Config with 50% noise
+    config = TensorMCTSConfig(
+        exploration_fraction=0.5,
+        dirichlet_alpha=1.0 # Flat noise for easier checking
+    )
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    # Setup
+    board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    # 1. Run Reset
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    
+    # 2. Inspect Root Priors
+    # Model gave uniform (0.142...). Noise is random.
+    # New Prior = 0.5 * 0.142 + 0.5 * Noise
+    priors = mcts.priors[0, 0].numpy()
+    
+    print(f"  Original Policy: {[0.14]*7}")
+    print(f"  Noised Priors:   {priors.round(3)}")
+    
+    # Check that they sum to 1
+    sum_p = priors.sum()
+    # Check that they are NOT uniform anymore
+    std_p = priors.std()
+    
+    if abs(sum_p - 1.0) < 1e-4 and std_p > 0.01:
+        print("  ✓ Noise successfully perturbed priors")
+        return True
+    else:
+        print(f"  ✗ FAILED: Priors look static or invalid (Sum={sum_p:.2f}, Std={std_p:.4f})")
+        return False
+    
+# =============================================================================
+# Test 18: Gradient Detachment (Memory Safety)
+# =============================================================================
+
+def test_gradient_detachment():
+    """Ensure MCTS detaches tensors to prevent memory leaks during training"""
+    print("\n" + "=" * 70)
+    print("TEST 18: Gradient Detachment")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # 1. Create a "Live" model that outputs gradients
+    class GradModel:
+        def __init__(self):
+            self.weights = torch.randn(42, 7, requires_grad=True)
+            
+        def forward(self, x, p):
+            # Fake forward pass
+            batch = x.shape[0]
+            # Output must have grad_fn
+            pol = torch.softmax(torch.randn(batch, 7, requires_grad=True), dim=1)
+            val = torch.tanh(torch.randn(batch, requires_grad=True))
+            return pol, val
+
+    model = GradModel()
+    mcts = TensorMCTS(model, n_trees=1, config=TensorMCTSConfig(), device=device)
+    
+    board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    # 2. Run simulation cycle
+    # We DO NOT use torch.no_grad() here to simulate training loop
+    policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    # Check inputs have grad
+    if not policies.requires_grad or not vals.requires_grad:
+        print("  ! Setup Error: Model outputs missing gradients")
+        return False
+        
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    mcts.run_simulations(10, parallel_sims=1)
+    
+    # 3. Check MCTS internal storage
+    # The stored values MUST NOT have grad
+    stored_priors_grad = mcts.priors.requires_grad
+    stored_values_grad = mcts.total_value.requires_grad
+    
+    print(f"  Input Policy Grad: {policies.requires_grad}")
+    print(f"  Stored Prior Grad: {stored_priors_grad}")
+    print(f"  Stored Value Grad: {stored_values_grad}")
+    
+    if not stored_priors_grad and not stored_values_grad:
+        print("  ✓ Tensors correctly detached (Safe from memory leaks)")
+        return True
+    else:
+        print("  ✗ FAILED: MCTS is storing computation graphs! (Memory Leak)")
+        return False
+    
+# =============================================================================
+# Test 19: Tree Capacity Handling
+# =============================================================================
+
+def test_capacity_overflow():
+    """Test behavior when max_nodes_per_tree is exceeded"""
+    print("\n" + "=" * 70)
+    print("TEST 19: Tree Capacity Overflow")
+    print("=" * 70)
+    
+    device = "cpu"
+    # Set tiny capacity: Root (1) + 7 children = 8 nodes needed.
+    # We set capacity to 5.
+    config = TensorMCTSConfig(max_nodes_per_tree=5) 
+    mcts = TensorMCTS(DummyModel(), n_trees=1, config=config, device=device)
+    
+    board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = DummyModel().forward(board_t.flatten(1).float(), players)
+    
+    print("  Initializing with Capacity=5 (Needs 8 for full root expansion)")
+    try:
+        # This will attempt to expand root. 
+        # _expand_roots checks `next_node_idx`.
+        # It should fill up to 5 and stop silently.
+        mcts.reset(board_t, policies, legal, players, root_values=vals)
+        
+        # Check utilization
+        used = mcts.next_node_idx[0].item()
+        print(f"  Nodes used: {used}/5")
+        
+        # Check children pointers
+        children = mcts.children[0, 0]
+        valid_children = (children != -1).sum().item()
+        print(f"  Valid children created: {valid_children}/7")
+        
+        if used <= 5 and valid_children < 7:
+            print("  ✓ Gracefully handled overflow (stopped expanding)")
+            return True
+        elif used > 5:
+            print(f"  ✗ FAILED: Buffer overflow! Used {used} indices")
+            return False
+        else:
+            # If it somehow created all 7 children with 5 slots??
+            print(f"  ? Unexpected state: {valid_children} children in {used} slots")
+            return False
+            
+    except Exception as e:
+        print(f"  ✗ FAILED: Crashed with error: {e}")
+        return False
+    
+# =============================================================================
+# Test 17: Deep Tree Traversal
+# =============================================================================
+
+def test_deep_traversal():
+    """Test that paths go multiple levels deep correctly"""
+    print("\n" + "=" * 70)
+    print("TEST 17: Deep Tree Traversal")
+    print("=" * 70)
+    
+    device = "cpu"
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    mcts.run_simulations(500, parallel_sims=1)  # Sequential to build deep tree
+    
+    # Check max depth reached
+    max_depth_found = 0
+    for node_idx in range(mcts.next_node_idx[0].item()):
+        if mcts.has_state[0, node_idx]:
+            # Trace back to root
+            depth = 0
+            current = node_idx
+            while current != 0 and depth < 50:
+                current = mcts.parent[0, current].item()
+                depth += 1
+            max_depth_found = max(max_depth_found, depth)
+    
+    print(f"  Nodes allocated: {mcts.next_node_idx[0].item()}")
+    print(f"  Max depth found: {max_depth_found}")
+    
+    if max_depth_found >= 4:
+        print("  ✓ Tree reached reasonable depth")
+        return True
+    else:
+        print("  ✗ Tree too shallow")
+        return False
+
+
+# =============================================================================
+# Test 18: Node Capacity Limit
+# =============================================================================
+
+def test_node_capacity():
+    """Test behavior when max_nodes is reached"""
+    print("\n" + "=" * 70)
+    print("TEST 18: Node Capacity Limit")
+    print("=" * 70)
+    
+    device = "cpu"
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    model = DummyModel(device)
+    
+    # Very small capacity
+    config = TensorMCTSConfig(
+        max_nodes_per_tree=50,  # Very limited
+        exploration_fraction=0.0
+    )
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    
+    # Run many sims - should not crash
+    try:
+        mcts.run_simulations(200, parallel_sims=8)
+        dist = mcts._get_visit_distributions()[0].numpy()
+        print(f"  Nodes used: {mcts.next_node_idx[0].item()} / {config.max_nodes_per_tree}")
+        print(f"  Distribution: {dist.round(3)}")
+        print("  ✓ Handled capacity limit gracefully")
+        return True
+    except Exception as e:
+        print(f"  ✗ Crashed: {e}")
+        return False
+
+
+# =============================================================================
+# Test 19: All Children Terminal
+# =============================================================================
+
+def test_all_children_terminal():
+    """Test when every immediate move ends the game"""
+    print("\n" + "=" * 70)
+    print("TEST 19: All Children Terminal")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # Create position where P1 has 3-in-row in EVERY column except one full
+    # This is tricky - let's do: P1 wins at col 3, P2 wins at col 0
+    # Near-endgame chaos
+    
+    # Simpler: board where only 1 column is playable and it's a win
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    # Fill all columns except col 3
+    for c in range(7):
+        if c != 3:
+            board_np[:, c] = 1  # All full
+    # P1 has 3 in row at bottom
+    board_np[5, 0:3] = 1
+    board_np[:, 0:3] = 0  # Clear those cols
+    board_np[5, 0:3] = 1  # Put back P1's pieces
+    
+    # Actually, let's simplify: one move available, it wins
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    board_np[5, 0] = 1
+    board_np[5, 1] = 1  
+    board_np[5, 2] = 1
+    # Col 3 wins for P1. Make other cols full.
+    for c in [4, 5, 6]:
+        board_np[:, c] = 2
+    for c in [0, 1, 2]:
+        board_np[0:5, c] = 2  # Leave bottom row
+        
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.from_numpy((board_np[0, :] == 0).astype(np.float32)).unsqueeze(0)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    print(f"  Legal moves: {legal[0].numpy()}")
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dist = mcts.run_simulations(50, parallel_sims=8)[0].numpy()
+    
+    print(f"  Distribution: {dist.round(3)}")
+    
+    # Should strongly favor col 3 (the winning move)
+    if np.argmax(dist) == 3:
+        print("  ✓ Found the only winning move")
+        return True
+    else:
+        print("  ✗ Missed the winning move")
+        return False
+
+
+# =============================================================================
+# Test 20: State Materialization Correctness
+# =============================================================================
+
+def test_state_materialization():
+    """Verify board states are built correctly at depth"""
+    print("\n" + "=" * 70)
+    print("TEST 20: State Materialization Correctness")
+    print("=" * 70)
+    
+    device = "cpu"
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    mcts.run_simulations(100, parallel_sims=1)
+    
+    # Check a few nodes: count pieces should match depth
+    errors = 0
+    for node_idx in range(1, min(20, mcts.next_node_idx[0].item())):
+        if not mcts.has_state[0, node_idx]:
+            continue
+            
+        state = mcts.states[0, node_idx]
+        pieces = (state != 0).sum().item()
+        
+        # Trace depth
+        depth = 0
+        current = node_idx
+        while current != 0 and depth < 50:
+            current = mcts.parent[0, current].item()
+            depth += 1
+        
+        if pieces != depth:
+            print(f"  Node {node_idx}: depth={depth}, pieces={pieces} - MISMATCH")
+            errors += 1
+    
+    if errors == 0:
+        print(f"  ✓ All materialized states have correct piece counts")
+        return True
+    else:
+        print(f"  ✗ {errors} nodes with wrong piece counts")
+        return False
+
+
+# =============================================================================
+# Test 21: Dirichlet Noise Application
+# =============================================================================
+
+def test_dirichlet_noise():
+    """Test that exploration noise is applied correctly"""
+    print("\n" + "=" * 70)
+    print("TEST 21: Dirichlet Noise Application")
+    print("=" * 70)
+    
+    device = "cpu"
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    
+    # Model with very peaked policy (99% on col 3)
+    class PeakedModel:
+        def __init__(self): self.device = "cpu"
+        def forward(self, boards, players):
+            b = boards.shape[0]
+            p = torch.zeros(b, 7)
+            p[:, 3] = 0.99
+            p[:, 0] = 0.01
+            return p, torch.zeros(b)
+    
+    model = PeakedModel()
+    
+    # With noise
+    config_noise = TensorMCTSConfig(
+        exploration_fraction=0.25,
+        dirichlet_alpha=0.3
+    )
+    
+    # Without noise
+    config_no_noise = TensorMCTSConfig(
+        exploration_fraction=0.0
+    )
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    # Get priors with noise
+    mcts_noise = TensorMCTS(model, n_trees=1, config=config_noise, device=device)
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    mcts_noise.reset(board_t, policies, legal, players, root_values=vals)
+    priors_with_noise = mcts_noise.priors[0, 0].numpy()
+    
+    # Get priors without noise
+    mcts_no_noise = TensorMCTS(model, n_trees=1, config=config_no_noise, device=device)
+    mcts_no_noise.reset(board_t, policies, legal, players, root_values=vals)
+    priors_no_noise = mcts_no_noise.priors[0, 0].numpy()
+    
+    print(f"  Original policy: [0.01, 0, 0, 0.99, 0, 0, 0]")
+    print(f"  Priors (no noise): {priors_no_noise.round(3)}")
+    print(f"  Priors (with noise): {priors_with_noise.round(3)}")
+    
+    # With noise, other columns should have more mass
+    other_cols_no_noise = priors_no_noise[[1,2,4,5,6]].sum()
+    other_cols_with_noise = priors_with_noise[[1,2,4,5,6]].sum()
+    
+    if other_cols_with_noise > other_cols_no_noise + 0.05:
+        print("  ✓ Dirichlet noise spread probability to other actions")
+        return True
+    else:
+        print("  ✗ Noise didn't spread probability enough")
+        return False
+
+
+# =============================================================================
+# Test 22: Wrapper Class
+# =============================================================================
+
+def test_wrapper():
+    """Test TensorMCTSWrapper convenience class"""
+    print("\n" + "=" * 70)
+    print("TEST 22: Wrapper Class")
+    print("=" * 70)
+    
+    from src.nn.modules.tensor_mcts import TensorMCTSWrapper
+    
+    device = "cpu"
+    model = DummyModel(device)
+    
+    wrapper = TensorMCTSWrapper(
+        model=model,
+        num_simulations=100,
+        parallel_simulations=8,
+        exploration_fraction=0.0,
+        device=device
+    )
+    
+    # Test with batch of 2 boards
+    board1 = torch.zeros(6, 7, dtype=torch.long)
+    
+    # Board 2: P1 can win at col 3
+    # For P1 to move, need P1_count == P2_count
+    board2 = torch.zeros(6, 7, dtype=torch.long)
+    board2[5, 0:3] = 1  # P1: XXX at bottom left (3 pieces)
+    board2[5, 4:7] = 2  # P2: OOO at bottom right (3 pieces)
+    # Now P1=3, P2=3 → P1 to move → col 3 wins
+    
+    boards = [board1, board2]
+    legal = [torch.ones(7), torch.ones(7)]
+    
+    visit_dist, action_probs = wrapper.get_action_probs_batch_parallel(
+        boards, legal, temperature=1.0
+    )
+    
+    print(f"  Board 0 dist: {visit_dist[0].numpy().round(3)}")
+    print(f"  Board 1 dist: {visit_dist[1].numpy().round(3)}")
+    print(f"  Board 1 best: col {visit_dist[1].argmax().item()}")
+    
+    if visit_dist[1].argmax().item() == 3:
+        print("  ✓ Wrapper correctly processed batch")
+        return True
+    else:
+        print("  ✗ Wrapper failed to find winning move")
+        return False
     
 # =============================================================================
 # Main
@@ -1028,22 +1689,42 @@ def run_all_tests():
     
     results = []
     
+    # Basic Logic
     results.append(("Terminal Detection", test_terminal_detection()))
     results.append(("PUCT Formula", test_puct_formula()))
     results.append(("Single Simulation", test_single_simulation()))
+    
+    # Gameplay Logic
     results.append(("Winning Move 1", test_winning_move()))
     results.append(("Winning Move 2", test_winning_move_2()))
     results.append(("Backup Values", test_backup_values()))
+    results.append(("Forced Block (Defense)", test_forced_mate_depth())) # The hard one!
     
-    # New Tests
+    # Edge Cases
     results.append(("Illegal Masking", test_illegal_masking()))
     results.append(("Draw Detection", test_draw_detection()))
     results.append(("Batch Independence", test_batch_independence()))
-    results.append(("Virtual Loss Cleanliness", test_virtual_loss_cleanliness()))
-    results.append(("Forced Block (Defense)", test_forced_mate_depth()))
     
-    test_visit_convergence()  # No pass/fail, just comparison
+    # Advanced / System
     results.append(("Virtual Loss Diversity", test_virtual_loss()))
+    results.append(("Virtual Loss Cleanliness", test_virtual_loss_cleanliness()))
+    results.append(("Prior Influence", test_prior_influence()))
+    results.append(("Temperature Scaling", test_temperature_scaling()))
+    results.append(("Deterministic Consistency", test_determinism()))
+    
+    # New Hardening Tests
+    results.append(("Dirichlet Noise", test_dirichlet_noise()))
+    results.append(("Gradient Detachment", test_gradient_detachment()))
+    results.append(("Capacity Overflow", test_capacity_overflow()))
+    
+    results.append(("Deep Tree Traversal", test_deep_traversal()))
+    results.append(("Node Capacity Limit", test_node_capacity()))
+    results.append(("All Children Terminal", test_all_children_terminal()))
+    results.append(("State Materialization", test_state_materialization()))
+    results.append(("Dirichlet Noise Application", test_dirichlet_noise()))
+    results.append(("Wrapper Class", test_wrapper()))
+    results.append(("Visit Convergence", test_visit_convergence()))
+
     
     print("\n" + "=" * 70)
     print("SUMMARY")
@@ -1051,7 +1732,6 @@ def run_all_tests():
     for name, passed in results:
         status = "✓ PASSED" if passed else "✗ FAILED"
         print(f"  {status}: {name}")
-
 
 if __name__ == "__main__":
     run_all_tests()

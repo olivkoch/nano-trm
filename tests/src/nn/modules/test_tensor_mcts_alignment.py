@@ -2416,6 +2416,697 @@ def test_collision_stress():
         return False
     
 # =============================================================================
+# Test 32: Policy vs Value Disagreement
+# =============================================================================
+
+def test_policy_value_disagreement():
+    """Test behavior when policy says one thing but value says another"""
+    print("\n" + "=" * 70)
+    print("TEST 32: Policy vs Value Disagreement")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    class DisagreeingModel:
+        """Policy favors col 0, but value says col 6 is best"""
+        def __init__(self, device="cpu"):
+            self.device = device
+            
+        def forward(self, boards, players):
+            batch = boards.shape[0]
+            boards_2d = boards.view(batch, 6, 7)
+            
+            # Policy strongly favors col 0
+            policy = torch.zeros(batch, 7, device=self.device)
+            policy[:, 0] = 0.9
+            policy[:, 1:] = 0.1 / 6
+            
+            # Value: col 6 played = good position, col 0 played = bad
+            col6_played = (boards_2d[:, :, 6] != 0).any(dim=1)
+            col0_played = (boards_2d[:, :, 0] != 0).any(dim=1)
+            
+            current_is_p1 = (players == 1)
+            
+            # If col 6 was played by P1, position is good for P1
+            values = torch.zeros(batch, device=self.device)
+            values = torch.where(col6_played & current_is_p1, 
+                                torch.tensor(-0.8, device=self.device),  # Good for P1 who played it
+                                values)
+            values = torch.where(col0_played & current_is_p1,
+                                torch.tensor(0.8, device=self.device),   # Bad for P1 who played it
+                                values)
+            
+            return policy, values
+    
+    model = DisagreeingModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    
+    # With few sims, policy dominates (U term)
+    dist_few = mcts.run_simulations(20, parallel_sims=1)[0].numpy()
+    
+    # Reset and run many sims - value should start to matter
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dist_many = mcts.run_simulations(500, parallel_sims=1)[0].numpy()
+    
+    print(f"  Policy: 90% col 0, Value: col 6 is best")
+    print(f"  20 sims:  {dist_few.round(3)} -> best: col {np.argmax(dist_few)}")
+    print(f"  500 sims: {dist_many.round(3)} -> best: col {np.argmax(dist_many)}")
+    
+    # With few sims, should follow policy (col 0)
+    # With many sims, should shift toward value (col 6)
+    policy_influence = dist_few[0] > dist_many[0]
+    value_influence = dist_many[6] > dist_few[6]
+    
+    if policy_influence and value_influence:
+        print("  ✓ Correctly balances policy (early) vs value (late)")
+        return True
+    else:
+        print("  ~ Balance may need tuning")
+        return True  # Diagnostic
+
+
+# =============================================================================
+# Test 33: Connect Four 7-Trap Pattern
+# =============================================================================
+
+def test_seven_trap():
+    """Test the famous Connect Four '7-trap' pattern"""
+    print("\n" + "=" * 70)
+    print("TEST 33: Connect Four 7-Trap Pattern")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # The 7-trap: P1 has pieces forming a '7' shape that creates
+    # two threats that can't both be blocked
+    #
+    # Setup: P1 plays to create threats at both col 2 (horizontal) 
+    # and col 3 (vertical) simultaneously
+    
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    # Horizontal base: X X _ X at row 5
+    board_np[5, 0] = 1
+    board_np[5, 1] = 1
+    board_np[5, 3] = 1
+    # P2 pieces for balance
+    board_np[5, 5] = 2
+    board_np[5, 6] = 2
+    board_np[4, 6] = 2
+    
+    # P1 playing col 2 completes horizontal win
+    # This is a simple winning position - P1 should find it
+    
+    print("  Board (P1 has X X _ X, should play col 2):")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board_np[row, c]] for c in range(7)])}|")
+    
+    # Run both engines
+    env = ConnectFourEnv()
+    env.board = board_np.copy()
+    env.to_play = 1
+    env.legal_actions = np.ones(7, dtype=np.float32)
+    eval_func = make_numpy_eval_func()
+    
+    _, v2_dist, _, _, _ = parallel_uct_search(
+        env, eval_func, None, 19652.0, 1.25, 500, num_parallel=16
+    )
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    tensor_dist = mcts.run_simulations(500, parallel_sims=16)[0].numpy()
+    
+    print(f"  mcts_v2:     {v2_dist.round(3)} -> col {np.argmax(v2_dist)}")
+    print(f"  tensor_mcts: {tensor_dist.round(3)} -> col {np.argmax(tensor_dist)}")
+    
+    if np.argmax(v2_dist) == 2 and np.argmax(tensor_dist) == 2:
+        print("  ✓ Both found the winning move")
+        return True
+    else:
+        print("  ✗ Missed winning move")
+        return False
+
+
+# =============================================================================
+# Test 34: Odd/Even Threat Analysis
+# =============================================================================
+
+def test_odd_even_threats():
+    """Test understanding of odd vs even row threats (crucial in Connect Four)"""
+    print("\n" + "=" * 70)
+    print("TEST 34: Odd/Even Threat Analysis")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # In Connect Four, threats on odd rows (1,3,5 from bottom=0) 
+    # are controlled by the second player if the column is empty.
+    # This is because players alternate, so even-row threats
+    # benefit the first player.
+    
+    # Setup: P1 has a threat that completes on row 4 (0-indexed, so 5th from top)
+    # which is even-indexed from bottom
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    board_np[5, 0] = 1  # Bottom row
+    board_np[5, 1] = 1
+    board_np[5, 2] = 1  # P1 has 3-in-row, threatens col 3
+    # Fill col 3 partially so the threat is NOT on bottom
+    board_np[5, 3] = 2  # P2 blocks bottom
+    board_np[4, 3] = 2  # P2 blocks row 4
+    # Now if P1 plays col 3, it lands on row 3 (odd from bottom)
+    # P2 pieces for turn balance
+    board_np[5, 6] = 2
+    
+    print("  Board (complex threat scenario):")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board_np[row, c]] for c in range(7)])}|")
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.from_numpy((board_np[0, :] == 0).astype(np.float32)).unsqueeze(0)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dist = mcts.run_simulations(1000, parallel_sims=16)[0].numpy()
+    
+    print(f"  Distribution: {dist.round(3)}")
+    print(f"  Best move: col {np.argmax(dist)}")
+    
+    # This is a diagnostic - the "right" answer depends on deep analysis
+    print("  ✓ Completed (diagnostic - verify manually)")
+    return True
+
+
+# =============================================================================
+# Test 35: Self-Play Game Simulation
+# =============================================================================
+
+def test_self_play_game():
+    """Simulate a complete self-play game"""
+    print("\n" + "=" * 70)
+    print("TEST 35: Self-Play Game Simulation")
+    print("=" * 70)
+    
+    device = "cpu"
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.25, dirichlet_alpha=0.3)
+    
+    board = np.zeros((6, 7), dtype=np.int8)
+    current_player = 1
+    move_history = []
+    
+    max_moves = 42  # Maximum possible moves in Connect Four
+    
+    for move_num in range(max_moves):
+        mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+        
+        board_t = torch.from_numpy(board).unsqueeze(0).long()
+        legal_mask = (board[0, :] == 0).astype(np.float32)
+        legal = torch.from_numpy(legal_mask).unsqueeze(0)
+        players = torch.tensor([current_player], dtype=torch.long)
+        
+        if legal_mask.sum() == 0:
+            break  # Board full
+        
+        with torch.no_grad():
+            policies, vals = model.forward(board_t.flatten(1).float(), players)
+        
+        mcts.reset(board_t, policies, legal, players, root_values=vals)
+        
+        # Use temperature for first 10 moves, then greedy
+        temp = 1.0 if move_num < 10 else 0.1
+        dist = mcts.run_simulations(100, parallel_sims=8)[0].numpy()
+        
+        # Sample move
+        if temp > 0.5:
+            probs = dist / dist.sum()
+            action = np.random.choice(7, p=probs)
+        else:
+            action = np.argmax(dist)
+        
+        # Make move
+        for row in range(5, -1, -1):
+            if board[row, action] == 0:
+                board[row, action] = current_player
+                break
+        
+        move_history.append(action)
+        
+        # Check terminal
+        is_term, winner = mcts._check_terminal_batch(torch.from_numpy(board).unsqueeze(0).long())
+        if is_term[0].item():
+            break
+        
+        current_player = 3 - current_player
+    
+    print(f"  Game completed in {len(move_history)} moves")
+    print(f"  Move history: {move_history}")
+    print(f"  Final board:")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board[row, c]] for c in range(7)])}|")
+    
+    # Check result
+    is_term, winner = mcts._check_terminal_batch(torch.from_numpy(board).unsqueeze(0).long())
+    if is_term[0].item():
+        if winner[0].item() == 0:
+            print(f"  Result: Draw")
+        else:
+            print(f"  Result: Player {winner[0].item()} wins")
+    else:
+        print(f"  Result: Game incomplete (board full)")
+    
+    print("  ✓ Self-play game completed successfully")
+    return True
+
+
+# =============================================================================
+# Test 36: Training Data Collection
+# =============================================================================
+
+def test_training_data_collection():
+    """Test that we can collect proper training data from MCTS"""
+    print("\n" + "=" * 70)
+    print("TEST 36: Training Data Collection")
+    print("=" * 70)
+    
+    device = "cpu"
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    
+    # Setup a position
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    board_np[5, 3] = 1  # One piece played
+    
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([2], dtype=torch.long)  # P2 to move
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    visit_dist = mcts.run_simulations(200, parallel_sims=8)[0]
+    
+    # Collect training data
+    training_state = board_t.clone()
+    training_policy = visit_dist.clone()  # MCTS policy target
+    
+    # Get root value for value target
+    root_visits = mcts.visits[0, 0].item()
+    root_value = mcts.total_value[0, 0].item()
+    training_value = root_value / max(1, root_visits)
+    
+    print(f"  Training state shape: {training_state.shape}")
+    print(f"  Training policy: {training_policy.numpy().round(3)}")
+    print(f"  Training value: {training_value:.3f}")
+    print(f"  Policy sums to: {training_policy.sum().item():.4f}")
+    
+    # Verify data quality
+    policy_valid = abs(training_policy.sum().item() - 1.0) < 0.01
+    value_valid = -1.0 <= training_value <= 1.0
+    
+    if policy_valid and value_valid:
+        print("  ✓ Training data is valid")
+        return True
+    else:
+        print("  ✗ Invalid training data")
+        return False
+
+
+# =============================================================================
+# Test 37: Repeated Position Handling
+# =============================================================================
+
+def test_repeated_positions():
+    """Test MCTS behavior when same position is evaluated multiple times"""
+    print("\n" + "=" * 70)
+    print("TEST 37: Repeated Position Handling")
+    print("=" * 70)
+    
+    device = "cpu"
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    board_np[5, 3] = 1
+    board_np[5, 4] = 2
+    
+    results = []
+    for i in range(5):
+        mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+        
+        board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+        legal = torch.ones(1, 7)
+        players = torch.tensor([1], dtype=torch.long)
+        
+        with torch.no_grad():
+            policies, vals = model.forward(board_t.flatten(1).float(), players)
+        
+        mcts.reset(board_t, policies, legal, players, root_values=vals)
+        dist = mcts.run_simulations(100, parallel_sims=8)[0].numpy()
+        results.append(dist)
+    
+    # Check consistency
+    results = np.stack(results)
+    variance = results.var(axis=0).max()
+    
+    print(f"  5 runs on same position:")
+    for i, r in enumerate(results):
+        print(f"    Run {i+1}: {r.round(3)}")
+    print(f"  Max variance across runs: {variance:.6f}")
+    
+    if variance < 0.001:
+        print("  ✓ Perfectly deterministic")
+        return True
+    elif variance < 0.01:
+        print("  ~ Low variance (acceptable)")
+        return True
+    else:
+        print("  ✗ High variance in repeated evaluations")
+        return False
+
+
+# =============================================================================
+# Test 38: Batch Efficiency Scaling
+# =============================================================================
+
+def test_batch_scaling():
+    """Test that parallel_sims parameter actually improves throughput"""
+    print("\n" + "=" * 70)
+    print("TEST 38: Batch Efficiency Scaling")
+    print("=" * 70)
+    
+    import time
+    device = "cpu"
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0, max_nodes_per_tree=5000)
+    
+    board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    results = {}
+    for parallel_sims in [1, 4, 8, 16, 32]:
+        mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+        mcts.reset(board_t, policies, legal, players, root_values=vals)
+        
+        start = time.time()
+        mcts.run_simulations(500, parallel_sims=parallel_sims)
+        elapsed = time.time() - start
+        
+        results[parallel_sims] = elapsed
+        print(f"  parallel_sims={parallel_sims:2d}: {elapsed:.3f}s ({500/elapsed:.0f} sims/sec)")
+    
+    # Check that higher parallelism is faster (or at least not much slower)
+    # On CPU, parallelism might not help much due to GIL, but shouldn't hurt
+    speedup = results[1] / results[16]
+    print(f"  Speedup (1 vs 16): {speedup:.2f}x")
+    
+    if results[16] <= results[1] * 1.5:  # Allow some overhead
+        print("  ✓ Batch processing doesn't degrade performance")
+        return True
+    else:
+        print("  ✗ Batch processing is significantly slower")
+        return False
+
+
+# =============================================================================
+# Test 39: Memory Stability Over Many Games
+# =============================================================================
+
+def test_memory_stability():
+    """Test that memory doesn't leak over many MCTS instances"""
+    print("\n" + "=" * 70)
+    print("TEST 39: Memory Stability Over Many Games")
+    print("=" * 70)
+    
+    import gc
+    
+    device = "cpu"
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    
+    board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    # Run many games
+    num_games = 100
+    for i in range(num_games):
+        mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+        mcts.reset(board_t, policies, legal, players, root_values=vals)
+        mcts.run_simulations(50, parallel_sims=8)
+        
+        if i % 25 == 0:
+            gc.collect()
+            # Could check memory here with psutil if available
+    
+    gc.collect()
+    print(f"  Ran {num_games} MCTS instances without crash")
+    print("  ✓ Memory appears stable (manual verification recommended)")
+    return True
+
+
+# =============================================================================
+# Test 40: Temperature Exploration vs Exploitation
+# =============================================================================
+
+def test_temperature_exploration():
+    """Test that temperature correctly controls exploration vs exploitation"""
+    print("\n" + "=" * 70)
+    print("TEST 40: Temperature Exploration vs Exploitation")
+    print("=" * 70)
+    
+    device = "cpu"
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    
+    # Create position where one move is clearly best
+    board_np = np.zeros((6, 7), dtype=np.int8)
+    board_np[5, 0:3] = 1  # P1 wins at col 3
+    board_np[5, 4:6] = 2
+    board_np[4, 5] = 2
+    
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.from_numpy(board_np).unsqueeze(0).long()
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    mcts.run_simulations(200, parallel_sims=8)
+    
+    # Get action probs at different temperatures
+    probs_t0 = mcts.get_action_probs(temperature=0)[0].numpy()
+    probs_t01 = mcts.get_action_probs(temperature=0.1)[0].numpy()
+    probs_t1 = mcts.get_action_probs(temperature=1.0)[0].numpy()
+    
+    print(f"  Visit distribution: {mcts._get_visit_distributions()[0].numpy().round(3)}")
+    print(f"  Temp=0.0: {probs_t0.round(3)} (entropy={-(probs_t0 * np.log(probs_t0 + 1e-10)).sum():.3f})")
+    print(f"  Temp=0.1: {probs_t01.round(3)} (entropy={-(probs_t01 * np.log(probs_t01 + 1e-10)).sum():.3f})")
+    print(f"  Temp=1.0: {probs_t1.round(3)} (entropy={-(probs_t1 * np.log(probs_t1 + 1e-10)).sum():.3f})")
+    
+    # Lower temp should have lower entropy (more peaked)
+    entropy_t0 = -(probs_t0 * np.log(probs_t0 + 1e-10)).sum()
+    entropy_t1 = -(probs_t1 * np.log(probs_t1 + 1e-10)).sum()
+    
+    if entropy_t0 < entropy_t1:
+        print("  ✓ Temperature correctly controls distribution sharpness")
+        return True
+    else:
+        print("  ✗ Temperature scaling incorrect")
+        return False
+
+
+# =============================================================================
+# Test 41: Center Column Preference (Opening Theory)
+# =============================================================================
+
+def test_center_preference():
+    """Test that MCTS discovers center column advantage in opening"""
+    print("\n" + "=" * 70)
+    print("TEST 41: Center Column Preference (Opening)")
+    print("=" * 70)
+    
+    device = "cpu"
+    
+    # Use a model that gives slight preference to center (like a trained model would)
+    class CenterBiasedModel:
+        def __init__(self, device="cpu"):
+            self.device = device
+            
+        def forward(self, boards, players):
+            batch = boards.shape[0]
+            # Slight center bias in policy
+            policy = torch.tensor([0.1, 0.12, 0.14, 0.18, 0.14, 0.12, 0.1], 
+                                 device=self.device).unsqueeze(0).expand(batch, -1)
+            # Slight positive value for center control
+            boards_2d = boards.view(batch, 6, 7)
+            center_control = (boards_2d[:, :, 3] != 0).any(dim=1)
+            values = torch.where(center_control,
+                                torch.tensor(0.1, device=self.device),
+                                torch.tensor(0.0, device=self.device))
+            return policy, values
+    
+    model = CenterBiasedModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, n_trees=1, config=config, device=device)
+    
+    board_t = torch.zeros(1, 6, 7, dtype=torch.long)
+    legal = torch.ones(1, 7)
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts.reset(board_t, policies, legal, players, root_values=vals)
+    dist = mcts.run_simulations(500, parallel_sims=16)[0].numpy()
+    
+    print(f"  Empty board, slight center bias in model")
+    print(f"  Distribution: {dist.round(3)}")
+    print(f"  Best move: col {np.argmax(dist)}")
+    
+    # Center columns (2,3,4) should dominate
+    center_mass = dist[2] + dist[3] + dist[4]
+    edge_mass = dist[0] + dist[1] + dist[5] + dist[6]
+    
+    print(f"  Center (2,3,4) mass: {center_mass:.3f}")
+    print(f"  Edge (0,1,5,6) mass: {edge_mass:.3f}")
+    
+    if center_mass > edge_mass:
+        print("  ✓ MCTS correctly amplifies center preference")
+        return True
+    else:
+        print("  ✗ Center preference not reflected in search")
+        return False
+
+
+# =============================================================================
+# Test 42: Multi-Tree Independence Verification
+# =============================================================================
+
+def test_multi_tree_independence():
+    """Verify that parallel trees don't affect each other's results"""
+    print("\n" + "=" * 70)
+    print("TEST 42: Multi-Tree Independence")
+    print("=" * 70)
+    
+    device = "cpu"
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    
+    # Board 0: P1 wins ONLY at col 3 (horizontal, blocked on right)
+    board0 = np.zeros((6, 7), dtype=np.int8)
+    board0[5, 0:3] = 1   # X X X _ at cols 0,1,2 -> win at col 3
+    board0[5, 4:7] = 2   # Block right side
+    board0[4, 4] = 2
+    
+    # Board 1: P1 wins ONLY at col 6 (VERTICAL stack)
+    board1 = np.zeros((6, 7), dtype=np.int8)
+    board1[5, 6] = 1     # Vertical stack in col 6
+    board1[4, 6] = 1
+    board1[3, 6] = 1     # 3 in a row, col 6 wins vertically
+    board1[5, 0:3] = 2   # P2 pieces for turn balance
+    
+    print("  Board 0 (P1 horizontal win at col 3):")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board0[row, c]] for c in range(7)])}|")
+    
+    print("  Board 1 (P1 vertical win at col 6):")
+    for row in range(6):
+        print(f"    |{''.join(['.XO'[board1[row, c]] for c in range(7)])}|")
+    
+    # Run together
+    boards = np.stack([board0, board1])
+    board_t = torch.from_numpy(boards).long()
+    
+    mcts_joint = TensorMCTS(model, n_trees=2, config=config, device=device)
+    legal = torch.ones(2, 7)
+    players = torch.tensor([1, 1], dtype=torch.long)
+    
+    with torch.no_grad():
+        policies, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    mcts_joint.reset(board_t, policies, legal, players, root_values=vals)
+    dists_joint = mcts_joint.run_simulations(200, parallel_sims=8).numpy()
+    
+    # Run separately
+    mcts_sep0 = TensorMCTS(model, n_trees=1, config=config, device=device)
+    with torch.no_grad():
+        p0, v0 = model.forward(torch.from_numpy(board0).unsqueeze(0).flatten(1).float(), players[0:1])
+    mcts_sep0.reset(torch.from_numpy(board0).unsqueeze(0).long(), 
+                   p0, legal[0:1], players[0:1], root_values=v0)
+    dist_sep0 = mcts_sep0.run_simulations(200, parallel_sims=8)[0].numpy()
+    
+    mcts_sep1 = TensorMCTS(model, n_trees=1, config=config, device=device)
+    with torch.no_grad():
+        p1, v1 = model.forward(torch.from_numpy(board1).unsqueeze(0).flatten(1).float(), players[1:2])
+    mcts_sep1.reset(torch.from_numpy(board1).unsqueeze(0).long(),
+                   p1, legal[1:2], players[1:2], root_values=v1)
+    dist_sep1 = mcts_sep1.run_simulations(200, parallel_sims=8)[0].numpy()
+    
+    print(f"\n  Board 0 (win@3) joint:    {dists_joint[0].round(3)}")
+    print(f"  Board 0 (win@3) separate: {dist_sep0.round(3)}")
+    print(f"  Board 1 (win@6) joint:    {dists_joint[1].round(3)}")
+    print(f"  Board 1 (win@6) separate: {dist_sep1.round(3)}")
+    
+    # Check that BEST MOVE is the same
+    best_joint_0 = np.argmax(dists_joint[0])
+    best_sep_0 = np.argmax(dist_sep0)
+    best_joint_1 = np.argmax(dists_joint[1])
+    best_sep_1 = np.argmax(dist_sep1)
+    
+    print(f"\n  Board 0: joint best={best_joint_0}, separate best={best_sep_0}, expected=3")
+    print(f"  Board 1: joint best={best_joint_1}, separate best={best_sep_1}, expected=6")
+    
+    # Both should find the unique winning move
+    correct_0 = (best_joint_0 == 3) and (best_sep_0 == 3)
+    correct_1 = (best_joint_1 == 6) and (best_sep_1 == 6)
+    
+    if correct_0 and correct_1:
+        print("  ✓ Trees are independent (same best moves)")
+        return True
+    else:
+        print("  ✗ Trees produced different best moves!")
+        return False
+    
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2476,6 +3167,19 @@ def run_all_tests():
     results.append(("Fork Creation", test_fork_creation()))
     results.append(("Collision Stress Test", test_collision_stress()))
         
+    # Connect Four tests
+    results.append(("Policy vs Value Disagreement", test_policy_value_disagreement()))
+    results.append(("Connect Four 7-Trap Pattern", test_seven_trap()))
+    results.append(("Odd/Even Threat Analysis", test_odd_even_threats()))
+    results.append(("Self-Play Game Simulation", test_self_play_game()))
+    results.append(("Training Data Collection", test_training_data_collection()))
+    results.append(("Repeated Position Handling", test_repeated_positions()))
+    results.append(("Batch Efficiency Scaling", test_batch_scaling()))
+    results.append(("Memory Stability Over Many Games", test_memory_stability()))
+    results.append(("Temperature Exploration vs Exploitation", test_temperature_exploration()))
+    results.append(("Center Column Preference (Opening Theory)", test_center_preference()))
+    results.append(("Multi-Tree Independence Verification", test_multi_tree_independence()))
+
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)

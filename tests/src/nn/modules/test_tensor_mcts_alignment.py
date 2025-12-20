@@ -2367,6 +2367,55 @@ def test_fork_creation():
         return False
     
 # =============================================================================
+# Test 31: Test Collision Test
+# =============================================================================
+def test_collision_stress():
+    print("\n" + "=" * 70 + "\nTEST 31: Collision Stress Test\n" + "=" * 70)
+    device = "cpu"
+    
+    # Safe Draw Pattern: No 4-in-a-row (Vertical, Horizontal, Diagonal)
+    # Rows 0-1: 1, 2, 1, 2...
+    # Rows 2-3: 2, 1, 2, 1...
+    # Rows 4-5: 1, 2, 1, 2...
+    board = np.zeros((6, 7), dtype=np.int8)
+    for r in range(6):
+        for c in range(1, 7): # Fill cols 1-6
+            # Base pattern
+            val = 1 if c % 2 != 0 else 2
+            # Flip on row blocks to break vertical/diagonal lines
+            if (r // 2) % 2 != 0:
+                val = 3 - val
+            board[r, c] = val
+            
+    # Explicit legal mask: Only Col 0 is open
+    legal_mask = torch.zeros(1, 7)
+    legal_mask[0, 0] = 1
+    
+    model = DummyModel(device)
+    config = TensorMCTSConfig(exploration_fraction=0.0)
+    mcts = TensorMCTS(model, 1, config, device)
+    
+    board_t = torch.from_numpy(board).unsqueeze(0).long()
+    players = torch.tensor([1], dtype=torch.long)
+    
+    with torch.no_grad():
+        pols, vals = model.forward(board_t.flatten(1).float(), players)
+    
+    # NOTE: Pass computed legal_mask, not board-derived, to ensure safety
+    mcts.reset(board_t, pols, legal_mask, players, root_values=vals)
+    mcts.run_simulations(16, 16)
+    
+    nodes = mcts.next_node_idx[0].item()
+    print(f"  Nodes used: {nodes}")
+    
+    if nodes >= 17:
+        print("  ✓ Safely handled massive collision")
+        return True
+    else:
+        print(f"  ✗ Unexpected node usage: {nodes}")
+        return False
+    
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2425,8 +2474,8 @@ def run_all_tests():
     results.append(("Immediate Win vs Future Win", test_immediate_vs_future()))
     results.append(("Zugzwang-like Position", test_zugzwang()))
     results.append(("Fork Creation", test_fork_creation()))
-
-    
+    results.append(("Collision Stress Test", test_collision_stress()))
+        
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)

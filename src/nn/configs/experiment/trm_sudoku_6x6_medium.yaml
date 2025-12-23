@@ -11,7 +11,7 @@ tags: ["sudoku", "trm", "medium"]
 timekeeping:
   max_epochs: 500
   batch_size: 768
-  num_workers: 0
+  num_workers: 1
 
 model_tuning:
   learning_rate: 1e-4

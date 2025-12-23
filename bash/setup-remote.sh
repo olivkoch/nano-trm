@@ -11,6 +11,9 @@ fi
 MACHINE="$1"
 REMOTE="ubuntu@${MACHINE}"
 
+echo "==> Removing ${MACHINE} from known_hosts..."
+ssh-keygen -R "${MACHINE}" 2>/dev/null || true
+
 echo "==> Installing unison on ${MACHINE}..."
 ssh "${REMOTE}" "sudo apt install -y unison"
 

@@ -302,7 +302,27 @@ def test_batch_size(
         return True
         
     except RuntimeError as e:
-        if "out of memory" in str(e).lower():
+        error_str = str(e).lower()
+        if "out of memory" in error_str:
+            clear_gpu_memory()
+            return False
+        # Handle CUDA assertion errors (can happen with torch.compile on some GPUs)
+        if "cuda error" in error_str or "device-side assert" in error_str:
+            print(f"\n    CUDA error (trying smaller batch)...", end=" ")
+            # Reset CUDA context
+            torch.cuda.synchronize()
+            clear_gpu_memory()
+            return False
+        raise
+    except Exception as e:
+        # Catch torch.AcceleratorError and other CUDA-related errors
+        error_str = str(e).lower()
+        if "cuda" in error_str or "accelerator" in error_str:
+            print(f"\n    CUDA error (trying smaller batch)...", end=" ")
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
             clear_gpu_memory()
             return False
         raise
@@ -317,24 +337,19 @@ def find_max_batch_size(
     compile_mode: str,
     num_classes: int = IMAGENETTE_NUM_CLASSES,
 ) -> Optional[int]:
-    """Find the maximum batch size that fits in GPU memory."""
+    """Find the maximum batch size that fits in GPU memory.
+    
+    Tests with uncompiled model to avoid torch.compile inductor bugs.
+    If compiled training needs more memory, OOM retry logic handles it.
+    """
     
     task = ARCHITECTURES[arch]["task"]
     image_size = DIFFUSION_SIZE if task == "diffusion" else IMAGENET_SIZE
     
     print(f"  Finding max batch size for {arch}/{variant} (compile={use_compile})...")
     
+    # Always test with uncompiled model to avoid torch.compile inductor bugs
     model = create_model(arch, variant, num_classes=num_classes).to(device)
-    
-    if use_compile:
-        model = torch.compile(model, mode=compile_mode)
-        # Warmup compile with small batch
-        print(f"    Compiling model...")
-        try:
-            test_batch_size(model, 8, device, use_amp, task, num_classes, image_size)
-        except Exception:
-            pass
-    
     model.train()
     
     max_batch = None

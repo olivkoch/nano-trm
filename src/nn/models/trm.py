@@ -103,7 +103,7 @@ class TRMModule(LightningModule):
         # CRITICAL: Manual optimization
         self.automatic_optimization = False
 
-        self.forward_dtype = torch.float32
+        self.forward_dtype = torch.bfloat16
 
         # Token embeddings
         self.embed_scale = math.sqrt(hidden_size)

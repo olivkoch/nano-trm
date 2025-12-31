@@ -19,9 +19,10 @@ puzzle_emb_len: ${model_tuning.puzzle_emb_len}
 rope_theta: ${model_tuning.rope_theta}
 pos_emb_type: ${model_tuning.pos_emb_type}
 lr_min_ratio: ${model_tuning.lr_min_ratio}
-use_sigreg: ${model_tuning.use_sigreg}
 use_mlp: ${model_tuning.use_mlp}
 attn_gate_type: ${model_tuning.attn_gate_type}
+use_conv_swiglu: ${model_tuning.use_conv_swiglu}
+use_muon: ${model_tuning.use_muon}
 output_dir: None
 
 # Should be set from datamodule

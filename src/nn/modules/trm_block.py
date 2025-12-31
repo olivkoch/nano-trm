@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import einops
 import torch
@@ -189,7 +189,42 @@ class SwiGLU(nn.Module):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
+class ConvSwiGLU(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion: float,
+        conv_kernel: int = 2,
+        intermediate_size: Optional[int] = None,
+    ):
+        super().__init__()
 
+        inter = intermediate_size if intermediate_size is not None else _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
+        self.inter = inter
+        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
+        self.dwconv = nn.Conv1d(
+            in_channels=inter,
+            out_channels=inter,
+            kernel_size=conv_kernel,
+            padding=conv_kernel // 2,
+            groups=inter,
+            bias=True,
+        ).to(dtype=torch.bfloat16)
+
+        self.act = nn.SiLU()
+        self.down_proj = CastedLinear(inter, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        x_ffn = F.silu(gate) * up
+        x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype))
+        x_conv = x_conv[..., :up.size(1)]
+        x_conv = self.act(x_conv)
+        x_conv = x_conv.transpose(1, 2).contiguous()
+        x_out = self.down_proj(x_conv)
+
+        return x_out
+    
 class Attention(nn.Module):
     def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, gate_type=None):
         super().__init__()
@@ -277,6 +312,7 @@ class ReasoningBlockConfig:
         puzzle_emb_ndim: int = 0,
         puzzle_emb_len: int = 0,
         attn_gate_type: str = None,
+        use_conv_swiglu: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -287,6 +323,7 @@ class ReasoningBlockConfig:
         self.puzzle_emb_len = puzzle_emb_len
         self.seq_len = seq_len
         self.attn_gate_type = attn_gate_type
+        self.use_conv_swiglu = use_conv_swiglu
 
 
 class ReasoningBlock(nn.Module):
@@ -294,49 +331,69 @@ class ReasoningBlock(nn.Module):
         super().__init__()
 
         self.config = config
-        if self.config.mlp_t:
-            self.puzzle_emb_len = (
-                -(config.puzzle_emb_ndim // -config.hidden_size)
-                if config.puzzle_emb_len == 0
-                else config.puzzle_emb_len
-            )
-            self.mlp_t = SwiGLU(
-                hidden_size=config.seq_len + config.puzzle_emb_len,  # L
-                expansion=config.expansion,
-            )
-        else:
+        if self.config.use_conv_swiglu:
             self.self_attn = Attention(
                 hidden_size=config.hidden_size,
                 head_dim=config.hidden_size // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
                 causal=False,
-                gate_type=config.attn_gate_type
             )
-        self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion,
-        )
+            self.mlp = ConvSwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+            )
+        else:
+            if self.config.mlp_t:
+                self.puzzle_emb_len = (
+                    -(config.puzzle_emb_ndim // -config.hidden_size)
+                    if config.puzzle_emb_len == 0
+                    else config.puzzle_emb_len
+                )
+                self.mlp_t = SwiGLU(
+                    hidden_size=config.seq_len + config.puzzle_emb_len,  # L
+                    expansion=config.expansion,
+                )
+            else:
+                self.self_attn = Attention(
+                    hidden_size=config.hidden_size,
+                    head_dim=config.hidden_size // config.num_heads,
+                    num_heads=config.num_heads,
+                    num_key_value_heads=config.num_heads,
+                    causal=False,
+                    gate_type=config.attn_gate_type
+                )
+            self.mlp = SwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+            )
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         # B, L, D = hidden_states.shape
         # Post Norm
-        if self.config.mlp_t:
-            hidden_states = hidden_states.transpose(1, 2)
-            out = self.mlp_t(hidden_states)
-            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-            hidden_states = hidden_states.transpose(1, 2)
+        if self.config.use_conv_swiglu:
+            attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+            hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
+            mlp_output = self.mlp(hidden_states)
+            hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
+            return hidden_states
         else:
-            # Self Attention
-            hidden_states = rms_norm(
-                hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
-                variance_epsilon=self.norm_eps,
-            )
-        # Fully Connected
-        out = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-        return hidden_states
+            if self.config.mlp_t:
+                hidden_states = hidden_states.transpose(1, 2)
+                out = self.mlp_t(hidden_states)
+                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+                hidden_states = hidden_states.transpose(1, 2)
+            else:
+                # Self Attention
+                hidden_states = rms_norm(
+                    hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
+                    variance_epsilon=self.norm_eps,
+                )
+            # Fully Connected
+            out = self.mlp(hidden_states)
+            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+            return hidden_states
 
 
 class ReasoningModule(nn.Module):

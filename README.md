@@ -111,17 +111,10 @@ git clone https://github.com/imoneoi/adam-atan2.git
 
 cd adam-atan2/
 
-# Build from source
-uv pip install --python /home/ubuntu/nano-trm/.venv/bin/python setuptools_scm ninja
-/home/ubuntu/nano-trm/.venv/bin/python setup.py build_ext --inplace
-
-# Check that the lib has been created
-ls -la adam_atan2_backend*.so
-
-# Copy it to your local env
-cp adam_atan2_backend.cpython-312-x86_64-linux-gnu.so /home/ubuntu/nano-trm/.venv/lib/python3.12/site-packages/adam_atan2
-cp /home/ubuntu/nano-trm/.venv/lib/python3.12/site-packages/adam_atan2/adam_atan2_backend.cpython-312-x86_64-linux-gnu.so /home/ubuntu/nano-trm/.venv/lib/python3.12/site-packages/
+uv pip install --python /home/ubuntu/nano-trm/.venv/bin/python --verbose --no-cache-dir --no-build-isolation -e .
 
 # Test
+cd /home/ubuntu/nano-trm
+uv run python
 from adam_atan2 import AdamATan2 -> this should work
 ```

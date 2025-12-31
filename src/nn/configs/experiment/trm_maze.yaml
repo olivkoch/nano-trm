@@ -33,8 +33,9 @@ model_tuning:
   rope_theta: 10000
   pos_emb_type: "1d"
   use_mlp: false
-  use_sigreg: false
+  use_conv_swiglu: false
   attn_gate_type: null
+  use_muon: false
 
 trainer:
   check_val_every_n_epoch: 10

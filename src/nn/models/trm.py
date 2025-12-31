@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from src.nn.modules.utils import compute_lr
 from src.nn.utils.constants import IGNORE_LABEL_ID
+from src.nn.optimizers.muon import Muon
 
 try:
     from adam_atan2 import AdamATan2
@@ -37,7 +38,6 @@ from src.nn.modules.trm_block import (
     RotaryEmbedding,
     RotaryEmbedding2D,
 )
-from src.nn.modules.sigreg import compute_sigreg_loss
 from src.nn.modules.utils import stablemax_cross_entropy, trunc_normal_init_
 from src.nn.utils import RankedLogger
 
@@ -85,9 +85,10 @@ class TRMModule(LightningModule):
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
         rope_theta: int = 10000,
         pos_emb_type: str = None,
+        use_conv_swiglu: bool = False,
         lr_min_ratio: float = 1.0,
-        use_sigreg: bool = False,
         use_mlp: bool = False,
+        use_muon: bool = False,
         attn_gate_type: str = None,  # None, "headwise", "elementwise"
         vocab_size: int = 0,  # Should be set from datamodule
         num_puzzles: int = 0,  # Should be set from datamodule
@@ -143,6 +144,7 @@ class TRMModule(LightningModule):
             puzzle_emb_ndim=puzzle_emb_dim,
             puzzle_emb_len=puzzle_emb_len,
             attn_gate_type=attn_gate_type,
+            use_conv_swiglu=use_conv_swiglu,
         )
 
         self.lenet = ReasoningModule(
@@ -168,10 +170,6 @@ class TRMModule(LightningModule):
             trunc_normal_init_(torch.empty(hidden_size, dtype=self.forward_dtype), std=1),
             persistent=True,
         )
-
-        if self.hparams.use_sigreg:
-            self.sigreg_beta = 1.0
-            self.sigreg_slices = 256
 
         # Add puzzle embeddings
         if puzzle_emb_dim > 0:
@@ -317,9 +315,6 @@ class TRMModule(LightningModule):
         for _ in range(self.hparams.L_cycles):
             z_L = self.lenet(z_L, z_H + input_embeddings, **seq_info)
         z_H = self.lenet(z_H, z_L, **seq_info)
-
-        if self.training and self.hparams.use_sigreg:
-            self._sigreg_loss = compute_sigreg_loss(z_H, z_L, global_step=self.manual_step, num_slices=self.sigreg_slices)
     
         # LM Outputs
         new_carry = TRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
@@ -433,10 +428,6 @@ class TRMModule(LightningModule):
         )
 
         total_loss = lm_loss + 0.5 * q_halt_loss
-
-        if self.training and self.hparams.use_sigreg:
-            total_loss = total_loss + self.sigreg_beta * self._sigreg_loss
-            metrics.update({"sigreg_loss": self._sigreg_loss.detach()})
 
         return new_carry, total_loss, metrics, new_carry.halted.all()
 
@@ -686,9 +677,6 @@ class TRMModule(LightningModule):
                 early_halt_rate = avg_halt_steps < self.hparams.N_supervision
                 self.log("train/early_halt_rate", early_halt_rate, on_step=True)
 
-                if self.hparams.use_sigreg:
-                    self.log("train/sigreg_loss", metrics["sigreg_loss"], on_step=True)
-
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
         """Test step - same as validation."""
         return self.validation_step(batch, batch_idx)
@@ -714,40 +702,79 @@ class TRMModule(LightningModule):
         base_lr = self.hparams.learning_rate
         embedding_lr = self.hparams.learning_rate_emb
 
-        optimizers = []
+        if self.hparams.use_muon:
+            adam_params = [p for p in self.parameters() if p.ndim != 2]
+            muon_params = [p for p in self.parameters() if p.ndim == 2]
 
-        # Main optimizer
-        # Use AdamATan2 if available
-        try:
-            main_opt = AdamATan2(
-                self.parameters(),
-                lr=base_lr,
-                weight_decay=self.hparams.weight_decay,
-                betas=(0.9, 0.95),
-            )
-        except NameError:
-            main_opt = torch.optim.AdamW(
-                self.parameters(),
-                lr=base_lr,
-                weight_decay=self.hparams.weight_decay,
-                betas=(0.9, 0.95),
-            )
-        optimizers.append(main_opt)
+            print('*' * 60)
+            print("Using Muon optimizer")
+            for name, p in self.named_parameters():
+                if p.ndim == 2:
+                    print(f"Muon param: {name} | shape: {p.shape}")
 
-        # Force sparse embedding to be leaf tensors
-        if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
-            # Force sparse embedding local weights to be leaf tensors
-            self.puzzle_emb.local_weights = self.puzzle_emb.local_weights.detach().requires_grad_(
-                True
+            if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
+                optimizers = [
+                    CastedSparseEmbeddingSignSGD_Distributed(
+                        self.puzzle_emb.buffers(),  # type: ignore
+                        lr=embedding_lr,  # Needs to be set by scheduler
+                        weight_decay=self.hparams.weight_decay,
+                        world_size=1,
+                    )]
+            else:
+                optimizers = []
+                
+            optimizers.append(
+                Muon([
+                    {
+                        "params": muon_params,
+                        "use_muon": True,
+                        "lr": base_lr,
+                    },
+                    {
+                        "params": adam_params,
+                        "use_muon": False,
+                        "lr": base_lr,
+                        "weight_decay": 0.1,
+                        "adamw_betas": (0.9, 0.95),
+                        "adamw_eps": 1e-8,
+                    },
+                ])
             )
+            
+        else:
+            optimizers = []
+            # Main optimizer
+            # Use AdamATan2 if available
+            try:
+                main_opt = AdamATan2(
+                    self.parameters(),
+                    lr=base_lr,
+                    weight_decay=self.hparams.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+            except NameError:
+                main_opt = torch.optim.AdamW(
+                    self.parameters(),
+                    lr=base_lr,
+                    weight_decay=self.hparams.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+            optimizers.append(main_opt)
 
-            # Add sparse embedding optimizer
-            sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
-                self.puzzle_emb.buffers(),
-                lr=embedding_lr,
-                weight_decay=self.hparams.weight_decay,
-                world_size=1,
-            )
-            optimizers.append(sparse_opt)
+            # Force sparse embedding to be leaf tensors
+            if hasattr(self, "puzzle_emb") and self.puzzle_emb is not None:
+                # Force sparse embedding local weights to be leaf tensors
+                self.puzzle_emb.local_weights = self.puzzle_emb.local_weights.detach().requires_grad_(
+                    True
+                )
+
+                # Add sparse embedding optimizer
+                sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
+                    self.puzzle_emb.buffers(),
+                    lr=embedding_lr,
+                    weight_decay=self.hparams.weight_decay,
+                    world_size=1,
+                )
+                optimizers.append(sparse_opt)
 
         return optimizers

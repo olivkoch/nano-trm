@@ -189,44 +189,121 @@ class SwiGLU(nn.Module):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
+class CastedConv1d(nn.Conv1d):
+    """Conv1d that automatically casts weights/bias to input dtype."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        nn.init.constant_(self.bias, 0) if self.bias is not None else None
+        trunc_normal_init_(self.weight, std=0.02)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.conv1d(
+            input,
+            self.weight.to(input.dtype),
+            self.bias.to(input.dtype) if self.bias is not None else None,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups
+        )
+
+class CastedConv2d(nn.Conv2d):
+    """Conv2d that automatically casts weights/bias to input dtype."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        nn.init.constant_(self.bias, 0) if self.bias is not None else None
+        trunc_normal_init_(self.weight, std=0.02)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(
+            input,
+            self.weight.to(input.dtype),
+            self.bias.to(input.dtype) if self.bias is not None else None,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups
+        )
+    
 class ConvSwiGLU(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         expansion: float,
-        conv_kernel: int = 2,
+        conv_kernel: int = 3, # Changed default to 3 (Odd is better for alignment)
         intermediate_size: Optional[int] = None,
     ):
         super().__init__()
 
         inter = intermediate_size if intermediate_size is not None else _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
-        self.inter = inter
+        
         self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
-        self.dwconv = nn.Conv1d(
-            in_channels=inter,
-            out_channels=inter,
+
+        self.dwconv = CastedConv1d(
+            in_channels=inter * 2,
+            out_channels=inter * 2,
             kernel_size=conv_kernel,
             padding=conv_kernel // 2,
-            groups=inter,
+            groups=inter * 2,
             bias=True,
-        ).to(dtype=torch.bfloat16)
+        )
 
-        self.act = nn.SiLU()
         self.down_proj = CastedLinear(inter, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor, timer: Optional[object] = None, prefix: str = ""):
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        x_ffn = F.silu(gate) * up
-        x_conv = self.dwconv(x_ffn.transpose(1, 2).to(self.dwconv.weight.dtype))
-        x_conv = x_conv[..., :up.size(1)]
-        x_conv = self.act(x_conv)
-        x_conv = x_conv.transpose(1, 2).contiguous()
-        x_out = self.down_proj(x_conv)
-
-        return x_out
+        
+        x_expanded = self.gate_up_proj(x)
+        x_conv = self.dwconv(x_expanded.transpose(1, 2))
+        if x_conv.size(-1) != x.size(1):
+             x_conv = x_conv[..., :x.size(1)]
+        x_conv = x_conv.transpose(1, 2)
+        gate, up = x_conv.chunk(2, dim=-1)
+        x_out = F.silu(gate) * up
+        return self.down_proj(x_out)
     
+class BoardAwareSwiGLU(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion: float,
+        rows: int = None,
+        cols: int = None,
+        puzzle_emb_len: int = 0,
+        conv_kernel: int = 3,
+    ):
+        super().__init__()
+        assert rows is not None and cols is not None, "Rows and Cols must be specified for BoardAwareSwiGLU."
+        assert rows > 0 and cols > 0, "Rows and Cols must be positive integers."
+        self.rows = rows
+        self.cols = cols
+        self.puzzle_len = puzzle_emb_len
+        
+        inter = _find_multiple(int(expansion * hidden_size * 2 / 3), 256)
+        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
+        self.board_conv = CastedConv2d(
+            inter * 2, inter * 2, 
+            kernel_size=conv_kernel, 
+            padding=conv_kernel // 2,
+            groups=inter * 2,
+            bias=True
+        )
+        self.down_proj = CastedLinear(inter, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor):
+        B, S, D = x.shape
+        x_expanded = self.gate_up_proj(x)
+        x_puzzle = x_expanded[:, :self.puzzle_len, :]
+        x_board = x_expanded[:, self.puzzle_len:, :]
+        x_board_img = x_board.transpose(1, 2).view(B, -1, self.rows, self.cols)
+        x_board_conv = self.board_conv(x_board_img)
+        x_board_out = x_board_conv.flatten(2).transpose(1, 2)
+        x_out = torch.cat([x_puzzle, x_board_out], dim=1)
+        gate, value = x_out.chunk(2, dim=-1)
+        x_act = F.silu(gate) * value
+        return self.down_proj(x_act)
+     
 class Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False, gate_type=None):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, causal=False):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -242,21 +319,6 @@ class Attention(nn.Module):
             bias=False,
         )
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
-
-        self.gate_type = gate_type
-        self.gate_proj = None
-
-        log.info(f"Using attention gating of type: {self.gate_type}")
-
-        if self.gate_type is not None:
-            if self.gate_type == "headwise":
-                self.gate_proj = CastedLinear(hidden_size, num_heads, bias=True)
-            else:
-                self.gate_proj = CastedLinear(hidden_size, self.output_size, bias=True)
-
-            if self.gate_proj.bias is not None:
-                nn.init.constant_(self.gate_proj.bias, 2.0) # make them quite open at init
-
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -287,20 +349,32 @@ class Attention(nn.Module):
         )
         attn_output = einops.rearrange(attn_output, "B H S D -> B S H D")
 
-        # Optional gating
-        if self.gate_proj is not None:
-            gate_scores = torch.sigmoid(self.gate_proj(hidden_states))
-            if self.gate_type == "headwise":
-                gate_scores = gate_scores.unsqueeze(-1)  # [B, S, H, 1]
-            else:
-                gate_scores = gate_scores.view(batch_size, seq_len, self.num_heads, self.head_dim)
-            attn_output = attn_output * gate_scores
-
         attn_output = attn_output.contiguous().view(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
 
 
 class ReasoningBlockConfig:
+    """
+    Configuration A: The "Standard Transformer"
+        mlp_t=False (Use Attention)
+        use_convswiglu/use_boardswiglu=False (Use Standard MLP)
+        Result: Classic powerful reasoning. Attention handles global context; MLP handles logic.
+
+    Configuration B: The "Spatial-Inductive Transformer"
+        mlp_t=False (Use Attention)
+        use_convswiglu/use_boardswiglu=True (Use Conv MLP)
+        Result: Strongest. Attention sees the whole board ("I can win in column 7"), while ConvSwiGLU recognizes patterns immediately ("I have 3-in-a-row here"). This gives the best of both worlds.
+
+    Configuration C: The "MLP-Mixer" (Pure MLP)
+        mlp_t=True (Use Token MLP)
+        use_convswiglu/use_boardswiglu=False (Use Standard MLP)
+        Result: Very fast, very stable, but no Attention. The model mixes information globally using a fixed matrix. It might struggle with "dynamic" reasoning.
+
+    Configuration D: The "ConvMixer"
+        mlp_t=True
+        use_convswiglu/use_boardswiglu=True
+        Result: A fully convolutional/MLP network. It has zero attention mechanisms: mlp_t mixes the board globally (fixed weights), convswiglu mixes neighbors locally.
+    """
     def __init__(
         self,
         hidden_size: int,
@@ -309,10 +383,12 @@ class ReasoningBlockConfig:
         rms_norm_eps: float,
         mlp_t: bool = False,
         seq_len: int = 0,
+        cols: int = None,
+        rows: int = None,
         puzzle_emb_ndim: int = 0,
         puzzle_emb_len: int = 0,
-        attn_gate_type: str = None,
         use_conv_swiglu: bool = False,
+        use_board_swiglu: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -322,16 +398,33 @@ class ReasoningBlockConfig:
         self.puzzle_emb_ndim = puzzle_emb_ndim
         self.puzzle_emb_len = puzzle_emb_len
         self.seq_len = seq_len
-        self.attn_gate_type = attn_gate_type
+        self.cols = cols
+        self.rows = rows
         self.use_conv_swiglu = use_conv_swiglu
+        self.use_board_swiglu = use_board_swiglu
 
 
 class ReasoningBlock(nn.Module):
     def __init__(self, config: ReasoningBlockConfig) -> None:
         super().__init__()
-
         self.config = config
-        if self.config.use_conv_swiglu:
+        self.norm_eps = config.rms_norm_eps
+
+        # 1. Calculate Effective Length
+        # If config is 0 (auto), infer from dimensions. Otherwise use config.
+        # This handles the case where puzzle_emb_ndim > 0 but puzzle_emb_len was not manually set.
+        self.puzzle_emb_len = (
+            -(config.puzzle_emb_ndim // -config.hidden_size)
+            if config.puzzle_emb_len == 0
+            else config.puzzle_emb_len
+        )
+
+        if self.config.mlp_t:
+            self.mlp_t = SwiGLU(
+                hidden_size=config.seq_len + self.puzzle_emb_len, 
+                expansion=config.expansion,
+            )
+        else:
             self.self_attn = Attention(
                 hidden_size=config.hidden_size,
                 head_dim=config.hidden_size // config.num_heads,
@@ -339,62 +432,47 @@ class ReasoningBlock(nn.Module):
                 num_key_value_heads=config.num_heads,
                 causal=False,
             )
+
+        if self.config.use_board_swiglu:
+            self.mlp = BoardAwareSwiGLU(
+                hidden_size=config.hidden_size,
+                expansion=config.expansion,
+                rows=config.rows,
+                cols=config.cols,
+                puzzle_emb_len=self.puzzle_emb_len, 
+                conv_kernel=3
+            )
+            
+        elif self.config.use_conv_swiglu:
             self.mlp = ConvSwiGLU(
                 hidden_size=config.hidden_size,
                 expansion=config.expansion,
+                conv_kernel=3
             )
+            
         else:
-            if self.config.mlp_t:
-                self.puzzle_emb_len = (
-                    -(config.puzzle_emb_ndim // -config.hidden_size)
-                    if config.puzzle_emb_len == 0
-                    else config.puzzle_emb_len
-                )
-                self.mlp_t = SwiGLU(
-                    hidden_size=config.seq_len + config.puzzle_emb_len,  # L
-                    expansion=config.expansion,
-                )
-            else:
-                self.self_attn = Attention(
-                    hidden_size=config.hidden_size,
-                    head_dim=config.hidden_size // config.num_heads,
-                    num_heads=config.num_heads,
-                    num_key_value_heads=config.num_heads,
-                    causal=False,
-                    gate_type=config.attn_gate_type
-                )
             self.mlp = SwiGLU(
                 hidden_size=config.hidden_size,
                 expansion=config.expansion,
             )
-        self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # B, L, D = hidden_states.shape
-        # Post Norm
-        if self.config.use_conv_swiglu:
-            attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
-            hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
-            mlp_output = self.mlp(hidden_states)
-            hidden_states = rms_norm(hidden_states + mlp_output, variance_epsilon=self.norm_eps)
-            return hidden_states
-        else:
-            if self.config.mlp_t:
-                hidden_states = hidden_states.transpose(1, 2)
-                out = self.mlp_t(hidden_states)
-                hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-                hidden_states = hidden_states.transpose(1, 2)
-            else:
-                # Self Attention
-                hidden_states = rms_norm(
-                    hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
-                    variance_epsilon=self.norm_eps,
-                )
-            # Fully Connected
-            out = self.mlp(hidden_states)
-            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
-            return hidden_states
 
+        if self.config.mlp_t:
+            residual = hidden_states
+            hidden_states = hidden_states.transpose(1, 2)
+            out = self.mlp_t(hidden_states)
+            hidden_states = out.transpose(1, 2)
+            
+            hidden_states = rms_norm(residual + hidden_states, variance_epsilon=self.norm_eps)
+        else:
+            attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+            hidden_states = rms_norm(hidden_states + attn_out, variance_epsilon=self.norm_eps)
+
+        mlp_out = self.mlp(hidden_states)
+        hidden_states = rms_norm(hidden_states + mlp_out, variance_epsilon=self.norm_eps)
+            
+        return hidden_states
 
 class ReasoningModule(nn.Module):
     def __init__(self, layers: List[ReasoningBlock]):

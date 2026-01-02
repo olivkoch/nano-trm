@@ -35,7 +35,7 @@ model_tuning:
   use_mlp: false # true
   use_conv_swiglu: false
   attn_gate_type: null
-  use_muon: true
+  use_muon: false
 
 trainer:
   check_val_every_n_epoch: 100

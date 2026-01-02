@@ -84,12 +84,12 @@ class TRMModule(LightningModule):
         puzzle_emb_dim: int = 512,  # Puzzle embedding dimension
         puzzle_emb_len: int = 16,  # How many tokens for puzzle embedding
         rope_theta: int = 10000,
-        pos_emb_type: str = None,
+        pos_emb_type: str = "1d",
+        use_mlp_t: bool = False,
         use_conv_swiglu: bool = False,
+        use_board_swiglu: bool = False,
         lr_min_ratio: float = 1.0,
-        use_mlp: bool = False,
         use_muon: bool = False,
-        attn_gate_type: str = None,  # None, "headwise", "elementwise"
         vocab_size: int = 0,  # Should be set from datamodule
         num_puzzles: int = 0,  # Should be set from datamodule
         batch_size: int = 0,  # Should be set from datamodule
@@ -109,7 +109,10 @@ class TRMModule(LightningModule):
         self.embed_scale = math.sqrt(hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        log.info(f"Creating TRM with vocab size={vocab_size}, seq_len={seq_len}, puzzle_emb_len={puzzle_emb_len} {pos_emb_type=} and attn_gate_type={attn_gate_type}")
+        log.info(f"Creating TRM with vocab size={vocab_size}, seq_len={seq_len}, puzzle_emb_len={puzzle_emb_len} {pos_emb_type=} {puzzle_emb_dim=}")
+        log.info(f"{use_mlp_t=}, {use_conv_swiglu=}, {use_board_swiglu=}")
+
+         # Input embedding
 
         self.input_embedding = CastedEmbedding(
             vocab_size, hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
@@ -133,6 +136,9 @@ class TRMModule(LightningModule):
         else:
             log.info("Not using Rotary Embeddings")
 
+        if not use_mlp_t:
+            assert pos_emb_type is not None, "Rotary embeddings required if using attention"
+
         # a single network (not two separate networks)
         reasoning_config = ReasoningBlockConfig(
             hidden_size=hidden_size,
@@ -140,7 +146,7 @@ class TRMModule(LightningModule):
             expansion=ffn_expansion,
             rms_norm_eps=1e-5,
             seq_len=seq_len,
-            mlp_t=use_mlp,
+            mlp_t=use_mlp_t,
             puzzle_emb_ndim=puzzle_emb_dim,
             puzzle_emb_len=puzzle_emb_len,
             use_conv_swiglu=use_conv_swiglu,
@@ -616,8 +622,8 @@ class TRMModule(LightningModule):
                 self.log(f'grad/{name}', value, on_step=True)
             
             # Warning for problematic gradients
-            if total_grad_norm < 1e-6 or total_grad_norm > 100:
-                log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
+            # if total_grad_norm < 1e-6 or total_grad_norm > 100:
+            #     log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
 
     def log_metrics(self, metrics: dict, lr_this_step: float = None, batch_size: int = None):
 

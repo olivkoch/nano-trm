@@ -1,12 +1,12 @@
-# An implementation of TRM
+# Fast, easy-to-play-with Tiny Recursive Models
 
-This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1)
-
-Watch the [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M)!
+This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/pdf/2510.04871v1). Watch the [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M)!
 
 Train a TRM in a few minutes on an A10. Reproduce the official TRM results. Push the envelope.
 
 This project reproduces the results on Sudoku Extreme and Maze Hard (87% and 75% exact accuracy on validation, resp.)
+
+LAST UPDATE (Jan, 2026): ConvSwigLU and BoardConvSwigLU are now available on top of the classic SwigLU. They are disabled by default.
 
 <p align="center">
 <img src="demo/sudoku_thinking_9_steps.gif" width="400" alt="Sudoku thinking">

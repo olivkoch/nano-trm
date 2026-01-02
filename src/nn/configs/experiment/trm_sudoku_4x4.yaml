@@ -32,9 +32,9 @@ model_tuning:
   ffn_expansion: 4
   rope_theta: 10000
   pos_emb_type: null
-  use_mlp: true
+  use_mlp_t: true
   use_conv_swiglu: false
-  attn_gate_type: null
+  use_board_swiglu: false
   use_muon: false
 
 trainer:

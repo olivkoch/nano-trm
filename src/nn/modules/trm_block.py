@@ -459,12 +459,10 @@ class ReasoningBlock(nn.Module):
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
 
         if self.config.mlp_t:
-            residual = hidden_states
-            hidden_states = hidden_states.transpose(1, 2)
+            hidden_states = hidden_states.transpose(1,2)
             out = self.mlp_t(hidden_states)
-            hidden_states = out.transpose(1, 2)
-            
-            hidden_states = rms_norm(residual + hidden_states, variance_epsilon=self.norm_eps)
+            hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
+            hidden_states = hidden_states.transpose(1,2)
         else:
             attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
             hidden_states = rms_norm(hidden_states + attn_out, variance_epsilon=self.norm_eps)

@@ -622,8 +622,8 @@ class TRMModule(LightningModule):
                 self.log(f'grad/{name}', value, on_step=True)
             
             # Warning for problematic gradients
-            # if total_grad_norm < 1e-6 or total_grad_norm > 100:
-            #     log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
+            if total_grad_norm < 1e-6 or total_grad_norm > 100:
+                log.warning(f"Step {self.manual_step}: Gradient norm={total_grad_norm:.2e}")
 
     def log_metrics(self, metrics: dict, lr_this_step: float = None, batch_size: int = None):
 

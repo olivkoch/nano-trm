@@ -150,7 +150,7 @@ class TRMModule(LightningModule):
             puzzle_emb_ndim=puzzle_emb_dim,
             puzzle_emb_len=puzzle_emb_len,
             use_conv_swiglu=use_conv_swiglu,
-            use_board_swiglu=False,
+            use_board_swiglu=use_board_swiglu,
             rows = max_grid_size,
             cols = max_grid_size
         )
@@ -300,7 +300,7 @@ class TRMModule(LightningModule):
             z_H=torch.where(reset_flag.view(-1, 1, 1), self.z_H_init, carry.z_H),
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.z_L_init, carry.z_L),
         )
-    
+
     def inner_forward(
         self, carry: TRMInnerCarry, batch: Dict[str, torch.Tensor]
     ) -> Tuple[TRMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -467,7 +467,8 @@ class TRMModule(LightningModule):
         scaled_loss = loss / batch_size
         scaled_loss.backward()
 
-        self.grad_monitoring()
+        if batch_idx % 50 == 0:
+            self.grad_monitoring()
 
         lr_this_step = None
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)

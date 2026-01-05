@@ -76,29 +76,15 @@ Follow me on [X](https://x.com/olivkoch)
 
 # Technical Notes
 
-## Sweeps
+## Codebase structure
 
-Create sweep
-
-```
-uv run python scripts/create_sweep.py \
-    --sweep-file src/nn/configs/sweeps/trm_sweep.yaml \
-    --project trm-sudoku
-```
-
-Run sweep agent
-
-```
-uv run python src/nn/train_sweep.py \
-    --sweep-id <sweep_id> \
-    --project trm-sudoku \
-    --experiment trm_sudoku6x6 \
-    --count 20
-```
+- `src/nn/train.py`: main training script
+- `src/nn/models/trm.py`: TRM model
+- `src/nn/configs/experiments`: main experimentation configurations.
 
 ## Installing AdamATan2
 
-This project uses the vanilla AdamW optimizer if AdamATan2 is not installed. If you want AdamATan2 and struggle to install it, here is how to install it from source:
+This project uses the vanilla AdamW optimizer. If you want AdamATan2 and struggle to install it, here is how to install it from source:
 
 ```
 # Clone the repo
@@ -114,3 +100,5 @@ cd /home/ubuntu/nano-trm
 uv run python
 from adam_atan2 import AdamATan2 -> this should work
 ```
+
+AdamAtan2 is not needed to reproduce the official results on Sudoku Extreme and Maze Hard. It might be needed on harder problems / deeper models (e.g. ARC AGI 2)

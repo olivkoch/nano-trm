@@ -12,7 +12,7 @@ Train a TRM in a few minutes on an A10. Reproduce the official TRM results. Push
 
 Recently, recursive models made a big comeback, notably with Tiny Recursive Models, which [won 1st paper award at the ARC-AGI 2 contest](https://www.google.com/url?sa=t&source=web&rct=j&opi=89978449&url=https://www.youtube.com/watch%3Fv%3DP9zzUM0PrBM&ved=2ahUKEwiO86mcjfWRAxW7BfsDHeyvHsUQwqsBegQIFhAB&usg=AOvVaw12B_Wsm15MK-AVqrZVbGAS) and maybe more importantly, reached an impressive level of performance on several benchmarks such as ARC-AGI 2 and Sudoku Extreme. TRM brings a lot of simplicity to its ancestor, HRM. However, the codebase inherits much of HRM's legacy.
 
-We propose a clean implementation of TRM. We call it "nano" because it is easy to experiment with, yet incorporates all important implementation details of TRM. The project uses hydra, torch lightning and uv to make experimentation easy. We propose an [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M) and small datasets (Sudoku 4x4 and 6x6) that lets you train a TRM on an A10 in just one hour! 
+We propose a clean implementation of TRM. We call it "nano" because it is easy to experiment with, yet incorporates all important implementation details of TRM. The project uses hydra, torch lightning and uv to make experimentation easy. We propose an [in-code introductory video](https://youtu.be/8Gzv5tGmJ1M) and small datasets (Sudoku 4x4 and 6x6) that lets you train a TRM on an A10 in a few minutes! 
 
 This repo reproduces the results on Sudoku Extreme and Maze Hard (87% and 75% exact accuracy on validation, respectively). We hope you will find this repo useful for your own experimentation on TRM.
 

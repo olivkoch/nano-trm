@@ -54,7 +54,7 @@ Run a training:
 
 Download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
 
-# Less (Really) is More: iterate on smaller datasets
+# Visualizations
 
 Generate a Sudoku dataset: 
 

@@ -54,29 +54,13 @@ Run a training:
 
 `uv run python src/nn/train.py experiment=trm_sudoku_4x4`
 
+This take a few minutes on a A10!
+
 # ARC-AGI
 
 Download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
 
 # Visualizations
-
-Generate a Sudoku dataset: 
-
-`./bash/generate_sudoku_data.sh`
-
-Test/visualize the data: 
-
-`uv run tests/src/nn/data/test_sudoku_data.py <data_dir>`
-
-Run a training: 
-
-`uv run python src/nn/train.py experiment=trm_sudoku4x4` 
-
-Takes a few mins on an A10
-
-Independant evaluation with visualizations: 
-
-`uv run python src/nn/evaluate.py +checkpoint=/tmp/ml-experiments/lunar-pine-174/checkpoints/last.ckpt +data_dir=./data/sudoku_4x4_small`
 
 Sudoku:
 - Evaluate and generate a gif: `uv run python src/nn/evaluate.py +checkpoint=./checkpoints/smooth-sunset-204.ckpt +data_dir=./data/sudoku-extreme-1k-aug-1k +visualize=true +save_gif=true +min_steps=9`

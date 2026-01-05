@@ -40,11 +40,19 @@ Run a training:
 
 Training time ~2h on an H100 SXM5. You should get to ~75% exact accuracy on validation (same as the reference implementation)
 
+# Small Sudoku datasets
+
+Generate data:
+
+`bash bash/generate_sudoku_data.sh` -> choose which dataset you want to generate
+
+Run a training:
+
+`uv run python src/nn/train.py experiment=trm_sudoku_4x4`
+
 # ARC-AGI
 
 Download the data from the [kaggle challenge page](https://www.kaggle.com/competitions/arc-prize-2025).
-
-Experiments in progress.
 
 # Less (Really) is More: iterate on smaller datasets
 

@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /data: sudoku4x4
+  - override /data: sudoku_4x4
   - override /model: trm
   - override /callbacks: default
   - override /trainer: gpu
@@ -10,7 +10,7 @@ tags: ["trm", "sudoku", "4x4"]
 
 timekeeping:
   max_epochs: 500
-  batch_size: 768
+  batch_size: 32
   num_workers: 0
 
 model_tuning:

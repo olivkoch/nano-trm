@@ -70,10 +70,6 @@ Maze:
 - Generate a dataset with test data (not just val): `uv run python scripts/data/build_maze_dataset.py --output-dir ./data/maze-30x30-hard-1k --num-aug 0 --eval-ratio 0.5`
 - Evaluate and generate a gif: `uv run python src/nn/evaluate.py +checkpoint=./checkpoints/stellar-shape-194.ckpt +data_dir=./data/maze-30x30-hard-1k +visualize=true +save_gif=true +min_steps=9 +task=maze`
 
-# Comments / contributions
-
-Follow me on [X](https://x.com/olivkoch)
-
 # Technical Notes
 
 ## Codebase structure
@@ -102,3 +98,9 @@ from adam_atan2 import AdamATan2 -> this should work
 ```
 
 AdamAtan2 is not needed to reproduce the official results on Sudoku Extreme and Maze Hard. It might be needed on harder problems / deeper models (e.g. ARC AGI 2)
+
+# Contact
+
+Follow me on [X](https://x.com/olivkoch)
+
+My [homepage](https://olivkoch.github.io)

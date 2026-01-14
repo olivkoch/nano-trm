@@ -103,7 +103,15 @@ class TRMModule(LightningModule):
         # CRITICAL: Manual optimization
         self.automatic_optimization = False
 
-        self.forward_dtype = torch.bfloat16
+        if torch.backends.mps.is_available():
+             log.info("MPS (Mac) detected. Forcing forward_dtype to float32 to avoid NaNs.")
+             self.forward_dtype = torch.float32
+        elif not torch.cuda.is_available():
+             # Fallback for pure CPU testing if needed
+             self.forward_dtype = torch.float32
+        else:
+             # Standard GPU behavior
+             self.forward_dtype = torch.bfloat16
 
         # Token embeddings
         self.embed_scale = math.sqrt(hidden_size)

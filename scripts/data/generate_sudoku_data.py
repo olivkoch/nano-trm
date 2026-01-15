@@ -134,7 +134,8 @@ def encode_puzzle_inline(
 ):
     """Encode a puzzle directly into pre-allocated output arrays.
     
-    This avoids creating intermediate arrays and method call overhead.
+    Uses 2D layout: grid placed in top-left of max_grid_size x max_grid_size.
+    Foobar
     """
     # Shift values: 0 -> 2 (blank token), 1-N -> 3 to N+2
     puzzle_shifted = puzzle.copy()
@@ -142,17 +143,13 @@ def encode_puzzle_inline(
     puzzle_shifted[puzzle > 0] = puzzle[puzzle > 0] + 2
     solution_shifted = solution + 2
     
-    # Write to output arrays
-    seq_len = grid_size * grid_size
-    inp_out[:seq_len] = puzzle_shifted.ravel()
-    lbl_out[:seq_len] = solution_shifted.ravel()
+    # Reshape output arrays to 2D and write to top-left corner
+    # The rest remains as initialized (0 for inputs, IGNORE_LABEL_ID for labels)
+    inp_view = inp_out.reshape(max_grid_size, max_grid_size)
+    lbl_view = lbl_out.reshape(max_grid_size, max_grid_size)
     
-    # Handle padding for smaller grids
-    if max_grid_size > grid_size:
-        max_seq = max_grid_size * max_grid_size
-        inp_out[seq_len:max_seq] = 0  # padding token
-        lbl_out[seq_len:max_seq] = IGNORE_LABEL_ID
-
+    inp_view[:grid_size, :grid_size] = puzzle_shifted
+    lbl_view[:grid_size, :grid_size] = solution_shifted
 
 # =============================================================================
 # POOL GENERATION

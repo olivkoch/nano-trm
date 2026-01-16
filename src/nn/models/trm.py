@@ -96,6 +96,7 @@ class TRMModule(LightningModule):
         pad_value: int = -1,  # Should be set from datamodule
         seq_len: int = 0,  # Should be set from datamodule
         output_dir: str = None,
+        forward_dtype: torch.dtype = None
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -103,15 +104,21 @@ class TRMModule(LightningModule):
         # CRITICAL: Manual optimization
         self.automatic_optimization = False
 
-        if torch.backends.mps.is_available():
-             log.info("MPS (Mac) detected. Forcing forward_dtype to float32 to avoid NaNs.")
-             self.forward_dtype = torch.float32
-        elif not torch.cuda.is_available():
-             # Fallback for pure CPU testing if needed
-             self.forward_dtype = torch.float32
+        if forward_dtype is not None:
+            self.forward_dtype = forward_dtype
+            print(f"Manually casting TRM to {self.forward_dtype}")
         else:
-             # Standard GPU behavior
-             self.forward_dtype = torch.bfloat16
+            # cast according to device
+            if torch.backends.mps.is_available():
+                log.info("MPS (Mac) detected. Forcing forward_dtype to float32 to avoid NaNs.")
+                self.forward_dtype = torch.float32
+            elif not torch.cuda.is_available():
+                # Fallback for pure CPU testing if needed
+                self.forward_dtype = torch.float32
+            else:
+                # Standard GPU behavior
+                self.forward_dtype = torch.bfloat16
+            print(f"Auto-casting TRM to {self.forward_dtype}")
 
         # Token embeddings
         self.embed_scale = math.sqrt(hidden_size)

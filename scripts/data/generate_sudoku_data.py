@@ -84,7 +84,7 @@ def shuffle_sudoku(board: np.ndarray, solution: np.ndarray, grid_size: int, rng:
     # Apply transformations using advanced indexing
     transpose_flag = rng.random() < 0.5
     
-    if transpose_flag:
+    if transpose_flag and grid_size in [4, 9]:
         new_board = digit_map[board.T[row_perm][:, col_perm]]
         new_solution = digit_map[solution.T[row_perm][:, col_perm]]
     else:

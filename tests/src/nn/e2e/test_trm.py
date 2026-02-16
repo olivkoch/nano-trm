@@ -6,8 +6,7 @@ try:
 except ImportError:
     print("Failed to import adam2")
 from src.nn.data.arc_datamodule import ARCDataModuleWithPuzzles
-from src.nn.data.xor_datamodule import SequentialXORDataModule
-from src.nn.models.trm_module import TRMModule
+from src.nn.models.trm import TRMModule
 from src.nn.modules.sparse_embeddings import (
     CastedSparseEmbedding,
     CastedSparseEmbeddingSignSGD_Distributed,
@@ -17,11 +16,7 @@ from src.nn.modules.sparse_embeddings import (
 def test_data_loading(dataset="xor"):
     """Test that data loads correctly with puzzle IDs."""
     print("Testing data loading...")
-    if dataset == "xor":
-        dm = SequentialXORDataModule(
-            num_train=200, num_val=200, num_test=200, batch_size=10, num_workers=0
-        )
-    elif dataset == "arc":
+    if dataset == "arc":
         dm = ARCDataModuleWithPuzzles(
             data_dir="data", batch_size=10, samples_per_task=10, num_workers=0
         )

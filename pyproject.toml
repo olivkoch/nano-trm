@@ -141,7 +141,10 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 minversion = "7.0"
-testpaths = ["tests"]
+testpaths = [
+    "tests/src/nn/modules",
+    "tests/src/nn/models",
+]
 pythonpath = ["src"]
 addopts = [
     "-ra",

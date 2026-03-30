@@ -12,7 +12,7 @@ This is an implementation of the [Tiny Recursive Model (TRM)](https://arxiv.org/
 Train a TRM in a few minutes on an A10. Reproduce the official TRM results. Push the envelope.
 
 <p align="center">
-<img src="demo/sudoku_thinking_9_steps.gif" width="400" alt="Sudoku thinking">
+<img src="https://raw.githubusercontent.com/olivkoch/nano-trm/main/demo/sudoku_thinking_9_steps.gif" width="400" alt="Sudoku thinking">
 </p>
 
 # Motivation

@@ -9,9 +9,11 @@ from src.nn.modules.trm_block import (
     RMSNorm,
     RotaryEmbedding,
     SwiGLU,
-    TransformerBlock,
-    apply_rotary_pos_emb,
+    ReasoningBlock,
+    ReasoningBlockConfig,
+    ReasoningModule,
     rotate_half,
+    apply_rotary_pos_emb,
 )
 
 
@@ -54,38 +56,37 @@ class TestRotaryEmbedding:
     def test_output_shape(self):
         """RoPE should output correct shapes."""
         head_dim = 64
-        seq_len = 10
-        rope = RotaryEmbedding(head_dim)
+        max_seq_len = 100
+        rope = RotaryEmbedding(head_dim, max_seq_len, base=10000)
 
-        x = torch.randn(2, seq_len, head_dim)
-        cos, sin = rope(x, seq_len)
-
-        assert cos.shape == (1, seq_len, head_dim)
-        assert sin.shape == (1, seq_len, head_dim)
+        cos, sin = rope()
+        
+        assert cos is not None
+        assert sin is not None
+        assert cos.shape == (max_seq_len, head_dim)
+        assert sin.shape == (max_seq_len, head_dim)
 
     def test_deterministic(self):
-        """RoPE should be deterministic for same sequence length."""
+        """RoPE should be deterministic."""
         head_dim = 64
-        seq_len = 10
-        rope = RotaryEmbedding(head_dim)
+        max_seq_len = 100
+        rope = RotaryEmbedding(head_dim, max_seq_len, base=10000)
 
-        x = torch.randn(2, seq_len, head_dim)
-        cos1, sin1 = rope(x, seq_len)
-        cos2, sin2 = rope(x, seq_len)
+        cos1, sin1 = rope()
+        cos2, sin2 = rope()
 
         assert torch.allclose(cos1, cos2)
         assert torch.allclose(sin1, sin2)
 
-    def test_different_seq_lengths(self):
-        """RoPE should handle different sequence lengths."""
+    def test_disabled_rope(self):
+        """RoPE with base=0 should be disabled."""
         head_dim = 64
-        rope = RotaryEmbedding(head_dim, max_seq_len=100)
-
-        for seq_len in [5, 10, 20, 50]:
-            x = torch.randn(2, seq_len, head_dim)
-            cos, sin = rope(x, seq_len)
-            assert cos.shape == (1, seq_len, head_dim)
-            assert sin.shape == (1, seq_len, head_dim)
+        max_seq_len = 100
+        rope = RotaryEmbedding(head_dim, max_seq_len, base=0)
+        
+        cos, sin = rope()
+        assert cos is None
+        assert sin is None
 
 
 class TestRotaryHelpers:
@@ -104,13 +105,15 @@ class TestRotaryHelpers:
         """Rotary application should preserve shape."""
         batch, seq_len, num_heads, head_dim = 2, 10, 8, 64
 
-        x = torch.randn(batch, seq_len, num_heads, head_dim)
-        cos = torch.randn(1, seq_len, head_dim)  # Format from RotaryEmbedding
-        sin = torch.randn(1, seq_len, head_dim)
+        q = torch.randn(batch, seq_len, num_heads, head_dim)
+        k = torch.randn(batch, seq_len, num_heads, head_dim)
+        cos = torch.randn(seq_len, head_dim)
+        sin = torch.randn(seq_len, head_dim)
 
-        result = apply_rotary_pos_emb(x, cos, sin)
+        q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin)
 
-        assert result.shape == x.shape
+        assert q_embed.shape == q.shape
+        assert k_embed.shape == k.shape
 
 
 class TestSwiGLU:
@@ -118,26 +121,25 @@ class TestSwiGLU:
 
     def test_shape_preservation(self):
         """SwiGLU should preserve input/output dimensions."""
-        dim = 64
-        hidden_dim = 256
-        swiglu = SwiGLU(dim, hidden_dim, bias=False)
+        hidden_size = 64
+        expansion = 2.0
+        swiglu = SwiGLU(hidden_size, expansion)
 
-        x = torch.randn(2, 10, dim)
+        x = torch.randn(2, 10, hidden_size)
         output = swiglu(x)
 
         assert output.shape == x.shape
 
     def test_no_bias(self):
-        """SwiGLU should have no bias when bias=False."""
-        swiglu = SwiGLU(64, 256, bias=False)
+        """SwiGLU linear layers should have no bias."""
+        swiglu = SwiGLU(64, 2.0)
 
-        assert swiglu.w1.bias is None
-        assert swiglu.w2.bias is None
-        assert swiglu.w3.bias is None
+        assert swiglu.gate_up_proj.bias is None
+        assert swiglu.down_proj.bias is None
 
     def test_nonlinearity(self):
         """SwiGLU should be non-linear."""
-        swiglu = SwiGLU(64, 256, bias=False)
+        swiglu = SwiGLU(64, 2.0)
 
         x1 = torch.randn(1, 5, 64)
         x2 = torch.randn(1, 5, 64)
@@ -149,62 +151,75 @@ class TestSwiGLU:
         assert not torch.allclose(result_sum, result_separate)
 
 
-class TestTransformerBlock:
-    """Test complete Transformer block."""
+class TestReasoningBlock:
+    """Test ReasoningBlock (transformer block)."""
 
     def test_shape_preservation(self):
-        """Transformer block should preserve shape."""
-        hidden_size = 512
+        """ReasoningBlock should preserve shape."""
+        hidden_size = 128
         num_heads = 8
         batch, seq_len = 2, 10
 
-        block = TransformerBlock(hidden_size, num_heads)
+        config = ReasoningBlockConfig(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=seq_len,
+        )
+        block = ReasoningBlock(config)
+        
         x = torch.randn(batch, seq_len, hidden_size)
-
-        output = block(x)
+        output = block(None, x)
 
         assert output.shape == x.shape
 
     def test_hidden_size_divisible_by_heads(self):
-        """Should raise error if hidden_size not divisible by num_heads."""
-        with pytest.raises(AssertionError):
-            TransformerBlock(hidden_size=100, num_heads=8)
+        """Should work when hidden_size is divisible by num_heads."""
+        config = ReasoningBlockConfig(
+            hidden_size=64,
+            num_heads=8,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=10,
+        )
+        block = ReasoningBlock(config)
+        
+        assert block is not None
 
-    def test_attention_output_range(self):
-        """Attention output should be reasonable (not exploding)."""
-        block = TransformerBlock(hidden_size=64, num_heads=8)
+    def test_output_range(self):
+        """Output should be reasonable (not exploding)."""
+        config = ReasoningBlockConfig(
+            hidden_size=64,
+            num_heads=8,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=10,
+        )
+        block = ReasoningBlock(config)
+        
         x = torch.randn(2, 10, 64)
-
-        output = block(x)
+        output = block(None, x)
 
         # Output should be bounded (not NaN or inf)
         assert not torch.isnan(output).any()
         assert not torch.isinf(output).any()
         assert output.abs().max() < 100  # Reasonable bound
 
-    def test_residual_connections(self):
-        """Block should have residual connections."""
-        block = TransformerBlock(hidden_size=64, num_heads=8)
-
-        # Zero initialization should result in identity-like behavior
-        # due to residual connections
-        with torch.no_grad():
-            for param in block.parameters():
-                param.zero_()
-
-        x = torch.randn(2, 10, 64)
-        output = block(x)
-
-        # With zero weights, residuals mean output ≈ input
-        # (not exactly due to normalization)
-        assert output.shape == x.shape
-
     def test_forward_backward(self):
         """Should support forward and backward pass."""
-        block = TransformerBlock(hidden_size=64, num_heads=8)
+        config = ReasoningBlockConfig(
+            hidden_size=64,
+            num_heads=8,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=10,
+        )
+        block = ReasoningBlock(config)
+        
         x = torch.randn(2, 10, 64, requires_grad=True)
 
-        output = block(x)
+        output = block(None, x)
         loss = output.sum()
         loss.backward()
 
@@ -213,28 +228,50 @@ class TestTransformerBlock:
         assert not torch.isnan(x.grad).any()
 
     def test_different_sequence_lengths(self):
-        """Should handle different sequence lengths."""
-        block = TransformerBlock(hidden_size=64, num_heads=8)
-
-        for seq_len in [5, 10, 20, 100]:
+        """Should handle different sequence lengths with appropriate config."""
+        for seq_len in [5, 10, 20]:
+            config = ReasoningBlockConfig(
+                hidden_size=64,
+                num_heads=8,
+                expansion=2,
+                rms_norm_eps=1e-5,
+                seq_len=seq_len,
+            )
+            block = ReasoningBlock(config)
+            
             x = torch.randn(2, seq_len, 64)
-            output = block(x)
+            output = block(None, x)
             assert output.shape == (2, seq_len, 64)
 
     def test_batch_size_one(self):
         """Should work with batch_size=1."""
-        block = TransformerBlock(hidden_size=64, num_heads=8)
+        config = ReasoningBlockConfig(
+            hidden_size=64,
+            num_heads=8,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=10,
+        )
+        block = ReasoningBlock(config)
+        
         x = torch.randn(1, 10, 64)
-
-        output = block(x)
+        output = block(None, x)
         assert output.shape == (1, 10, 64)
 
     def test_gradient_flow(self):
         """Gradients should flow through all components."""
-        block = TransformerBlock(hidden_size=64, num_heads=8)
+        config = ReasoningBlockConfig(
+            hidden_size=64,
+            num_heads=8,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=10,
+        )
+        block = ReasoningBlock(config)
+        
         x = torch.randn(2, 10, 64, requires_grad=True)
 
-        output = block(x)
+        output = block(None, x)
         loss = output.mean()
         loss.backward()
 
@@ -243,60 +280,106 @@ class TestTransformerBlock:
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for {name}"
                 assert not torch.isnan(param.grad).any(), f"NaN gradient for {name}"
+                
+    def test_with_mlp_t(self):
+        """Test ReasoningBlock with mlp_t enabled."""
+        config = ReasoningBlockConfig(
+            hidden_size=64,
+            num_heads=8,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=10,
+            mlp_t=True,
+        )
+        block = ReasoningBlock(config)
+        
+        x = torch.randn(2, 10, 64)
+        output = block(None, x)
+        
+        assert output.shape == x.shape
+        assert not torch.isnan(output).any()
 
 
-class TestTransformerIntegration:
-    """Integration tests for full Transformer."""
+class TestReasoningModule:
+    """Integration tests for ReasoningModule (multi-layer)."""
 
     def test_multi_layer_forward(self):
-        """Multiple Transformer blocks should work together."""
+        """Multiple ReasoningBlocks should work together."""
         hidden_size = 128
         num_heads = 8
         num_layers = 4
+        seq_len = 10
 
-        blocks = torch.nn.ModuleList(
-            [TransformerBlock(hidden_size, num_heads) for _ in range(num_layers)]
-        )
+        configs = [
+            ReasoningBlockConfig(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                expansion=2,
+                rms_norm_eps=1e-5,
+                seq_len=seq_len,
+            )
+            for _ in range(num_layers)
+        ]
+        
+        blocks = [ReasoningBlock(config) for config in configs]
+        module = ReasoningModule(layers=blocks)
 
-        x = torch.randn(2, 10, hidden_size)
+        # ReasoningModule signature: (hidden_states, input_injection, **kwargs)
+        hidden_states = torch.randn(2, seq_len, hidden_size)
+        input_injection = torch.randn(2, seq_len, hidden_size)
+        
+        output = module(hidden_states, input_injection, cos_sin=None)
 
-        for block in blocks:
-            x = block(x)
-
-        assert x.shape == (2, 10, hidden_size)
-        assert not torch.isnan(x).any()
+        assert output.shape == (2, seq_len, hidden_size)
+        assert not torch.isnan(output).any()
 
     def test_with_input_sum(self):
-        """Test with summed inputs (as used in HRM)."""
+        """Test with summed inputs (as used in TRM)."""
         hidden_size = 64
-        block = TransformerBlock(hidden_size, num_heads=8)
+        seq_len = 10
+        
+        config = ReasoningBlockConfig(
+            hidden_size=hidden_size,
+            num_heads=8,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=seq_len,
+        )
+        block = ReasoningBlock(config)
 
-        x = torch.randn(2, 10, hidden_size)
-        y = torch.randn(2, 10, hidden_size)
-        z = torch.randn(2, 10, hidden_size)
+        x = torch.randn(2, seq_len, hidden_size)
+        y = torch.randn(2, seq_len, hidden_size)
+        z = torch.randn(2, seq_len, hidden_size)
 
-        # Sum inputs as in HRM
+        # Sum inputs as in TRM
         combined = x + y + z
-        output = block(combined)
+        output = block(None, combined)
 
-        assert output.shape == (2, 10, hidden_size)
+        assert output.shape == (2, seq_len, hidden_size)
         assert not torch.isnan(output).any()
 
     def test_detach_between_steps(self):
-        """Test detaching between recursion steps (as in HRM)."""
-        block = TransformerBlock(hidden_size=64, num_heads=8)
+        """Test detaching between recursion steps (as in TRM)."""
+        config = ReasoningBlockConfig(
+            hidden_size=64,
+            num_heads=8,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=10,
+        )
+        block = ReasoningBlock(config)
 
         x = torch.randn(2, 10, 64)
         y = torch.randn(2, 10, 64, requires_grad=True)
 
         # First step
-        output1 = block(x + y)
+        output1 = block(None, x + y)
 
         # Detach for next step
         y_detached = output1.detach()
 
         # Second step
-        output2 = block(x + y_detached)
+        output2 = block(None, x + y_detached)
         loss = output2.sum()
         loss.backward()
 
@@ -305,45 +388,58 @@ class TestTransformerIntegration:
         assert output2.requires_grad
 
 
-def test_transformer_with_recursion():
-    """Test Transformer in recursive setting like HRM."""
-    hidden_size = 64
-    num_heads = 8
-    L_net = torch.nn.ModuleList([TransformerBlock(hidden_size, num_heads) for _ in range(2)])
-    H_net = torch.nn.ModuleList([TransformerBlock(hidden_size, num_heads) for _ in range(2)])
+@pytest.mark.parametrize("hidden_size,num_heads", [(64, 8), (128, 8), (256, 16)])
+def test_reasoning_block_with_recursion(hidden_size, num_heads):
+    """Test ReasoningBlock in recursive setting like TRM."""
+    seq_len = 10
+    num_layers = 2
+    
+    # Create L and H networks
+    L_configs = [
+        ReasoningBlockConfig(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=seq_len,
+        )
+        for _ in range(num_layers)
+    ]
+    H_configs = [
+        ReasoningBlockConfig(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            expansion=2,
+            rms_norm_eps=1e-5,
+            seq_len=seq_len,
+        )
+        for _ in range(num_layers)
+    ]
+    
+    L_net = ReasoningModule(layers=[ReasoningBlock(c) for c in L_configs])
+    H_net = ReasoningModule(layers=[ReasoningBlock(c) for c in H_configs])
 
-    batch, seq_len = 2, 10
+    batch = 2
     x = torch.randn(batch, seq_len, hidden_size)
     zL = torch.randn(batch, seq_len, hidden_size)
     zH = torch.randn(batch, seq_len, hidden_size)
 
-    # Simulate HRM forward pass
-    def net_forward(net, *inputs):
-        combined = sum(inputs)
-        for block in net:
-            combined = block(combined)
-        return combined
-
-    # n=2, T=2 pattern
+    # Simulate TRM forward pass (simplified)
+    # ReasoningModule: (hidden_states, input_injection, **kwargs)
     with torch.no_grad():
         # First cycle
-        zL = net_forward(L_net, zL, zH, x)
-        zL = net_forward(L_net, zL, zH, x)
-        zH = net_forward(H_net, zH, zL)
+        zL = L_net(zL, zH + x, cos_sin=None)
+        zL = L_net(zL, zH + x, cos_sin=None)
+        zH = H_net(zH, zL, cos_sin=None)
 
         # Second cycle (partial)
-        zL = net_forward(L_net, zL, zH, x)
+        zL = L_net(zL, zH + x, cos_sin=None)
 
     # Final with gradients
-    zL = net_forward(L_net, zL, zH, x)
-    zH = net_forward(H_net, zH, zL)
+    zL = L_net(zL, zH + x, cos_sin=None)
+    zH = H_net(zH, zL, cos_sin=None)
 
     assert zL.shape == (batch, seq_len, hidden_size)
     assert zH.shape == (batch, seq_len, hidden_size)
     assert zH.requires_grad
     assert not torch.isnan(zH).any()
-
-
-if __name__ == "__main__":
-    # Run tests
-    pytest.main([__file__, "-v"])

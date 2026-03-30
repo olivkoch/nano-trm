@@ -3,7 +3,7 @@ name = "nano-trm"
 version = "0.1.0"
 description = "An implementation of TRM"
 readme = "README.md"
-requires-python = "==3.12.1"
+requires-python = ">=3.12,<3.15"
 authors = [
     { name = "Olivier Koch", email = "olivier.koch@gmail.com" }
 ]

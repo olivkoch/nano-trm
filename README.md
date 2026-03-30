@@ -1,6 +1,6 @@
 [![PyPI version](https://badge.fury.io/py/nano-trm.svg)](https://pypi.org/project/nano-trm/)
-[![Tests](https://github.com/olivkoch/nano-trm/actions/workflows/tests.yml/badge.svg)](https://github.com/YOUR_USER/YOUR_REPO/actions)
-[![codecov](https://codecov.io/gh/olivkoch/nano-trm/branch/main/graph/badge.svg)](https://codecov.io/gh/YOUR_USER/YOUR_REPO)
+[![Tests](https://github.com/olivkoch/nano-trm/actions/workflows/tests.yml/badge.svg)](https://github.com/olivkoch/nano-trm/actions)
+[![codecov](https://codecov.io/gh/olivkoch/nano-trm/branch/main/graph/badge.svg)](https://codecov.io/gh/olivkoch/nano-trm)
 [![docs](https://readthedocs.org/projects/nano-trm/badge/?version=latest)](https://nano-trm.readthedocs.io)
 [![PyPI Downloads](https://img.shields.io/pypi/dm/nano-trm)](https://pypi.org/project/nano-trm/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)

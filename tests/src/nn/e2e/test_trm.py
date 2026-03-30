@@ -1,11 +1,14 @@
-# debug_trm.py
+"""End-to-end tests for TRM model with synthetic data."""
+import pytest
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 try:
     from adam_atan2 import AdamATan2
+    HAS_ADAM_ATAN2 = True
 except ImportError:
-    print("Failed to import adam2")
-from src.nn.data.arc_datamodule import ARCDataModuleWithPuzzles
+    HAS_ADAM_ATAN2 = False
+
 from src.nn.models.trm import TRMModule
 from src.nn.modules.sparse_embeddings import (
     CastedSparseEmbedding,
@@ -13,136 +16,270 @@ from src.nn.modules.sparse_embeddings import (
 )
 
 
-def test_data_loading(dataset="xor"):
-    """Test that data loads correctly with puzzle IDs."""
-    print("Testing data loading...")
-    if dataset == "arc":
-        dm = ARCDataModuleWithPuzzles(
-            data_dir="data", batch_size=10, samples_per_task=10, num_workers=0
+class SyntheticDataModule:
+    """Mock datamodule with synthetic data for functional testing."""
+    
+    def __init__(
+        self,
+        batch_size: int = 8,
+        num_puzzles: int = 5,
+        grid_size: int = 10,
+        num_colors: int = 10,
+        pad_value: int = 10,
+    ):
+        self.batch_size = batch_size
+        self.num_puzzles = num_puzzles
+        self.grid_size = grid_size
+        self.num_colors = num_colors
+        self.pad_value = pad_value
+        
+    def setup(self):
+        """Setup method to match ARCDataModuleWithPuzzles interface."""
+        pass
+    
+    def train_dataloader(self):
+        """Create a synthetic train dataloader."""
+        # Create random input grids (batch_size, grid_size, grid_size)
+        inputs = torch.randint(
+            0, self.num_colors, (self.batch_size, self.grid_size, self.grid_size)
         )
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
+        
+        # Create random output grids
+        outputs = torch.randint(
+            0, self.num_colors, (self.batch_size, self.grid_size, self.grid_size)
+        )
+        
+        # Flatten the grids to sequences
+        inputs_flat = inputs.view(self.batch_size, -1)
+        outputs_flat = outputs.view(self.batch_size, -1)
+        
+        # Create random puzzle identifiers
+        puzzle_ids = torch.randint(0, self.num_puzzles, (self.batch_size,))
+        
+        # Create dataset and loader
+        dataset = TensorDataset(inputs_flat, outputs_flat, puzzle_ids)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        
+        return loader
+    
+    def get_batch(self):
+        """Get a single batch formatted like ARCDataModuleWithPuzzles."""
+        loader = self.train_dataloader()
+        inputs, outputs, puzzle_ids = next(iter(loader))
+        
+        return {
+            'input': inputs,
+            'output': outputs,
+            'puzzle_identifiers': puzzle_ids,
+        }
+
+
+@pytest.fixture
+def synthetic_datamodule():
+    """Fixture providing a synthetic datamodule."""
+    dm = SyntheticDataModule(
+        batch_size=8,
+        num_puzzles=5,
+        grid_size=10,
+        num_colors=10,
+        pad_value=10,
+    )
     dm.setup()
-
-    print(f"Num puzzles: {dm.num_puzzles}")
-
-    # Get a batch
-    train_loader = dm.train_dataloader()
-    batch = next(iter(train_loader))
-
-    print(f"Batch keys: {batch.keys()}")
-    print(f"Inputs shape: {batch['input'].shape}")
-    print(f"Puzzle IDs shape: {batch['puzzle_identifiers'].shape}")
-    print(f"Sample puzzle IDs: {batch['puzzle_identifiers'][:5]}")
-
-    if "output" in batch:
-        print(f"Output shape: {batch['output'].shape}")
-
-    return dm, batch
+    return dm
 
 
-def test_model_forward(dataset="xor"):
-    """Test model forward pass with carry."""
-    print("\nTesting model forward...")
+@pytest.fixture
+def synthetic_batch(synthetic_datamodule):
+    """Fixture providing a synthetic batch."""
+    return synthetic_datamodule.get_batch()
 
-    # Get data
-    dm, batch = test_data_loading(dataset=dataset)
 
-    # Create model
+@pytest.fixture
+def trm_model(synthetic_datamodule):
+    """Fixture providing a TRM model."""
+    seq_len = synthetic_datamodule.grid_size * synthetic_datamodule.grid_size
     model = TRMModule(
-        hidden_size=128,
+        hidden_size=64,
         num_layers=2,
-        puzzle_emb_dim=128,
+        puzzle_emb_dim=64,
         puzzle_emb_len=4,
         N_supervision=3,
-        n_latent_recursions=1,
-        T_deep_recursions=1,
-        num_puzzles=dm.num_puzzles,
-        batch_size=dm.batch_size,
-        pad_value=dm.pad_value,
+        H_cycles=2,
+        L_cycles=3,
+        num_puzzles=synthetic_datamodule.num_puzzles,
+        batch_size=synthetic_datamodule.batch_size,
+        pad_value=synthetic_datamodule.pad_value,
+        vocab_size=synthetic_datamodule.num_colors + 1,  # colors + pad
+        seq_len=seq_len,
+        max_grid_size=synthetic_datamodule.grid_size,
     )
+    return model
 
+
+def test_synthetic_data_loading(synthetic_datamodule, synthetic_batch):
+    """Test that synthetic data loads correctly with puzzle IDs."""
+    assert 'input' in synthetic_batch
+    assert 'output' in synthetic_batch
+    assert 'puzzle_identifiers' in synthetic_batch
+    
+    # Check shapes - inputs are flattened
+    seq_len = synthetic_datamodule.grid_size * synthetic_datamodule.grid_size
+    assert synthetic_batch['input'].shape == (8, seq_len)
+    assert synthetic_batch['output'].shape == (8, seq_len)
+    assert synthetic_batch['puzzle_identifiers'].shape == (8,)
+    
+    # Check puzzle IDs are in valid range
+    assert synthetic_batch['puzzle_identifiers'].min() >= 0
+    assert synthetic_batch['puzzle_identifiers'].max() < synthetic_datamodule.num_puzzles
+    
+    # Check color values are in valid range
+    assert synthetic_batch['input'].min() >= 0
+    assert synthetic_batch['input'].max() < synthetic_datamodule.num_colors
+
+
+def test_model_initial_carry(trm_model, synthetic_batch):
+    """Test model initial carry creation."""
+    carry = trm_model.initial_carry(synthetic_batch)
+    
+    assert hasattr(carry, 'inner_carry')
+    assert hasattr(carry.inner_carry, 'z_H')
+    assert hasattr(carry.inner_carry, 'z_L')
+    assert carry.inner_carry.z_H.shape[0] == synthetic_batch['input'].shape[0]
+    assert carry.inner_carry.z_L.shape[0] == synthetic_batch['input'].shape[0]
+
+
+def test_model_forward_pass(trm_model, synthetic_batch):
+    """Test model forward pass with carry."""
+    trm_model.eval()
+    
     # Test initial carry
-    carry = model.initial_carry(batch)
-    print(f"Initial carry z_H shape: {carry.z_H.shape}")
-    print(f"Initial carry z_L shape: {carry.z_L.shape}")
-
+    carry = trm_model.initial_carry(synthetic_batch)
+    
     # Test forward pass
-    new_carry, outputs = model.forward(carry, batch)
-    print(f"Output logits shape: {outputs['logits'].shape}")
-    print(f"Q halt logits shape: {outputs['q_halt_logits'].shape}")
+    with torch.no_grad():
+        new_carry, outputs = trm_model.forward(carry, synthetic_batch)
+    
+    assert 'logits' in outputs
+    assert 'q_halt_logits' in outputs
+    
+    # Check output shapes
+    batch_size = synthetic_batch['input'].shape[0]
+    assert outputs['logits'].shape[0] == batch_size
+    assert outputs['q_halt_logits'].shape[0] == batch_size
 
-    return model, batch
 
-
-def test_training_step(dataset="xor"):
+def test_training_step(trm_model, synthetic_batch):
     """Test a single training step."""
-    print("\nTesting training step...")
-
-    model, batch = test_model_forward(dataset=dataset)
-
-    # Manual optimization setup with proper optimizers
-    base_lr = 1e-4 / model.hparams.N_supervision
-    embedding_lr = 1e-3 / model.hparams.N_supervision
-
+    # Setup optimizers
+    base_lr = 1e-4 / trm_model.hparams.N_supervision
+    embedding_lr = 1e-3 / trm_model.hparams.N_supervision
+    
     optimizers = []
-
+    
     # Collect parameters for main optimizer (excluding sparse embeddings)
     main_params = []
-
-    # Collect other parameters
-    for name, param in model.named_parameters():
-        if "puzzle_emb" not in name:  # Exclude puzzle_emb as it's handled separately
+    for name, param in trm_model.named_parameters():
+        if "puzzle_emb" not in name:
             main_params.append(param)
-
-    # Main optimizer (use AdamATan2 if available, else AdamW)
+    
+    # Main optimizer
     if main_params:
-        try:
-            main_opt = AdamATan2(main_params, lr=base_lr, weight_decay=0.01, betas=(0.9, 0.95))
-        except:
-            # Fallback to AdamW if AdamATan2 not available
+        if HAS_ADAM_ATAN2:
+            main_opt = AdamATan2(
+                main_params, lr=base_lr, weight_decay=0.01, betas=(0.9, 0.95)
+            )
+        else:
             main_opt = torch.optim.AdamW(
                 main_params, lr=base_lr, weight_decay=0.01, betas=(0.9, 0.95)
             )
         optimizers.append(main_opt)
-
+    
     # Sparse embedding optimizer
-    for _, module in model.named_modules():
+    for _, module in trm_model.named_modules():
         if isinstance(module, CastedSparseEmbedding):
-            # Pass the three components directly as a list, NOT a list of lists
             sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
-                [module.local_weights, module.local_ids, module.weights],  # Single list
+                [module.local_weights, module.local_ids, module.weights],
                 world_size=1,
                 lr=embedding_lr,
                 weight_decay=0.01,
             )
             optimizers.append(sparse_opt)
-            break  # Only one sparse embedding module
-
+            break
+    
     # Store optimizers for testing
-    model._optimizers = optimizers
-
+    trm_model._optimizers = optimizers
+    
+    # Initialize total_steps (normally set by Lightning's setup method)
+    trm_model.total_steps = 1000
+    
     # Simulate training step
-    model.train()
-    model.carry = None  # Start fresh
+    trm_model.train()
+    trm_model.carry = None
+    
+    # Run one training step
+    loss = trm_model.training_step(synthetic_batch, 0)
+    
+    # Assertions
+    assert loss is not None
+    assert torch.isfinite(loss)
+    assert loss.requires_grad
+    
+    # Check carry state was updated
+    assert trm_model.carry is not None
+    assert hasattr(trm_model.carry, 'steps')
+    assert hasattr(trm_model.carry, 'halted')
 
-    # Run one step
-    loss = model.training_step(batch, 0)
-    print(f"Training loss: {loss.item():.4f}")
 
-    # Check carry state
-    print(f"Carry steps: {model.carry.steps}")
-    print(f"Carry halted: {model.carry.halted}")
-
-    # Check if parameters are updating
-    print(f"Number of optimizers: {len(optimizers)}")
-    for i, opt in enumerate(optimizers):
-        print(f"Optimizer {i}: {type(opt).__name__}")
-
-
-if __name__ == "__main__":
-    dataset = "xor"
-    # test_data_loading(dataset=dataset)
-    # test_model_forward(dataset=dataset)
-    test_training_step(dataset=dataset)
-    print("\n✅ All tests passed!")
+def test_multiple_training_steps(trm_model, synthetic_datamodule):
+    """Test multiple consecutive training steps."""
+    # Setup optimizers
+    base_lr = 1e-4 / trm_model.hparams.N_supervision
+    embedding_lr = 1e-3 / trm_model.hparams.N_supervision
+    
+    optimizers = []
+    main_params = []
+    
+    for name, param in trm_model.named_parameters():
+        if "puzzle_emb" not in name:
+            main_params.append(param)
+    
+    if main_params:
+        if HAS_ADAM_ATAN2:
+            main_opt = AdamATan2(
+                main_params, lr=base_lr, weight_decay=0.01, betas=(0.9, 0.95)
+            )
+        else:
+            main_opt = torch.optim.AdamW(
+                main_params, lr=base_lr, weight_decay=0.01, betas=(0.9, 0.95)
+            )
+        optimizers.append(main_opt)
+    
+    for _, module in trm_model.named_modules():
+        if isinstance(module, CastedSparseEmbedding):
+            sparse_opt = CastedSparseEmbeddingSignSGD_Distributed(
+                [module.local_weights, module.local_ids, module.weights],
+                world_size=1,
+                lr=embedding_lr,
+                weight_decay=0.01,
+            )
+            optimizers.append(sparse_opt)
+            break
+    
+    trm_model._optimizers = optimizers
+    trm_model.train()
+    trm_model.carry = None
+    
+    # Initialize total_steps (normally set by Lightning's setup method)
+    trm_model.total_steps = 1000
+    
+    losses = []
+    for _ in range(3):
+        batch = synthetic_datamodule.get_batch()
+        loss = trm_model.training_step(batch, 0)
+        losses.append(loss.item())
+        
+        assert torch.isfinite(loss)
+    
+    # Check that we got valid losses for all steps
+    assert len(losses) == 3
+    assert all(loss > 0 for loss in losses)
